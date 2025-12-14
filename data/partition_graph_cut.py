@@ -1,4 +1,5 @@
 import os
+import json
 import argparse
 import dgl
 import torch
@@ -7,10 +8,65 @@ import scipy as sp
 from pathlib import Path
 from util import read_data
 
+
+def compute_entity_degrees(src, dst, num_entities):
+    """Return total degree (in+out) per entity."""
+    out_deg = np.bincount(src, minlength=num_entities)
+    in_deg = np.bincount(dst, minlength=num_entities)
+    return in_deg + out_deg
+
+
+def compute_relation_counts(rel_ids, num_relations):
+    return np.bincount(rel_ids, minlength=num_relations)
+
+
+def select_hot_entities(entity_degrees, percent):
+    if percent <= 0.0:
+        return None
+    target = max(1, int(len(entity_degrees) * percent))
+    if target >= len(entity_degrees):
+        hot = np.argsort(entity_degrees)[::-1]
+    else:
+        candidates = np.argpartition(entity_degrees, -target)[-target:]
+        hot = candidates[np.argsort(entity_degrees[candidates])[::-1]]
+    return hot
+
+
+def compute_triple_costs(src, dst, rel, entity_degrees, relation_counts, alpha, beta):
+    costs = np.ones(len(src), dtype=np.float32)
+    if alpha != 0.0:
+        costs += alpha * (entity_degrees[src] + entity_degrees[dst]).astype(np.float32)
+    if beta != 0.0:
+        costs += beta * relation_counts[rel].astype(np.float32)
+    return costs
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", help="name of dataset to partition")
     parser.add_argument("-n", "--num_partitions", type=int, help="number of partitions")
+    parser.add_argument(
+        "--cost-alpha",
+        type=float,
+        default=0.0,
+        help="Coefficient for entity-degree contribution to per-triple cost.",
+    )
+    parser.add_argument(
+        "--cost-beta",
+        type=float,
+        default=0.0,
+        help="Coefficient for relation-frequency contribution to per-triple cost.",
+    )
+    parser.add_argument(
+        "--hot-entity-percent",
+        type=float,
+        default=0.0,
+        help="Percent of entities to mark as hot (0 disables).",
+    )
+    parser.add_argument(
+        "--export-triple-costs",
+        action="store_true",
+        help="Write the per-triple cost array to disk (large).",
+    )
     args = parser.parse_args()
     dataset_folder = args.dataset
     num_parts = args.num_partitions
@@ -20,12 +76,25 @@ if __name__ == '__main__':
 
     src = data[:, 0]
     dst = data[:, 2]
+    rel = data[:, 1]
     num_entities = len(entities)
+    num_relations = len(relations)
+    print("computing graph statistics...")
+    entity_degrees = compute_entity_degrees(src, dst, num_entities)
+    relation_counts = compute_relation_counts(rel, num_relations)
+    hot_entities = select_hot_entities(entity_degrees, args.hot_entity_percent)
+    triple_costs = None
+    if args.cost_alpha != 0.0 or args.cost_beta != 0.0:
+        print("computing per-triple costs...")
+        triple_costs = compute_triple_costs(
+            src, dst, rel, entity_degrees, relation_counts, args.cost_alpha, args.cost_beta
+        )
     coo = sp.sparse.coo_matrix((np.ones(data.shape[0]), (src, dst)),
                                shape=[num_entities, num_entities])
 
     triple_partition_assignment = np.full((len(data)), -1, dtype=np.int)
     entity_partition_assignment = np.full((num_entities), -1, dtype=np.int)
+    partition_triple_order = {i: [] for i in range(num_parts)}
     num_inner_edges_dict = {}
     inner_nodes_dict = {}
     print("construct graph...")
@@ -45,6 +114,7 @@ if __name__ == '__main__':
         src, dst = part.all_edges(form='uv', order='eid')
         #print(src)
         triple_partition_assignment[part.edata["_ID"].numpy()] = part_id
+        partition_triple_order[part_id].extend(part.edata["_ID"].numpy().tolist())
         #entity_partition_assignment[part.ndata["_ID"].numpy()] = part_id
 
 
@@ -70,6 +140,16 @@ if __name__ == '__main__':
         entity_partition_assignment[parent_inner_nodes] = mapper
         #print(node_part_mapper)
 
+    partition_counts = np.bincount(triple_partition_assignment, minlength=num_parts)
+    partition_costs = None
+    if triple_costs is not None:
+        partition_costs = np.bincount(
+            triple_partition_assignment, weights=triple_costs, minlength=num_parts
+        )
+        print("per-partition weighted cost:", partition_costs.tolist())
+    else:
+        partition_costs = partition_counts.astype(np.float64)
+
     # write to file
 
     if write:
@@ -90,6 +170,65 @@ if __name__ == '__main__':
             delimiter="\t",
             fmt="%s",
         )
+        np.save(
+            os.path.join(output_folder, "partition_counts.npy"),
+            partition_counts,
+        )
+        np.save(
+            os.path.join(output_folder, "partition_costs.npy"),
+            partition_costs,
+        )
+        reordered = {}
+        for part_id in range(num_parts):
+            idx = np.array(partition_triple_order[part_id], dtype=np.int64)
+            if len(idx) == 0:
+                reordered[f"part_{part_id}"] = idx
+                continue
+            order = np.lexsort((rel[idx], dst[idx], src[idx]))
+            reordered[f"part_{part_id}"] = idx[order]
+        np.savez(os.path.join(output_folder, "partition_triples.npz"), **reordered)
+
+    analysis_prefix = Path(dataset_folder)
+    np.save(analysis_prefix / "analysis_entity_degrees.npy", entity_degrees)
+    np.save(analysis_prefix / "analysis_relation_counts.npy", relation_counts)
+    if hot_entities is not None:
+        np.save(analysis_prefix / "analysis_hot_entities.npy", hot_entities)
+    if triple_costs is not None and args.export_triple_costs:
+        np.save(
+            analysis_prefix / f"analysis_triple_costs_num_{num_parts}.npy",
+            triple_costs,
+        )
+    summary = {
+        "num_triples": int(len(data)),
+        "num_entities": int(num_entities),
+        "num_relations": int(num_relations),
+        "max_entity_degree": int(entity_degrees.max()) if len(entity_degrees) else 0,
+        "median_entity_degree": float(np.median(entity_degrees))
+        if len(entity_degrees)
+        else 0.0,
+        "max_relation_frequency": int(relation_counts.max())
+        if len(relation_counts)
+        else 0,
+        "median_relation_frequency": float(np.median(relation_counts))
+        if len(relation_counts)
+        else 0.0,
+        "hot_entity_percent": args.hot_entity_percent,
+        "num_hot_entities": int(len(hot_entities)) if hot_entities is not None else 0,
+        "cost_alpha": args.cost_alpha,
+        "cost_beta": args.cost_beta,
+        "partition_counts": partition_counts.tolist(),
+        "partition_costs": partition_costs.tolist()
+        if partition_costs is not None
+        else None,
+    }
+    summary_path = analysis_prefix / "analysis_graphcut_summary.json"
+    with open(summary_path, "w") as summary_file:
+        json.dump(summary, summary_file, indent=2)
+    summary_num_path = (
+        analysis_prefix / f"analysis_graphcut_summary_num_{num_parts}.json"
+    )
+    with open(summary_num_path, "w") as summary_file:
+        json.dump(summary, summary_file, indent=2)
     print("some counting")
     unique_pairs, counts = np.unique(
         triple_partition_assignment, return_counts=True, axis=0

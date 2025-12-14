@@ -351,7 +351,7 @@ class Dataset(Configurable):
             filename,
             header=None,
             sep="\t",
-            dtype=np.long,
+            dtype=np.int64,
         ).to_numpy()
         if use_pickle:
             Dataset._pickle_dump_atomic(partition_assignment, pickle_filename)

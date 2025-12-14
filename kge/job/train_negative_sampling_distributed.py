@@ -7,6 +7,7 @@ import math
 import gc
 import os
 import itertools
+from pathlib import Path
 
 from collections import defaultdict, deque
 from typing import Dict, Any
@@ -185,6 +186,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         # also defines the local entities
         self._initialize_parameter_server(init_for_load_only=init_for_load_only)
 
+        self.hot_entity_tensor = self._load_hot_entity_cache()
+        if self.hot_entity_tensor is not None:
+            self._localize_hot_entities()
+
         def stop_and_wait(job):
             job.parameter_client.stop()
             job.parameter_client.barrier()
@@ -226,6 +231,54 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self.model.get_s_embedder()._normalize_embeddings()
                 self._push_init_to_parameter_server(init_work_package)
         self.parameter_client.barrier()
+
+    def _load_hot_entity_cache(self):
+        if not self.config.get("job.distributed.hot_entity_cache.enable"):
+            return None
+        cache_file = self.config.get("job.distributed.hot_entity_cache.file")
+        dataset_folder = Path(self.dataset.folder)
+        if cache_file:
+            cache_path = Path(cache_file)
+            if not cache_path.is_absolute():
+                cache_path = dataset_folder / cache_path
+        else:
+            cache_path = dataset_folder / "analysis_hot_entities.npy"
+        if not cache_path.is_file():
+            self.config.log(
+                f"No hot-entity cache found at {cache_path}. Skipping hot-entity localization."
+            )
+            return None
+        try:
+            hot_entities = np.load(cache_path)
+        except Exception as e:
+            self.config.log(f"Failed to load hot entities from {cache_path}: {e}")
+            return None
+        max_entities = self.config.get("job.distributed.hot_entity_cache.max_entities")
+        if max_entities is not None and max_entities > 0:
+            hot_entities = hot_entities[:max_entities]
+        if hot_entities.size == 0:
+            self.config.log(
+                f"Hot-entity cache at {cache_path} is empty. Skipping localization."
+            )
+            return None
+        tensor = torch.from_numpy(hot_entities.astype(np.int64)).long()
+        self.config.log(
+            f"Loaded {len(tensor)} hot entities from {cache_path} for caching."
+        )
+        return tensor
+
+    def _localize_hot_entities(self):
+        if self.hot_entity_tensor is None:
+            return
+        try:
+            self.model.get_s_embedder().localize(
+                self.hot_entity_tensor, make_unique=True
+            )
+            self.config.log(
+                f"Requested localization of {len(self.hot_entity_tensor)} hot entities."
+            )
+        except Exception as e:
+            self.config.log(f"Failed to localize hot entities: {e}")
 
     def _push_init_to_parameter_server(self, entity_ids: torch.Tensor):
         push_tensor = torch.cat(
@@ -525,6 +578,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 break
             local_partition_counter += 1
             self.work_pre_localized = False
+            partition_start_time = time.time()
             if work_entities is not None and self.entity_localize:
                 self.model.get_s_embedder().localize(work_entities)
                 self.entity_partition_localized = True
@@ -771,6 +825,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 ps_set_time += time.time()
                 # self.model.get_p_embedder().global_to_local_mapper[:] = -1
                 self.model.get_p_embedder().push_back()
+            partition_duration = time.time() - partition_start_time
+            self.work_scheduler_client.register_partition_result(partition_duration)
             self.work_scheduler_client.work_done()
 
             # add results to trace entry
@@ -939,4 +995,3 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             relation_ids = torch.arange(self.dataset.num_relations(), dtype=torch.long)
             self.parameter_client.pull(relation_ids + lapse_offset, pull_tensor)
             torch.save(pull_tensor, f"{file}_relations.{file_ending}")
-

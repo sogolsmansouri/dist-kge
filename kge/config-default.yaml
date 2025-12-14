@@ -75,6 +75,12 @@ job:
     pre_localize_partition: False
     pre_localize_batch: False # pre localize entities in batch one batch ahead
     scheduler_data_type: int32 # torch type used for communication of the work scheduler
+    hot_entity_cache:
+      enable: False
+      file: ''        # optional override; defaults to dataset/analysis_hot_entities.npy
+      max_entities: -1  # if >0, limit to this many hot entities per worker
+    graph_cut:
+      cost_aware_schedule: False
 
     stratification:
       # not all the entities in a strata are used ("active") for the positives

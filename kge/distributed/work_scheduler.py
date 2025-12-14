@@ -5,6 +5,7 @@ import numba
 import torch
 from collections import deque, defaultdict
 from copy import deepcopy
+from pathlib import Path
 from kge.misc import set_seeds
 from kge.distributed.stratification_schedule_creator import StratificationScheduleCreator
 from torch import multiprocessing as mp
@@ -16,8 +17,8 @@ from dataclasses import dataclass
 
 
 TORCH_TO_NP_DTYPE = {
-    torch.long: np.long,
-    torch.int64: np.long,
+    torch.long: np.int64,
+    torch.int64: np.int64,
     torch.int32: np.int32,
     torch.int: np.int32,
 }
@@ -37,6 +38,7 @@ class SCHEDULER_CMDS(IntEnum):
     PRE_LOCALIZE_WORK = 10
     REGISTER_EVAL_RESULT = 11
     GET_EVAL_RESULT = 12
+    REGISTER_PARTITION_RESULT = 13
 
 @dataclass
 class WorkPackage:
@@ -71,6 +73,8 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.init_up_to_entity = -1
         self.num_processed_partitions = 0
         self.eval_hists = []
+        self.active_partition_per_worker = dict()
+        self.partition_stats = dict()
         if config.get("job.distributed.scheduler_data_type") not in ["int", "int32", "int64", "long"]:
             raise ValueError("Only long and int is supported as dtype for the scheduler communication")
         self.data_type = getattr(torch, config.get("job.distributed.scheduler_data_type"))
@@ -206,6 +210,8 @@ class WorkScheduler(mp.get_context("fork").Process):
                 self._handle_register_eval_result(rank, cmd_buffer)
             elif cmd == SCHEDULER_CMDS.GET_EVAL_RESULT:
                 self._handle_get_eval_result(rank)
+            elif cmd == SCHEDULER_CMDS.REGISTER_PARTITION_RESULT:
+                self._handle_register_partition_result(rank)
             else:
                 raise ValueError(
                     f"The work scheduler received an unknown command: {cmd}"
@@ -231,6 +237,8 @@ class WorkScheduler(mp.get_context("fork").Process):
             cmd_buffer[1] = len(work_package.partition_data)
             dist.send(cmd_buffer, dst=rank)
             dist.send(work_package.partition_data, dst=rank)
+            if not pre_localize:
+                self.active_partition_per_worker[rank] = work_package.partition_id
             if work_package.entities_in_partition is None:
                 cmd_buffer[1] = 0
                 dist.send(cmd_buffer, dst=rank)
@@ -259,6 +267,7 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _handle_work_done(self, rank):
         self.num_processed_partitions += 1
         print(f"trainer {rank} done with partition {self.num_processed_partitions}")
+        self.active_partition_per_worker.pop(rank, None)
 
     def _handle_init_info(self, rank):
         max_entities = self._get_max_entities()
@@ -309,6 +318,63 @@ class WorkScheduler(mp.get_context("fork").Process):
             dist.send(h, dst=rank)
         self.eval_hists = []
 
+    def _handle_register_partition_result(self, rank):
+        result_buffer = torch.zeros(1, dtype=torch.float32)
+        dist.recv(result_buffer, src=rank)
+        self._register_partition_result(rank, float(result_buffer[0].item()))
+
+    def _register_partition_result(self, rank, step_time):
+        partition_id = self.active_partition_per_worker.get(rank)
+        if partition_id is None:
+            return
+        history = self.partition_stats.setdefault(partition_id, deque(maxlen=8))
+        history.append(step_time)
+        avg_time = sum(history) / len(history)
+        self._handle_partition_feedback(partition_id, avg_time)
+
+    def _handle_partition_feedback(self, partition_id, avg_time):
+        pass
+
+    def _order_by_feedback(self, partition_ids):
+        if not self.partition_stats:
+            return partition_ids
+        scored = []
+        for idx, pid in enumerate(partition_ids):
+            history = self.partition_stats.get(pid)
+            if not history:
+                avg = 0.0
+            else:
+                avg = sum(history) / len(history)
+            scored.append((-avg, idx))
+        scored.sort()
+        return [partition_ids[idx] for _, idx in scored]
+
+    def _load_reordered_partitions(self, num_partitions):
+        dataset_folder = Path(self.dataset.folder)
+        path = (
+            dataset_folder
+            / "partitions"
+            / self.dataset._partition_type
+            / f"num_{num_partitions}"
+            / "partition_triples.npz"
+        )
+        if not path.is_file():
+            return None
+        try:
+            data = np.load(path, allow_pickle=False)
+            partitions = []
+            for part_id in range(num_partitions):
+                key = f"part_{part_id}"
+                if key not in data:
+                    raise KeyError(f"{key} missing in {path}")
+                arr = data[key].astype(TORCH_TO_NP_DTYPE[self.data_type])
+                partitions.append(torch.from_numpy(arr).contiguous())
+            self.config.log(f"Loaded locality-aware partition ordering from {path}.")
+            return partitions
+        except Exception as e:
+            self.config.log(f"Failed to load locality-aware ordering from {path}: {e}")
+            return None
+
     def _get_max_entities(self):
         return 0
 
@@ -358,6 +424,8 @@ class RandomWorkScheduler(WorkScheduler):
             self.partitions = self._load_partitions(self.num_partitions)
             self._define_local_entities()
         super(RandomWorkScheduler, self)._refill_work()
+        reordered = self._order_by_feedback(list(self.work_to_do))
+        self.work_to_do = deque(reordered)
 
 
 class RelationWorkScheduler(WorkScheduler):
@@ -395,6 +463,9 @@ class RelationWorkScheduler(WorkScheduler):
 
     def _load_partitions(self, num_partitions):
         np_type = TORCH_TO_NP_DTYPE[self.data_type]
+        reordered = self._load_reordered_partitions(num_partitions)
+        if reordered is not None:
+            return reordered
         partition_assignment = self.dataset.load_train_partitions(num_partitions)
         # todo: let the partitions start at zero, then we do not need this unique
         partition_indexes = np.unique(partition_assignment)
@@ -418,6 +489,8 @@ class RelationWorkScheduler(WorkScheduler):
             # self.partitions = self._load_partitions(self.num_partitions)
             self._define_local_entities()
         super(RelationWorkScheduler, self)._refill_work()
+        reordered = self._order_by_feedback(list(self.work_to_do))
+        self.work_to_do = deque(reordered)
 
 
 class GraphCutWorkScheduler(WorkScheduler):
@@ -431,12 +504,14 @@ class GraphCutWorkScheduler(WorkScheduler):
             config=config,
             dataset=dataset,
         )
+        self.partition_costs = None
 
     def _init_in_started_process(self):
         super(GraphCutWorkScheduler, self)._init_in_started_process()
         self.entities_to_partition = self.dataset.load_entities_to_partitions(self.num_partitions)
         self.entities_to_partition = self._get_entities_in_partition()
         self.previous_partition_per_worker = defaultdict(lambda: None)
+        self.partition_costs = self._load_partition_costs(self.num_partitions)
 
     def _config_check(self, config):
         super(GraphCutWorkScheduler, self)._config_check(config)
@@ -466,6 +541,9 @@ class GraphCutWorkScheduler(WorkScheduler):
 
     def _load_partitions(self, num_partitions):
         np_type = TORCH_TO_NP_DTYPE[self.data_type]
+        reordered = self._load_reordered_partitions(num_partitions)
+        if reordered is not None:
+            return reordered
         partition_assignment = self.dataset.load_train_partitions(num_partitions)
         # todo: let the partitions start at zero, then we do not need this unique
         partition_indexes = np.unique(partition_assignment)
@@ -486,6 +564,63 @@ class GraphCutWorkScheduler(WorkScheduler):
 
     def _get_max_entities(self):
         return max([len(i) for i in self.entities_to_partition.values()])
+
+    def _refill_work(self):
+        super(GraphCutWorkScheduler, self)._refill_work()
+        if (
+            self.partition_costs is not None
+            and len(self.partition_costs) == self.num_partitions
+        ):
+            ordered = sorted(
+                range(self.num_partitions),
+                key=lambda idx: self.partition_costs[idx],
+                reverse=True,
+            )
+            self.work_to_do = deque(ordered)
+
+    def _load_partition_costs(self, num_partitions):
+        if not self.config.get("job.distributed.graph_cut.cost_aware_schedule"):
+            return None
+        dataset_folder = Path(self.dataset.folder)
+        cost_path = (
+            dataset_folder
+            / "partitions"
+            / "graph-cut"
+            / f"num_{num_partitions}"
+            / "partition_costs.npy"
+        )
+        if not cost_path.is_file():
+            self.config.log(
+                f"graph-cut cost-aware scheduling enabled, but {cost_path} not found."
+            )
+            return None
+        try:
+            costs = np.load(cost_path)
+        except Exception as e:
+            self.config.log(f"Failed to load graph-cut partition costs: {e}")
+            return None
+        if len(costs) != num_partitions:
+            self.config.log(
+                f"Ignoring partition costs: expected {num_partitions} entries, got {len(costs)}."
+            )
+            return None
+        self.config.log(
+            f"Loaded graph-cut partition costs from {cost_path} for cost-aware scheduling."
+        )
+        return costs
+
+    def _register_partition_result(self, rank, step_time):
+        partition_id = self.active_partition_per_worker.get(rank)
+        if partition_id is None:
+            return
+        if self.partition_costs is None or len(self.partition_costs) != self.num_partitions:
+            self.partition_costs = np.zeros(self.num_partitions, dtype=np.float64)
+        self.partition_costs[partition_id] = step_time
+        remaining = sorted(
+            list(self.work_to_do), key=lambda idx: self.partition_costs[idx], reverse=True
+        )
+        self.work_to_do = deque(remaining)
+        super(GraphCutWorkScheduler, self)._register_partition_result(rank, step_time)
 
 
 class StratificationWorkScheduler(WorkScheduler):
@@ -567,7 +702,7 @@ class StratificationWorkScheduler(WorkScheduler):
         num_partitions,
         active_only=True,
         combine_mirror_blocks=True,
-        np_type=np.long,
+        np_type=np.int64,
     ):
         """
         This needs to be a static method so that we can pickle and run in background
@@ -869,7 +1004,7 @@ class StratificationWorkScheduler(WorkScheduler):
         return partitions
 
     @staticmethod
-    def _construct_partitions(partition_assignment, num_partitions, np_type=np.long):
+    def _construct_partitions(partition_assignment, num_partitions, np_type=np.int64):
         (
             partition_indexes,
             partition_data,
@@ -1062,3 +1197,9 @@ class SchedulerClient:
     def shutdown(self):
         cmd = torch.tensor([SCHEDULER_CMDS.SHUTDOWN, self.machine_id], dtype=self.data_type)
         dist.send(cmd, dst=self.scheduler_rank)
+
+    def register_partition_result(self, step_time):
+        cmd = torch.tensor([SCHEDULER_CMDS.REGISTER_PARTITION_RESULT, 0], dtype=self.data_type)
+        dist.send(cmd, dst=self.scheduler_rank)
+        payload = torch.tensor([step_time], dtype=torch.float32)
+        dist.send(payload, dst=self.scheduler_rank)
