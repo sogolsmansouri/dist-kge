@@ -82,6 +82,11 @@ job:
     graph_cut:
       cost_aware_schedule: False
       max_chunk_size: 0
+      min_chunk_size: 0
+      dynamic_chunking: False
+      target_chunk_time: 2.0
+      chunk_warmup_epochs: 0
+      export_feedback: False
 
     stratification:
       # not all the entities in a strata are used ("active") for the positives

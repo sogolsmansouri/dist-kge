@@ -76,6 +76,12 @@ if __name__ == '__main__':
         action="store_true",
         help="Write the per-triple cost array to disk (large).",
     )
+    parser.add_argument(
+        "--feedback-file",
+        type=str,
+        default=None,
+        help="Optional partition_feedback.json from previous runs to blend into partition costs.",
+    )
     args = parser.parse_args()
     dataset_folder = args.dataset
     num_parts = args.num_partitions
@@ -158,6 +164,29 @@ if __name__ == '__main__':
 
     partition_counts = np.bincount(triple_partition_assignment, minlength=num_parts)
     partition_costs = None
+    feedback_path = args.feedback_file
+    partition_folder = os.path.join(dataset_folder, "partitions","graph-cut")
+    output_folder = os.path.join(partition_folder, f"num_{num_parts}")
+    if feedback_path is None:
+        feedback_path = os.path.join(output_folder, "partition_feedback.json")
+
+    feedback_costs = None
+    if feedback_path and os.path.isfile(feedback_path):
+        try:
+            with open(feedback_path, "r") as fp:
+                feedback_json = json.load(fp)
+            avg_map = feedback_json.get("avg_step_time", feedback_json)
+            feedback_costs = np.zeros(num_parts, dtype=np.float64)
+            for pid_str, val in avg_map.items():
+                pid = int(pid_str)
+                if 0 <= pid < num_parts:
+                    feedback_costs[pid] = float(val)
+            if feedback_costs.max() > 0:
+                feedback_costs = feedback_costs / feedback_costs.max()
+            print(f"Loaded partition feedback from {feedback_path}")
+        except Exception as exc:
+            print(f"Failed to load feedback file {feedback_path}: {exc}")
+
     if triple_costs is not None:
         partition_costs = np.bincount(
             triple_partition_assignment, weights=triple_costs, minlength=num_parts
@@ -165,12 +194,15 @@ if __name__ == '__main__':
         print("per-partition weighted cost:", partition_costs.tolist())
     else:
         partition_costs = partition_counts.astype(np.float64)
+    if feedback_costs is not None:
+        if partition_costs.max() > 0:
+            partition_costs = partition_costs * (1.0 + feedback_costs)
+        else:
+            partition_costs = feedback_costs.copy()
 
     # write to file
 
     if write:
-        partition_folder = os.path.join(dataset_folder, "partitions","graph-cut")
-        output_folder = os.path.join(partition_folder, f"num_{num_parts}")
         Path(output_folder).mkdir(parents=True, exist_ok=True)
 
         print("write to file")
@@ -237,6 +269,7 @@ if __name__ == '__main__':
         "partition_costs": partition_costs.tolist()
         if partition_costs is not None
         else None,
+        "feedback_file": feedback_path if feedback_costs is not None else None,
     }
     summary_path = analysis_prefix / "analysis_graphcut_summary.json"
     with open(summary_path, "w") as summary_file:

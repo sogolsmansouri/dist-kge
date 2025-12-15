@@ -1,5 +1,6 @@
 import math
 import time
+import json
 import numpy as np
 import numba
 import torch
@@ -158,6 +159,7 @@ class WorkScheduler(mp.get_context("fork").Process):
                 epoch_time = None
                 self.num_processed_partitions = 0
                 self._refill_work()
+                self._on_epoch_completed()
                 for worker in self.asking_workers:
                     self._send_work(worker, cmd_buffer)
                 self.done_workers = []
@@ -190,6 +192,7 @@ class WorkScheduler(mp.get_context("fork").Process):
                         if self.repartition_worker_pool is not None:
                             self.repartition_worker_pool.close()
                             self.repartition_worker_pool.terminate()
+                    self._on_scheduler_shutdown()
                     break
             elif cmd == SCHEDULER_CMDS.INIT_INFO:
                 self._handle_init_info(rank)
@@ -304,6 +307,12 @@ class WorkScheduler(mp.get_context("fork").Process):
 
     def _handle_pre_localize_work(self, rank, machine_id):
         raise ValueError("The current partition scheme does not support pre-localizing")
+
+    def _on_epoch_completed(self):
+        pass
+
+    def _on_scheduler_shutdown(self):
+        pass
 
     def _handle_register_eval_result(self, rank, cmd_buffer):
         num_sub_hists = cmd_buffer[1]
@@ -516,6 +525,29 @@ class GraphCutWorkScheduler(WorkScheduler):
         self.max_chunk_size = max(
             0, int(config.get("job.distributed.graph_cut.max_chunk_size"))
         )
+        self.min_chunk_size = max(
+            0, int(config.get("job.distributed.graph_cut.min_chunk_size"))
+        )
+        self.dynamic_chunking = bool(
+            config.get("job.distributed.graph_cut.dynamic_chunking")
+        )
+        self.target_chunk_time = float(
+            config.get("job.distributed.graph_cut.target_chunk_time")
+        )
+        self.chunk_warmup_epochs = int(
+            config.get("job.distributed.graph_cut.chunk_warmup_epochs")
+        )
+        self.export_feedback = bool(
+            config.get("job.distributed.graph_cut.export_feedback")
+        )
+        self.completed_epochs = 0
+        self._base_chunk_size = self.max_chunk_size
+        if self.chunk_warmup_epochs > 0 and self.max_chunk_size > 0:
+            warm_start = self.max_chunk_size // 4
+            if self.min_chunk_size > 0:
+                warm_start = max(self.min_chunk_size, warm_start)
+            self._base_chunk_size = max(1, warm_start)
+        self.partition_chunk_size = defaultdict(self._default_chunk_size)
         self.partition_next_offset = defaultdict(int)
         self.partition_done_offset = defaultdict(int)
 
@@ -609,6 +641,8 @@ class GraphCutWorkScheduler(WorkScheduler):
     def _reset_partition_progress(self):
         self.partition_next_offset = defaultdict(int)
         self.partition_done_offset = defaultdict(int)
+        if not hasattr(self, "partition_chunk_size"):
+            self.partition_chunk_size = defaultdict(self._default_chunk_size)
 
     def _register_partition_result(self, rank, step_time):
         partition_id = self.active_partition_per_worker.get(rank)
@@ -621,6 +655,8 @@ class GraphCutWorkScheduler(WorkScheduler):
             list(self.work_to_do), key=lambda idx: self.partition_costs[idx], reverse=True
         )
         self.work_to_do = deque(remaining)
+        chunk_size = self.active_partition_chunk_sizes.get(rank, 0)
+        self._maybe_adjust_chunk_size(partition_id, chunk_size, step_time)
         super(GraphCutWorkScheduler, self)._register_partition_result(rank, step_time)
 
     def _next_work(
@@ -648,13 +684,14 @@ class GraphCutWorkScheduler(WorkScheduler):
 
     def _slice_partition(self, partition_id, partition_tensor):
         total = len(partition_tensor)
-        if self.max_chunk_size <= 0 or total <= self.max_chunk_size:
+        chunk_cap = self._get_partition_chunk_size(partition_id, total)
+        if chunk_cap <= 0 or chunk_cap >= total:
             self.partition_next_offset[partition_id] = total
             return partition_tensor
         start = self.partition_next_offset[partition_id]
         if start >= total:
             return None
-        chunk_len = min(self.max_chunk_size, total - start)
+        chunk_len = min(chunk_cap, total - start)
         end = start + chunk_len
         self.partition_next_offset[partition_id] = end
         if end < total:
@@ -678,6 +715,87 @@ class GraphCutWorkScheduler(WorkScheduler):
             f"trainer {rank} finished chunk "
             f"{self.partition_done_offset[partition_id]}/{total} of partition {partition_id}"
         )
+
+    def _default_chunk_size(self):
+        if self._base_chunk_size:
+            return self._base_chunk_size
+        return self.max_chunk_size
+
+    def _get_partition_chunk_size(self, partition_id, total):
+        size = self.partition_chunk_size.get(partition_id)
+        if not size or size <= 0:
+            if self.max_chunk_size > 0:
+                size = self.max_chunk_size
+            else:
+                size = total
+            self.partition_chunk_size[partition_id] = size
+        return min(size, total)
+
+    def _maybe_adjust_chunk_size(self, partition_id, chunk_size, step_time):
+        if (
+            not self.dynamic_chunking
+            or self.max_chunk_size <= 0
+            or step_time <= 0
+            or chunk_size <= 0
+        ):
+            return
+        if self.target_chunk_time <= 0:
+            return
+        current = self.partition_chunk_size.get(partition_id, chunk_size)
+        min_size = self.min_chunk_size if self.min_chunk_size > 0 else max(1, chunk_size // 2)
+        adjusted = False
+        if step_time > self.target_chunk_time * 1.25 and current > min_size:
+            new_size = max(min_size, int(current * (self.target_chunk_time / step_time)))
+            current = max(1, new_size)
+            adjusted = True
+        elif step_time < self.target_chunk_time * 0.5 and current < self.max_chunk_size:
+            new_size = min(self.max_chunk_size, int(current * (self.target_chunk_time / step_time)))
+            current = max(1, new_size)
+            adjusted = True
+        if adjusted:
+            self.partition_chunk_size[partition_id] = current
+
+    def _on_epoch_completed(self):
+        self.completed_epochs += 1
+        if (
+            self.chunk_warmup_epochs > 0
+            and self.max_chunk_size > 0
+            and self.completed_epochs <= self.chunk_warmup_epochs
+        ):
+            progress = self.completed_epochs / self.chunk_warmup_epochs
+            target = max(
+                self.min_chunk_size or 1,
+                int(self.max_chunk_size * progress),
+            )
+            if target > self._base_chunk_size:
+                self._base_chunk_size = target
+                for pid in range(self.num_partitions):
+                    current = self.partition_chunk_size.get(pid, target)
+                    if current < target:
+                        self.partition_chunk_size[pid] = target
+
+    def _on_scheduler_shutdown(self):
+        if not self.export_feedback or not self.partition_stats:
+            return
+        dataset_folder = Path(self.dataset.folder)
+        output_folder = (
+            dataset_folder
+            / "partitions"
+            / "graph-cut"
+            / f"num_{self.num_partitions}"
+        )
+        output_folder.mkdir(parents=True, exist_ok=True)
+        feedback = {}
+        for pid, history in self.partition_stats.items():
+            if history:
+                feedback[pid] = sum(history) / len(history)
+        path = output_folder / "partition_feedback.json"
+        try:
+            with open(path, "w") as fp:
+                json.dump({"avg_step_time": feedback}, fp, indent=2)
+            self.config.log(f"Exported graph-cut feedback to {path}.")
+        except Exception as e:
+            self.config.log(f"Failed to export graph-cut feedback: {e}")
 
 
 class StratificationWorkScheduler(WorkScheduler):
