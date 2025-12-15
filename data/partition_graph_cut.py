@@ -83,29 +83,29 @@ if __name__ == '__main__':
     data, entities, relations = read_data(dataset_folder, train=True, entity_ids=True, relation_ids=True)
 
 
-    src = data[:, 0]
-    dst = data[:, 2]
-    rel = data[:, 1]
+    src_all = data[:, 0]
+    dst_all = data[:, 2]
+    rel_all = data[:, 1]
     num_entities = len(entities)
     num_relations = len(relations)
     print("computing graph statistics...")
-    entity_degrees = compute_entity_degrees(src, dst, num_entities)
-    relation_counts = compute_relation_counts(rel, num_relations)
+    entity_degrees = compute_entity_degrees(src_all, dst_all, num_entities)
+    relation_counts = compute_relation_counts(rel_all, num_relations)
     hot_entities = select_hot_entities(entity_degrees, args.hot_entity_percent)
     triple_costs = None
     if args.cost_alpha != 0.0 or args.cost_beta != 0.0 or args.cost_neg_factor != 0.0:
         print("computing per-triple costs...")
         triple_costs = compute_triple_costs(
-            src,
-            dst,
-            rel,
+            src_all,
+            dst_all,
+            rel_all,
             entity_degrees,
             relation_counts,
             args.cost_alpha,
             args.cost_beta,
             args.cost_neg_factor,
         )
-    coo = sp.sparse.coo_matrix((np.ones(data.shape[0]), (src, dst)),
+    coo = sp.sparse.coo_matrix((np.ones(data.shape[0]), (src_all, dst_all)),
                                shape=[num_entities, num_entities])
 
     triple_partition_assignment = np.full((len(data)), -1, dtype=np.int64)
@@ -127,8 +127,8 @@ if __name__ == '__main__':
     for part_id in part_dict:
         part = part_dict[part_id]
         #print(part.has_nodes(entities))
-        src, dst = part.all_edges(form='uv', order='eid')
-        #print(src)
+        part_src, part_dst = part.all_edges(form='uv', order='eid')
+        #print(part_src)
         triple_partition_assignment[part.edata["_ID"].numpy()] = part_id
         partition_triple_order[part_id].extend(part.edata["_ID"].numpy().tolist())
         #entity_partition_assignment[part.ndata["_ID"].numpy()] = part_id
@@ -200,7 +200,7 @@ if __name__ == '__main__':
             if len(idx) == 0:
                 reordered[f"part_{part_id}"] = idx
                 continue
-            order = np.lexsort((rel[idx], dst[idx], src[idx]))
+            order = np.lexsort((rel_all[idx], dst_all[idx], src_all[idx]))
             reordered[f"part_{part_id}"] = idx[order]
         np.savez(os.path.join(output_folder, "partition_triples.npz"), **reordered)
 
