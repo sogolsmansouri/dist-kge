@@ -81,6 +81,7 @@ job:
       max_entities: -1  # if >0, limit to this many hot entities per worker
     graph_cut:
       cost_aware_schedule: False
+      max_chunk_size: 0
 
     stratification:
       # not all the entities in a strata are used ("active") for the positives

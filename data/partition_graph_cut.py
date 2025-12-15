@@ -32,12 +32,15 @@ def select_hot_entities(entity_degrees, percent):
     return hot
 
 
-def compute_triple_costs(src, dst, rel, entity_degrees, relation_counts, alpha, beta):
+def compute_triple_costs(src, dst, rel, entity_degrees, relation_counts, alpha, beta, neg_factor):
     costs = np.ones(len(src), dtype=np.float32)
     if alpha != 0.0:
         costs += alpha * (entity_degrees[src] + entity_degrees[dst]).astype(np.float32)
     if beta != 0.0:
         costs += beta * relation_counts[rel].astype(np.float32)
+    if neg_factor != 0.0:
+        neg_load = (entity_degrees[src] * entity_degrees[dst]).astype(np.float32)
+        costs += neg_factor * neg_load
     return costs
 
 if __name__ == '__main__':
@@ -55,6 +58,12 @@ if __name__ == '__main__':
         type=float,
         default=0.0,
         help="Coefficient for relation-frequency contribution to per-triple cost.",
+    )
+    parser.add_argument(
+        "--cost-neg-factor",
+        type=float,
+        default=0.0,
+        help="Coefficient for negative-sampling load (degree product) contribution to per-triple cost.",
     )
     parser.add_argument(
         "--hot-entity-percent",
@@ -84,16 +93,23 @@ if __name__ == '__main__':
     relation_counts = compute_relation_counts(rel, num_relations)
     hot_entities = select_hot_entities(entity_degrees, args.hot_entity_percent)
     triple_costs = None
-    if args.cost_alpha != 0.0 or args.cost_beta != 0.0:
+    if args.cost_alpha != 0.0 or args.cost_beta != 0.0 or args.cost_neg_factor != 0.0:
         print("computing per-triple costs...")
         triple_costs = compute_triple_costs(
-            src, dst, rel, entity_degrees, relation_counts, args.cost_alpha, args.cost_beta
+            src,
+            dst,
+            rel,
+            entity_degrees,
+            relation_counts,
+            args.cost_alpha,
+            args.cost_beta,
+            args.cost_neg_factor,
         )
     coo = sp.sparse.coo_matrix((np.ones(data.shape[0]), (src, dst)),
                                shape=[num_entities, num_entities])
 
-    triple_partition_assignment = np.full((len(data)), -1, dtype=np.int)
-    entity_partition_assignment = np.full((num_entities), -1, dtype=np.int)
+    triple_partition_assignment = np.full((len(data)), -1, dtype=np.int64)
+    entity_partition_assignment = np.full((num_entities), -1, dtype=np.int64)
     partition_triple_order = {i: [] for i in range(num_parts)}
     num_inner_edges_dict = {}
     inner_nodes_dict = {}
@@ -216,6 +232,7 @@ if __name__ == '__main__':
         "num_hot_entities": int(len(hot_entities)) if hot_entities is not None else 0,
         "cost_alpha": args.cost_alpha,
         "cost_beta": args.cost_beta,
+        "cost_neg_factor": args.cost_neg_factor,
         "partition_counts": partition_counts.tolist(),
         "partition_costs": partition_costs.tolist()
         if partition_costs is not None

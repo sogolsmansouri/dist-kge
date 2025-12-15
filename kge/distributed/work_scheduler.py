@@ -74,6 +74,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.num_processed_partitions = 0
         self.eval_hists = []
         self.active_partition_per_worker = dict()
+        self.active_partition_chunk_sizes = dict()
         self.partition_stats = dict()
         if config.get("job.distributed.scheduler_data_type") not in ["int", "int32", "int64", "long"]:
             raise ValueError("Only long and int is supported as dtype for the scheduler communication")
@@ -239,6 +240,9 @@ class WorkScheduler(mp.get_context("fork").Process):
             dist.send(work_package.partition_data, dst=rank)
             if not pre_localize:
                 self.active_partition_per_worker[rank] = work_package.partition_id
+                self.active_partition_chunk_sizes[rank] = len(work_package.partition_data)
+                if hasattr(self, "previous_partition_per_worker"):
+                    self.previous_partition_per_worker[rank] = work_package.partition_id
             if work_package.entities_in_partition is None:
                 cmd_buffer[1] = 0
                 dist.send(cmd_buffer, dst=rank)
@@ -268,6 +272,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.num_processed_partitions += 1
         print(f"trainer {rank} done with partition {self.num_processed_partitions}")
         self.active_partition_per_worker.pop(rank, None)
+        self.active_partition_chunk_sizes.pop(rank, None)
 
     def _handle_init_info(self, rank):
         max_entities = self._get_max_entities()
@@ -333,7 +338,10 @@ class WorkScheduler(mp.get_context("fork").Process):
         self._handle_partition_feedback(partition_id, avg_time)
 
     def _handle_partition_feedback(self, partition_id, avg_time):
-        pass
+        if not self.work_to_do:
+            return
+        ordered = self._order_by_feedback(list(self.work_to_do))
+        self.work_to_do = deque(ordered)
 
     def _order_by_feedback(self, partition_ids):
         if not self.partition_stats:
@@ -505,6 +513,11 @@ class GraphCutWorkScheduler(WorkScheduler):
             dataset=dataset,
         )
         self.partition_costs = None
+        self.max_chunk_size = max(
+            0, int(config.get("job.distributed.graph_cut.max_chunk_size"))
+        )
+        self.partition_next_offset = defaultdict(int)
+        self.partition_done_offset = defaultdict(int)
 
     def _init_in_started_process(self):
         super(GraphCutWorkScheduler, self)._init_in_started_process()
@@ -512,6 +525,7 @@ class GraphCutWorkScheduler(WorkScheduler):
         self.entities_to_partition = self._get_entities_in_partition()
         self.previous_partition_per_worker = defaultdict(lambda: None)
         self.partition_costs = self._load_partition_costs(self.num_partitions)
+        self._reset_partition_progress()
 
     def _config_check(self, config):
         super(GraphCutWorkScheduler, self)._config_check(config)
@@ -520,24 +534,6 @@ class GraphCutWorkScheduler(WorkScheduler):
                 "Metis partitioning does not support entity sync level 'parititon'. "
                 "Triples still have outside partition accesses."
             )
-
-    def _next_work(
-        self, rank, machine_id
-    ) -> WorkPackage:
-        """add work/partitions to the list of work to do"""
-        try:
-            work_package = WorkPackage()
-            prev_work_id = self.previous_partition_per_worker[rank]
-            if prev_work_id is not None and prev_work_id in self.work_to_do:
-                work_package.partition_id = prev_work_id
-                del self.work_to_do[self.work_to_do.index(prev_work_id)]
-            else:
-                work_package.partition_id = self.work_to_do.pop()
-            work_package.partition_data = self.partitions[work_package.partition_id]
-            work_package.entities_in_partition = self.entities_to_partition[work_package.partition_id]
-            return work_package
-        except IndexError:
-            return WorkPackage()
 
     def _load_partitions(self, num_partitions):
         np_type = TORCH_TO_NP_DTYPE[self.data_type]
@@ -566,6 +562,7 @@ class GraphCutWorkScheduler(WorkScheduler):
         return max([len(i) for i in self.entities_to_partition.values()])
 
     def _refill_work(self):
+        self._reset_partition_progress()
         super(GraphCutWorkScheduler, self)._refill_work()
         if (
             self.partition_costs is not None
@@ -609,6 +606,10 @@ class GraphCutWorkScheduler(WorkScheduler):
         )
         return costs
 
+    def _reset_partition_progress(self):
+        self.partition_next_offset = defaultdict(int)
+        self.partition_done_offset = defaultdict(int)
+
     def _register_partition_result(self, rank, step_time):
         partition_id = self.active_partition_per_worker.get(rank)
         if partition_id is None:
@@ -621,6 +622,62 @@ class GraphCutWorkScheduler(WorkScheduler):
         )
         self.work_to_do = deque(remaining)
         super(GraphCutWorkScheduler, self)._register_partition_result(rank, step_time)
+
+    def _next_work(
+        self, rank, machine_id
+    ) -> WorkPackage:
+        try:
+            work_package = WorkPackage()
+            prev_work_id = self.previous_partition_per_worker[rank]
+            if prev_work_id is not None and prev_work_id in self.work_to_do:
+                work_package.partition_id = prev_work_id
+                del self.work_to_do[self.work_to_do.index(prev_work_id)]
+            else:
+                work_package.partition_id = self.work_to_do.pop()
+            partition_tensor = self.partitions[work_package.partition_id]
+            partition_slice = self._slice_partition(
+                work_package.partition_id, partition_tensor
+            )
+            if partition_slice is None or len(partition_slice) == 0:
+                return self._next_work(rank, machine_id)
+            work_package.partition_data = partition_slice
+            work_package.entities_in_partition = self.entities_to_partition[work_package.partition_id]
+            return work_package
+        except IndexError:
+            return WorkPackage()
+
+    def _slice_partition(self, partition_id, partition_tensor):
+        total = len(partition_tensor)
+        if self.max_chunk_size <= 0 or total <= self.max_chunk_size:
+            self.partition_next_offset[partition_id] = total
+            return partition_tensor
+        start = self.partition_next_offset[partition_id]
+        if start >= total:
+            return None
+        chunk_len = min(self.max_chunk_size, total - start)
+        end = start + chunk_len
+        self.partition_next_offset[partition_id] = end
+        if end < total:
+            self.work_to_do.appendleft(partition_id)
+        return partition_tensor.narrow(0, start, chunk_len).clone()
+
+    def _handle_work_done(self, rank):
+        if self.max_chunk_size <= 0:
+            return super(GraphCutWorkScheduler, self)._handle_work_done(rank)
+        partition_id = self.active_partition_per_worker.get(rank)
+        chunk_size = self.active_partition_chunk_sizes.pop(rank, 0)
+        if partition_id is None or chunk_size <= 0:
+            return super(GraphCutWorkScheduler, self)._handle_work_done(rank)
+        total = len(self.partitions[partition_id])
+        self.partition_done_offset[partition_id] += chunk_size
+        if self.partition_done_offset[partition_id] >= total:
+            return super(GraphCutWorkScheduler, self)._handle_work_done(rank)
+        # partition still has pending chunks; release worker but avoid double-counting
+        self.active_partition_per_worker.pop(rank, None)
+        print(
+            f"trainer {rank} finished chunk "
+            f"{self.partition_done_offset[partition_id]}/{total} of partition {partition_id}"
+        )
 
 
 class StratificationWorkScheduler(WorkScheduler):
