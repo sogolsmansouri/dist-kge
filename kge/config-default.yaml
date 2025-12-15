@@ -79,6 +79,14 @@ job:
       enable: False
       file: ''        # optional override; defaults to dataset/analysis_hot_entities.npy
       max_entities: -1  # if >0, limit to this many hot entities per worker
+    scheduler_feedback:
+      enable: False
+      min_history: 3
+      slow_partition_factor: 1.5
+      target_chunk_size: 0
+      min_chunk_size: 1024
+      max_splits_per_partition: 8
+      ema_decay: 0.5
     graph_cut:
       cost_aware_schedule: False
       max_chunk_size: 0

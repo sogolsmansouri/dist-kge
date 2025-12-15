@@ -345,6 +345,10 @@ class WorkScheduler(mp.get_context("fork").Process):
         history.append(step_time)
         avg_time = sum(history) / len(history)
         self._handle_partition_feedback(partition_id, avg_time)
+        self._after_partition_result(partition_id, avg_time)
+
+    def _after_partition_result(self, partition_id, avg_time):
+        pass
 
     def _handle_partition_feedback(self, partition_id, avg_time):
         if not self.work_to_do:
@@ -402,7 +406,115 @@ class WorkScheduler(mp.get_context("fork").Process):
         raise NotImplementedError()
 
 
-class RandomWorkScheduler(WorkScheduler):
+class AdaptiveWorkScheduler(WorkScheduler):
+    def __init__(self, config, dataset):
+        super(AdaptiveWorkScheduler, self).__init__(config=config, dataset=dataset)
+        cfg = config.get("job.distributed.scheduler_feedback") or {}
+        self._adaptive_enabled = bool(cfg.get("enable", False))
+        self._adaptive_min_history = max(1, int(cfg.get("min_history", 3)))
+        self._adaptive_slow_factor = max(1.0, float(cfg.get("slow_partition_factor", 1.5)))
+        self._adaptive_target_chunk = max(0, int(cfg.get("target_chunk_size", 0)))
+        self._adaptive_min_chunk = max(1, int(cfg.get("min_chunk_size", 1)))
+        self._adaptive_max_splits = max(1, int(cfg.get("max_splits_per_partition", 8)))
+        decay = float(cfg.get("ema_decay", 0.5))
+        decay = min(0.999, max(0.0, decay))
+        self._adaptive_decay = decay
+        self._adaptive_global_avg = None
+        self._adaptive_offsets = defaultdict(int)
+        self._adaptive_chunk_sizes = defaultdict(int)
+        self._adaptive_split_counts = defaultdict(int)
+        self._adaptive_total_lengths: Dict = {}
+
+    def _supports_adaptive_feedback(self):
+        return False
+
+    def _after_partition_result(self, partition_id, avg_time):
+        super(AdaptiveWorkScheduler, self)._after_partition_result(partition_id, avg_time)
+        if (
+            not self._adaptive_enabled
+            or not self._supports_adaptive_feedback()
+            or partition_id is None
+        ):
+            return
+        history = self.partition_stats.get(partition_id)
+        if not history or len(history) < self._adaptive_min_history:
+            return
+        if self._adaptive_global_avg is None:
+            self._adaptive_global_avg = avg_time
+        else:
+            self._adaptive_global_avg = (
+                self._adaptive_decay * self._adaptive_global_avg
+                + (1.0 - self._adaptive_decay) * avg_time
+            )
+        if self._adaptive_global_avg <= 0:
+            return
+        if avg_time < self._adaptive_global_avg * self._adaptive_slow_factor:
+            return
+        total_len = self._adaptive_total_lengths.get(partition_id)
+        if total_len is None:
+            total_len = self._adaptive_get_partition_length(partition_id)
+            if total_len is not None:
+                self._adaptive_total_lengths[partition_id] = total_len
+        if total_len is None or total_len < self._adaptive_min_chunk * 2:
+            return
+        if self._adaptive_split_counts[partition_id] >= self._adaptive_max_splits:
+            return
+        chunk_size = self._adaptive_target_chunk
+        if chunk_size <= 0 or chunk_size >= total_len:
+            chunk_size = max(self._adaptive_min_chunk, total_len // 2)
+        if chunk_size <= 0 or chunk_size >= total_len:
+            return
+        self._adaptive_chunk_sizes[partition_id] = chunk_size
+        self._adaptive_split_counts[partition_id] += 1
+
+    def _adaptive_get_partition_length(self, partition_id):
+        return self._adaptive_total_lengths.get(partition_id)
+
+    def _adaptive_requeue_partition(self, partition_id):
+        if hasattr(self, "work_to_do") and isinstance(self.work_to_do, deque):
+            self.work_to_do.appendleft(partition_id)
+
+    def _adaptive_reset_state(self):
+        self._adaptive_offsets.clear()
+        self._adaptive_total_lengths.clear()
+
+    def _adaptive_maybe_slice(self, partition_id, partition_tensor):
+        if (
+            not self._adaptive_enabled
+            or not self._supports_adaptive_feedback()
+            or partition_tensor is None
+        ):
+            return partition_tensor
+        total = len(partition_tensor)
+        if total == 0:
+            return partition_tensor
+        if partition_id not in self._adaptive_total_lengths:
+            self._adaptive_total_lengths[partition_id] = total
+        chunk_size = self._adaptive_chunk_sizes.get(partition_id, 0)
+        if chunk_size <= 0 or chunk_size >= total:
+            self._adaptive_offsets[partition_id] = 0
+            return partition_tensor
+        start = self._adaptive_offsets[partition_id]
+        if start >= total:
+            self._adaptive_chunk_sizes[partition_id] = 0
+            self._adaptive_offsets[partition_id] = 0
+            return partition_tensor
+        take = min(chunk_size, total - start)
+        end = start + take
+        self._adaptive_offsets[partition_id] = end
+        if end < total:
+            self._adaptive_requeue_partition(partition_id)
+        else:
+            self._adaptive_chunk_sizes[partition_id] = 0
+            self._adaptive_offsets[partition_id] = 0
+        return partition_tensor.narrow(0, start, take).clone()
+
+    def _refill_work(self):
+        self._adaptive_reset_state()
+        return super(AdaptiveWorkScheduler, self)._refill_work()
+
+
+class RandomWorkScheduler(AdaptiveWorkScheduler):
     def __init__(
         self,
         config,
@@ -421,7 +533,13 @@ class RandomWorkScheduler(WorkScheduler):
         try:
             work_package = WorkPackage()
             work_package.partition_id = self.work_to_do.pop()
-            work_package.partition_data = self.partitions[work_package.partition_id]
+            partition_tensor = self.partitions[work_package.partition_id]
+            partition_slice = self._adaptive_maybe_slice(
+                work_package.partition_id, partition_tensor
+            )
+            if partition_slice is None or len(partition_slice) == 0:
+                return self._next_work(rank, machine_id)
+            work_package.partition_data = partition_slice
             # those are not entities in the partition but "local" entities for the
             #  worker to allow local sampling
             work_package.entities_in_partition = self.local_entities[rank]
@@ -444,8 +562,16 @@ class RandomWorkScheduler(WorkScheduler):
         reordered = self._order_by_feedback(list(self.work_to_do))
         self.work_to_do = deque(reordered)
 
+    def _supports_adaptive_feedback(self):
+        return True
 
-class RelationWorkScheduler(WorkScheduler):
+    def _adaptive_get_partition_length(self, partition_id):
+        if 0 <= partition_id < len(self.partitions):
+            return len(self.partitions[partition_id])
+        return None
+
+
+class RelationWorkScheduler(AdaptiveWorkScheduler):
     def __init__(
         self,
         config,
@@ -469,7 +595,13 @@ class RelationWorkScheduler(WorkScheduler):
         try:
             work_package = WorkPackage()
             work_package.partition_id = self.work_to_do.pop()
-            work_package.partition_data = self.partitions[work_package.partition_id]
+            partition_tensor = self.partitions[work_package.partition_id]
+            partition_slice = self._adaptive_maybe_slice(
+                work_package.partition_id, partition_tensor
+            )
+            if partition_slice is None or len(partition_slice) == 0:
+                return self._next_work(rank, machine_id)
+            work_package.partition_data = partition_slice
             work_package.relations_in_partition = self.relations_to_partition[work_package.partition_id]
             # those are not entities in the partition but "local" entities for the
             #  worker to allow local sampling
@@ -508,6 +640,14 @@ class RelationWorkScheduler(WorkScheduler):
         super(RelationWorkScheduler, self)._refill_work()
         reordered = self._order_by_feedback(list(self.work_to_do))
         self.work_to_do = deque(reordered)
+
+    def _supports_adaptive_feedback(self):
+        return True
+
+    def _adaptive_get_partition_length(self, partition_id):
+        if 0 <= partition_id < len(self.partitions):
+            return len(self.partitions[partition_id])
+        return None
 
 
 class GraphCutWorkScheduler(WorkScheduler):
@@ -798,7 +938,7 @@ class GraphCutWorkScheduler(WorkScheduler):
             self.config.log(f"Failed to export graph-cut feedback: {e}")
 
 
-class StratificationWorkScheduler(WorkScheduler):
+class StratificationWorkScheduler(AdaptiveWorkScheduler):
 
     def __init__(
         self,
@@ -1116,7 +1256,11 @@ class StratificationWorkScheduler(WorkScheduler):
                 else:
                     self._pre_localized_strata[rank] = strata
                 work_package.partition_id = strata
-                work_package.partition_data = strata_data
+                partition_slice = self._adaptive_maybe_slice(strata, strata_data)
+                if partition_slice is None or len(partition_slice) == 0:
+                    work_package.partition_data = strata_data
+                else:
+                    work_package.partition_data = partition_slice
                 work_package.entities_in_partition = entities_in_strata
                 return work_package
 
@@ -1168,6 +1312,34 @@ class StratificationWorkScheduler(WorkScheduler):
         self.fixed_schedule = self.schedule_creator.create_schedule()
         if self.fixed_schedule is None:
             self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
+
+    def _supports_adaptive_feedback(self):
+        return True
+
+    def _adaptive_get_partition_length(self, partition_id):
+        data = self.partitions.get(partition_id)
+        if data is None:
+            return None
+        length = len(data)
+        if not self.combine_mirror_blocks:
+            return length
+        i, j = partition_id
+        if i == j:
+            if i % 2 == 0:
+                return length
+            mirror = (i - 1, j - 1)
+        else:
+            mirror = (j, i)
+        mirror_data = self.partitions.get(mirror)
+        if mirror_data is not None:
+            length += len(mirror_data)
+        return length
+
+    def _adaptive_requeue_partition(self, partition_id):
+        if isinstance(self.current_iteration, set):
+            self.current_iteration.add(partition_id)
+        else:
+            super(StratificationWorkScheduler, self)._adaptive_requeue_partition(partition_id)
 
     def _load_partitions(self, num_partitions):
         start = time.time()
