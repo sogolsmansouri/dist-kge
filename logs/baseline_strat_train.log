@@ -1,0 +1,15 @@
+/mnt/beegfs/smansou2/repos/dist-kge-upstream/kge/cli.py:15: UserWarning: Lapse could not be imported. Only parallel training possible.
+  warnings.warn("Lapse could not be imported. Only parallel training possible.")
+Traceback (most recent call last):
+  File "/mnt/beegfs/smansou2/conda_envs/distkge-py38-clean/lib/python3.8/runpy.py", line 194, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/mnt/beegfs/smansou2/conda_envs/distkge-py38-clean/lib/python3.8/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/mnt/beegfs/smansou2/repos/dist-kge-upstream/kge/__main__.py", line 4, in <module>
+    main()
+  File "/mnt/beegfs/smansou2/repos/dist-kge-upstream/kge/cli.py", line 197, in main
+    config.load(args.config)
+  File "/mnt/beegfs/smansou2/repos/dist-kge-upstream/kge/config.py", line 352, in load
+    with open(filename, "r") as file:
+FileNotFoundError: [Errno 2] No such file or directory: 'examples/freebase-complex-parallel.yaml'
+Loading configuration examples/freebase-complex-parallel.yaml...
