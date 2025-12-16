@@ -4,6 +4,8 @@ import numpy as np
 from torch.optim.optimizer import Optimizer
 from copy import deepcopy
 
+from kge.util.triton_fused import fused_embedding_optimizer_update
+
 
 class DistAdagrad(Optimizer):
     """Implements Adagrad algorithm.
@@ -172,16 +174,9 @@ class DistAdagrad(Optimizer):
                     else:
                         sum_update_values = grad_values.pow(2).mean(1).view(-1, 1)
                     state_sum.add_(sum_update_values)
-                    # state["sum"].add_(make_sparse(sum_update_values))
-                    if group["sync_level"] == "batch":
-                        pass
-                    else:
-                        # state["sum"][grad_indices_flat] = state_sum
-                        group["optimizer_values"][grad_indices] = state_sum
-
                     # std = state["sum"].sparse_mask(grad)
                     # std_values = std._values().sqrt_().add_(group["eps"])
-                    std_values = state_sum.sqrt_().add_(group["eps"])
+                    std_values = state_sum.sqrt().add_(group["eps"])
                     update_value = (grad_values / std_values).mul_(-clr)
                     if group["sync_level"] == "batch":
                         update_indexes = grad_indices.cpu()
@@ -218,8 +213,13 @@ class DistAdagrad(Optimizer):
                             )
                         )
                     else:
-                        p.data.index_add_(0, grad_indices, update_value)
-                        # p.add_(make_sparse(update_value))
+                        fused_embedding_optimizer_update(
+                            p.data,
+                            group["optimizer_values"],
+                            grad_indices,
+                            update_value,
+                            state_sum,
+                        )
                     # p.add_(make_sparse(grad_values / std_values), alpha=-clr)
                 else:
                     raise ValueError(

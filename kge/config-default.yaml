@@ -79,6 +79,10 @@ job:
       enable: False
       file: ''        # optional override; defaults to dataset/analysis_hot_entities.npy
       max_entities: -1  # if >0, limit to this many hot entities per worker
+    locality_ordering:
+      enable: False
+      entity_rank_file: analysis_entity_locality_rank.npy
+      relation_rank_file: analysis_relation_locality_rank.npy
     scheduler_feedback:
       enable: False
       min_history: 3

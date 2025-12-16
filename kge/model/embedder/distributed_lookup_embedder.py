@@ -1,10 +1,12 @@
 import math
 import time
+from pathlib import Path
 from torch import Tensor
 import torch.nn
 import torch.nn.functional
 
 import torch
+import numpy as np
 from collections import deque
 
 from kge import Config, Dataset
@@ -90,6 +92,11 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self.mapping_time = 0.0
         # self.pre_pulled = None
         self.pre_pulled = deque()
+        self.copy_stream = None
+        if "cuda" in config.get("job.device"):
+            with torch.cuda.device(config.get("job.device")):
+                self.copy_stream = torch.cuda.Stream()
+        self.locality_rank = self._load_locality_rank()
 
     def to_device(self, move_optim_data=True):
         """Needs to be called after model.to(self.device)"""
@@ -186,18 +193,37 @@ class DistributedLookupEmbedder(LookupEmbedder):
             if free:
                 self.pull_tensors[i][0] = False
                 return i, pull_tensor
+        return None
+
+    def _async_copy_to_device(self, tensor):
+        device = self._embeddings.weight.device
+        if tensor.device == device:
+            return tensor, None
+        if self.copy_stream is None:
+            return tensor.to(device, non_blocking=True), None
+        target = torch.empty_like(tensor, device=device)
+        with torch.cuda.stream(self.copy_stream):
+            target.copy_(tensor, non_blocking=True)
+        event = torch.cuda.Event()
+        self.copy_stream.record_event(event)
+        return target, event
 
     @torch.no_grad()
     def pre_pull(self, indexes):
         pull_indexes = (indexes + self.lapse_offset).cpu()
-        pull_tensor_index, pull_tensor = self._get_free_pull_tensor()
-        pull_tensor = pull_tensor[: len(indexes)]
+        result = self._get_free_pull_tensor()
+        if result is None:
+            return
+        pull_tensor_index, pull_tensor = result
+        num_indexes = len(indexes)
+        pull_tensor = pull_tensor[:num_indexes]
         pull_future = self.parameter_client.pull(
             pull_indexes, pull_tensor, asynchronous=True
         )
         self.pre_pulled.append(
             {
                 "indexes": indexes,
+                "num_indexes": num_indexes,
                 "pull_indexes": pull_indexes,
                 "pull_tensor": pull_tensor,
                 "pull_future": pull_future,
@@ -210,27 +236,39 @@ class DistributedLookupEmbedder(LookupEmbedder):
             # id 0 is from the batch currently processed
             # last one is the one pulled from ps
             # we are moving the second last
-            self.parameter_client.wait(self.pre_pulled[-2]["pull_future"])
-            self.pre_pulled[-2]["pull_tensor"] = self.pre_pulled[-2]["pull_tensor"].to(
-                self._embeddings.weight.device, non_blocking=True
-            )
+            entry = self.pre_pulled[-2]
+            if entry.get("device_tensor") is None:
+                self.parameter_client.wait(entry["pull_future"])
+                device_tensor, event = self._async_copy_to_device(entry["pull_tensor"])
+                entry["device_tensor"] = device_tensor
+                entry["copy_event"] = event
 
     @torch.no_grad()
     def _pull_embeddings(self, indexes):
         cpu_gpu_time = 0.0
         pull_time = 0.0
         device = self._embeddings.weight.device
-        len_indexes = len(indexes)
-        if len(self.pre_pulled) > 0:
+        use_prefetch = len(self.pre_pulled) > 0
+        if use_prefetch:
             # todo: add workaround for relations here as well
             # todo: clean up this method
             pre_pulled = self.pre_pulled.popleft()
-            self.pulled_ids = pre_pulled["indexes"]
+            indexes = pre_pulled["indexes"]
+            len_indexes = pre_pulled.get("num_indexes", len(indexes))
+            pull_indexes = pre_pulled["pull_indexes"][:len_indexes]
+            self.pulled_ids = indexes
             self.parameter_client.wait(pre_pulled["pull_future"])
-            self.local_to_lapse_mapper[:len_indexes] = pre_pulled["pull_indexes"]
-            cpu_gpu_time -= time.time()
-            pre_pulled_tensor = pre_pulled["pull_tensor"].to(device)
-            cpu_gpu_time += time.time()
+            self.local_to_lapse_mapper[:len_indexes] = pull_indexes
+            tensor = pre_pulled.get("device_tensor")
+            event = pre_pulled.get("copy_event")
+            if tensor is None:
+                cpu_gpu_time -= time.time()
+                tensor = pre_pulled["pull_tensor"].to(device, non_blocking=True)
+                cpu_gpu_time += time.time()
+            else:
+                if event is not None and device.type == "cuda":
+                    torch.cuda.current_stream(device).wait_event(event)
+            pre_pulled_tensor = tensor
             pulled_embeddings, pulled_optim_values = torch.split(
                 pre_pulled_tensor, [self.dim, self.optimizer_dim], dim=1
             )
@@ -239,6 +277,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
             self.pull_tensors[pre_pulled["pull_tensor_index"]][0] = True
             return pull_time, cpu_gpu_time
 
+        len_indexes = len(indexes)
         self.pulled_ids = indexes
         pull_indexes = (indexes + self.lapse_offset).cpu()
         self.local_to_lapse_mapper[:len_indexes] = pull_indexes
@@ -331,3 +370,44 @@ class DistributedLookupEmbedder(LookupEmbedder):
             raise ValueError(f"Invalid value regularize={self.regularize}")
 
         return result
+
+    def _load_locality_rank(self):
+        cfg = self.config.get("job.distributed.locality_ordering") or {}
+        if not cfg.get("enable", False):
+            return None
+        if "entity" in self.configuration_key:
+            filename = cfg.get("entity_rank_file") or "analysis_entity_locality_rank.npy"
+            expected = self.dataset.num_entities()
+        elif "relation" in self.configuration_key:
+            filename = cfg.get("relation_rank_file") or "analysis_relation_locality_rank.npy"
+            expected = self.dataset.num_relations()
+        else:
+            return None
+        rank_path = Path(self.dataset.folder) / filename
+        if not rank_path.is_file():
+            return None
+        try:
+            data = np.load(rank_path)
+            if len(data) != expected:
+                self.config.log(
+                    f"Ignoring locality rank {rank_path} (expected {expected} entries, found {len(data)})."
+                )
+                return None
+            tensor = torch.from_numpy(data.astype(np.int64))
+            self.config.log(f"Loaded locality rank from {rank_path}.")
+            return tensor
+        except Exception as exc:
+            self.config.log(f"Failed to load locality rank from {rank_path}: {exc}")
+            return None
+
+    def apply_locality_order(self, indexes: Tensor) -> Tensor:
+        if self.locality_rank is None or indexes.numel() <= 1:
+            return indexes
+        if indexes.device.type != "cpu":
+            cpu_idx = indexes.detach().cpu()
+            ranks = self.locality_rank[cpu_idx]
+            order = torch.argsort(ranks)
+            return cpu_idx[order].to(indexes.device)
+        ranks = self.locality_rank[indexes]
+        order = torch.argsort(ranks)
+        return indexes[order]

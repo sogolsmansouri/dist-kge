@@ -374,6 +374,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     )
                 )
             )
+            entity_embedder = self.model.get_s_embedder()
+            relation_embedder = self.model.get_p_embedder()
+            if hasattr(entity_embedder, "apply_locality_order"):
+                unique_entities = entity_embedder.apply_locality_order(unique_entities)
+            if hasattr(relation_embedder, "apply_locality_order"):
+                unique_relations = relation_embedder.apply_locality_order(unique_relations)
             unique_time += time.time()
 
             return {

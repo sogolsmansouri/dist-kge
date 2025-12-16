@@ -43,6 +43,20 @@ def compute_triple_costs(src, dst, rel, entity_degrees, relation_counts, alpha, 
         costs += neg_factor * neg_load
     return costs
 
+
+def compute_locality_rank(num_items, priority_ids=None):
+    """Return per-id priority where lower rank == earlier placement."""
+    order = np.arange(num_items, dtype=np.int64)
+    if priority_ids is not None and len(priority_ids) > 0:
+        priority_ids = np.asarray(priority_ids, dtype=np.int64)
+        seen = np.zeros(num_items, dtype=bool)
+        seen[priority_ids] = True
+        cold = order[~seen]
+        order = np.concatenate((priority_ids, cold))
+    rank = np.empty(num_items, dtype=np.int64)
+    rank[order] = np.arange(num_items, dtype=np.int64)
+    return rank
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", help="name of dataset to partition")
@@ -287,3 +301,11 @@ if __name__ == '__main__':
     print(counts)
 
     print(triple_partition_assignment)
+
+    entity_rank = compute_locality_rank(num_entities, hot_entities)
+    np.save(analysis_prefix / "analysis_entity_locality_rank.npy", entity_rank)
+    if num_relations > 0:
+        relation_priority = np.argsort(-relation_counts, kind="mergesort")
+        relation_rank = np.empty(num_relations, dtype=np.int64)
+        relation_rank[relation_priority] = np.arange(num_relations, dtype=np.int64)
+        np.save(analysis_prefix / "analysis_relation_locality_rank.npy", relation_rank)

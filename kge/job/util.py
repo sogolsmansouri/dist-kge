@@ -44,18 +44,18 @@ def coord_to_sparse_tensor(
         coords[:, 0] -= row_slice.start
         nrows = row_slice.stop - row_slice.start
 
-    if device == "cpu":
-        labels = torch.sparse.FloatTensor(
-            coords.long().t(),
-            torch.ones([len(coords)], dtype=torch.float, device=device) * value,
-            torch.Size([nrows, ncols]),
-        )
-    else:
-        labels = torch.cuda.sparse.FloatTensor(
-            coords.long().t(),
-            torch.ones([len(coords)], dtype=torch.float, device=device) * value,
-            torch.Size([nrows, ncols]),
-            device=device,
-        )
+    if coords.numel() == 0:
+        indices = torch.zeros((2, 0), dtype=torch.long)
+        values = torch.zeros(0, dtype=torch.float, device=device)
+        return torch.sparse_coo_tensor(indices, values, (nrows, ncols), device=device)
 
-    return labels
+    indices = coords.long().t().contiguous()
+    if device != "cpu":
+        indices = indices.to(device)
+    values = torch.full(
+        (indices.shape[1],),
+        float(value),
+        dtype=torch.float,
+        device=device,
+    )
+    return torch.sparse_coo_tensor(indices, values, (nrows, ncols), device=device).coalesce()
