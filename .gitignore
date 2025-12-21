@@ -150,3 +150,6 @@ docs/_build
 /tests/data/dataset_test/*.pckl
 /data/freebase/**
 /data/freebase/.*
+# Large datasets / generated artifacts (do not commit)
+data/freebase/train.del
+data/freebase/partitions/
