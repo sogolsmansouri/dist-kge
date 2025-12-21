@@ -1,6 +1,7 @@
 import os
 import gc
 import datetime
+import warnings
 from typing import Optional
 from copy import deepcopy
 import torch
@@ -26,6 +27,8 @@ class WorkerProcessPool:
         already_init_workers = config.get("job.distributed.already_init_workers")
 
         config.log(f"creating worker process pool with {config.get('job.distributed.num_workers')} workers")
+        sanitized_pool = self._sanitize_device_pool(config)
+        config.set("job.device_pool", sanitized_pool)
         self.workers = []
         configs = {}
         parameters = None
@@ -58,6 +61,36 @@ class WorkerProcessPool:
             )
             worker.start()
             self.workers.append(worker)
+
+    def _sanitize_device_pool(self, config):
+        device_pool = list(config.get("job.device_pool") or [])
+        if not device_pool:
+            return device_pool
+        available_cuda = torch.cuda.device_count()
+        sanitized = []
+        for dev in device_pool:
+            if isinstance(dev, str) and dev.startswith("cuda"):
+                idx = 0
+                if dev != "cuda":
+                    try:
+                        idx = int(dev.split(":")[1])
+                    except (IndexError, ValueError):
+                        idx = None
+                if idx is not None and (available_cuda == 0 or idx >= available_cuda):
+                    warnings.warn(
+                        f"Ignoring unavailable device '{dev}' "
+                        f"(cuda.device_count={available_cuda})."
+                    )
+                    continue
+            sanitized.append(dev)
+        if not sanitized:
+            fallback = config.get("job.device")
+            warnings.warn(
+                "All entries in job.device_pool were invalid; "
+                f"falling back to '{fallback}'."
+            )
+            sanitized = [fallback]
+        return sanitized
 
     def join(self):
         """Wait for all workers"""

@@ -83,6 +83,11 @@ class TrainingJob(TrainingOrEvaluationJob):
         self._subbatch_auto_tune: bool = config.get("train.subbatch_auto_tune")
         self._max_subbatch_size: int = config.get("train.subbatch_size")
         self.device: str = self.config.get("job.device")
+        self._non_blocking_transfer: bool = bool(
+            isinstance(self.device, str)
+            and self.device.startswith("cuda")
+            and self.config.get("train.pin_memory")
+        )
         self.train_split = config.get("train.split")
 
         self.config.check("train.trace_level", ["batch", "epoch"])

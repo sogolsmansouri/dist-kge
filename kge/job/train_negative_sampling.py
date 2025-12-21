@@ -36,6 +36,12 @@ class TrainingJobNegativeSampling(TrainingJob):
         )
         self._sampler = KgeSampler.create(config, "negative_sampling", dataset)
         self.type_str = "negative_sampling"
+        loss_type = self.config.get("train.loss")
+        self._fuse_slot_losses = loss_type in [
+            "bce",
+            "bce_mean",
+            "bce_self_adversarial",
+        ]
 
         if self.__class__ == TrainingJobNegativeSampling:
             for f in Job.job_created_hooks:
@@ -131,6 +137,8 @@ class TrainingJobNegativeSampling(TrainingJob):
         subbatch_size = len(triples)
         result.prepare_time += time.time()
         labels = batch["labels"]  # reuse b/w subbatches
+        fused_scores = []
+        fused_labels = []
 
         # process the subbatch for each slot separately
         for slot in [S, P, O]:
@@ -164,15 +172,35 @@ class TrainingJobNegativeSampling(TrainingJob):
             result.forward_time += batch_negative_samples[slot].forward_time
             result.prepare_time += batch_negative_samples[slot].prepare_time
 
-            # compute loss for slot in subbatch (concluding the forward pass)
+            if self._fuse_slot_losses:
+                fused_scores.append(scores)
+                fused_labels.append(labels[slot])
+            else:
+                # compute loss for slot in subbatch (concluding the forward pass)
+                result.forward_time -= time.time()
+                loss_value_torch = (
+                    self.loss(scores, labels[slot], num_negatives=num_samples)
+                    / batch_size
+                )
+                result.avg_loss += loss_value_torch.item()
+                result.forward_time += time.time()
+
+                # backward pass for this slot in the subbatch
+                result.backward_time -= time.time()
+                if not self.is_forward_only:
+                    loss_value_torch.backward()
+                result.backward_time += time.time()
+
+        if self._fuse_slot_losses and fused_scores:
+            fused_scores_tensor = torch.cat(fused_scores, dim=1)
+            fused_labels_tensor = torch.cat(fused_labels, dim=1)
             result.forward_time -= time.time()
             loss_value_torch = (
-                self.loss(scores, labels[slot], num_negatives=num_samples) / batch_size
+                self.loss(fused_scores_tensor, fused_labels_tensor) / batch_size
             )
             result.avg_loss += loss_value_torch.item()
             result.forward_time += time.time()
 
-            # backward pass for this slot in the subbatch
             result.backward_time -= time.time()
             if not self.is_forward_only:
                 loss_value_torch.backward()

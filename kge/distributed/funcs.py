@@ -1,11 +1,12 @@
+import os
 import time
 import logging
 import warnings
 
 import psutil
 from signal import signal, SIGINT
-from py3nvml.py3nvml import *
 from typing import Dict, Optional
+import threading
 from kge import Config, Dataset
 from kge.distributed.parameter_server import init_torch_server, init_lapse_scheduler
 from kge.distributed.worker_process import WorkerProcessPool
@@ -52,6 +53,19 @@ def monitor_hardware(folder, interval=1):
 
 def monitor_gpus(folder, interval=1):
     try:
+        from py3nvml.py3nvml import (
+            nvmlInit,
+            nvmlDeviceGetCount,
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetComputeRunningProcesses,
+            nvmlDeviceGetUtilizationRates,
+            nvmlDeviceGetMemoryInfo,
+            nvmlShutdown,
+        )
+    except Exception:
+        print("py3nvml not available. GPU monitoring disabled.")
+        return
+    try:
         nvmlInit()
     except Exception:
         print("could not initialize GPU monitor")
@@ -79,6 +93,7 @@ def monitor_gpus(folder, interval=1):
             logger.info(
                 f"{time.time()};{i};{res.gpu};{round((mem_res.used/mem_res.total)*100)};{mem_per_process}"
             )
+    nvmlShutdown()
 
 def update_config_for_distributed(config: Config):
     # setting num eval workers to 1 if < 1
@@ -153,6 +168,9 @@ def create_and_run_distributed(
         exit(0)
     signal(SIGINT, kill_processes)
 
+    job_device = str(config.get("job.device"))
+    use_gpu = job_device.startswith("cuda")
+
     if config.get("job.type") == "train":
         # start hardware monitoring
         monitor_process = mp.Process(
@@ -160,11 +178,29 @@ def create_and_run_distributed(
         )
         monitoring_processes.append(monitor_process)
         monitor_process.start()
-        gpu_monitor_process = mp.Process(
-            target=monitor_gpus, args=(config.folder, 1), daemon=True
-        )
-        monitoring_processes.append(gpu_monitor_process)
-        gpu_monitor_process.start()
+        if use_gpu:
+            gpu_monitor_process = mp.Process(
+                target=monitor_gpus, args=(config.folder, 1), daemon=True
+            )
+            monitoring_processes.append(gpu_monitor_process)
+            gpu_monitor_process.start()
+
+    worker_pool_holder = {"pool": None, "error": None}
+
+    def _spawn_workers():
+        try:
+            worker_pool_holder["pool"] = WorkerProcessPool(
+                config,
+                dataset,
+                checkpoint,
+            )
+        except Exception as exc:
+            worker_pool_holder["error"] = exc
+
+    worker_thread = threading.Thread(
+        target=_spawn_workers, name="worker-pool-spawn", daemon=True
+    )
+    worker_thread.start()
 
     if config.get("job.distributed.machine_id") == 0:
         num_keys = get_num_keys(config, dataset)
@@ -202,17 +238,18 @@ def create_and_run_distributed(
         scheduler.start()
         config.log(f"scheduler start took: {time.time()-scheduler_start_time}")
 
-    # create all train-workers in a worker pool
-    worker_process_pool = WorkerProcessPool(
-        config,
-        dataset,
-        checkpoint,
-    )
+    worker_thread.join()
+    if worker_pool_holder["error"] is not None:
+        raise worker_pool_holder["error"]
+    worker_process_pool = worker_pool_holder["pool"]
     valid_trace = worker_process_pool.join()
     for p in processes:
         p.join()
 
     if config.get("job.type") == "train":
         monitor_process.terminate()
-        gpu_monitor_process.terminate()
+        monitor_process.join(timeout=1.0)
+        if use_gpu:
+            gpu_monitor_process.terminate()
+            gpu_monitor_process.join(timeout=1.0)
     return valid_trace

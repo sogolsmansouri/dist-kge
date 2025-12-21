@@ -42,6 +42,7 @@ class DistAdagrad(Optimizer):
         is_row=False,
         use_lr_scheduler=False,
         min_rank=-1,
+        max_pending_pushes=2,
     ):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -62,15 +63,15 @@ class DistAdagrad(Optimizer):
         self.lapse_indexes = lapse_indexes
         self.pulled_parameters = [None, None]
         self.async_write_back = async_write_back
+        self._async_write_back_map = {
+            "entity": bool(async_write_back[0]) if len(async_write_back) > 0 else True,
+            "relation": bool(async_write_back[1]) if len(async_write_back) > 1 else True,
+        }
 
         self.is_row = is_row
 
         self.parameter_client = parameter_client
-        self.push_keys = {"entity": None, "relation": None}
-        self.push_tensors = {
-            "entity": None,
-            "relation": None,
-        }
+        self._push_buffer_pool = {"entity": [], "relation": []}
         self.use_lr_scheduler = use_lr_scheduler
         self.min_rank = min_rank
         self.entity_async_wait_values = deque()
@@ -79,6 +80,7 @@ class DistAdagrad(Optimizer):
             "entity": self.entity_async_wait_values,
             "relation": self.relation_async_wait_values,
         }
+        self.max_pending_pushes = max(1, int(max_pending_pushes))
 
         defaults = dict(
             lr=lr,
@@ -115,14 +117,16 @@ class DistAdagrad(Optimizer):
         """
         # we need to wait here for the previous push to finish, otherwise we can not
         #  delete the push tensors
-        if self.async_write_back[0]:
-            for wait_value in self.entity_async_wait_values:
-                self.parameter_client.wait(wait_value)
-            self.entity_async_wait_values.clear()
-        if self.async_write_back[1]:
-            for wait_value in self.relation_async_wait_values:
-                self.parameter_client.wait(wait_value)
-            self.relation_async_wait_values.clear()
+        self._process_wait_queue(
+            self.entity_async_wait_values,
+            self._async_write_back_map["entity"],
+            "entity",
+        )
+        self._process_wait_queue(
+            self.relation_async_wait_values,
+            self._async_write_back_map["relation"],
+            "relation",
+        )
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -180,38 +184,20 @@ class DistAdagrad(Optimizer):
                     update_value = (grad_values / std_values).mul_(-clr)
                     if group["sync_level"] == "batch":
                         update_indexes = grad_indices.cpu()
-                        self.push_keys[group["name"]] = group["local_to_lapse_mapper"][
-                            update_indexes
-                        ]
-                        unnecessary_dim = (
-                            self.parameter_client.dim
-                            - update_value.shape[1]
-                            - sum_update_values.shape[1]
+                        push_keys = group["local_to_lapse_mapper"][update_indexes]
+                        payload_buffer = self._acquire_push_buffer(
+                            group["name"], len(update_value)
                         )
-                        if unnecessary_dim > 0:
-                            self.push_tensors[group["name"]] = torch.cat(
-                                (
-                                    update_value,
-                                    sum_update_values,
-                                    torch.empty(
-                                        (len(update_value), unnecessary_dim),
-                                        device=update_value.device,
-                                    ),
-                                ),
-                                dim=1,
-                            ).cpu()
-                        else:
-                            self.push_tensors[group["name"]] = torch.cat(
-                                (update_value, sum_update_values), dim=1
-                            ).cpu()
-                        self.async_wait_values[group["name"]].append(
-                            self.parameter_client.push(
-                                self.push_keys[group["name"]],
-                                self.push_tensors[group["name"]],
-                                asynchronous=True,
-                                # asynchronous=self.async_write_back[i]
-                            )
+                        payload = payload_buffer[: len(update_value)]
+                        self._pack_push_payload(
+                            payload, update_value, sum_update_values
                         )
+                        wait_value = self.parameter_client.push(
+                            push_keys,
+                            payload,
+                            asynchronous=self._async_write_back_map[group["name"]],
+                        )
+                        self._enqueue_wait(group["name"], wait_value, payload_buffer)
                     else:
                         fused_embedding_optimizer_update(
                             p.data,
@@ -227,6 +213,70 @@ class DistAdagrad(Optimizer):
                     )
 
         return loss
+
+    def _acquire_push_buffer(self, group_name: str, rows: int) -> torch.Tensor:
+        pool = self._push_buffer_pool[group_name]
+        for idx, buffer in enumerate(pool):
+            if buffer.size(0) >= rows:
+                return pool.pop(idx)
+        cols = self.parameter_client.dim
+        capacity = max(rows, 1024)
+        buffer = torch.empty((capacity, cols), dtype=torch.float32)
+        if torch.cuda.is_available():
+            buffer = buffer.pin_memory()
+        return buffer
+
+    def _release_push_buffer(self, group_name: str, buffer: torch.Tensor):
+        self._push_buffer_pool[group_name].append(buffer)
+
+    def _pack_push_payload(
+        self, dest: torch.Tensor, update_value: torch.Tensor, optimizer_values: torch.Tensor
+    ):
+        rows = update_value.size(0)
+        dest_view = dest[:rows]
+        update_cols = update_value.size(1)
+        optimizer_cols = optimizer_values.size(1)
+        dest_view[:, :update_cols].copy_(
+            update_value.contiguous(), non_blocking=True
+        )
+        dest_view[:, update_cols : update_cols + optimizer_cols].copy_(
+            optimizer_values.contiguous(), non_blocking=True
+        )
+        remaining = dest_view.size(1) - update_cols - optimizer_cols
+        if remaining > 0:
+            dest_view[:, update_cols + optimizer_cols :].zero_()
+
+    def _enqueue_wait(self, group_name: str, wait_value, buffer: torch.Tensor):
+        if wait_value is None:
+            self._release_push_buffer(group_name, buffer)
+        else:
+            self.async_wait_values[group_name].append((wait_value, buffer))
+
+    def _process_wait_queue(self, queue: deque, async_enabled: bool, group_name: str):
+        if async_enabled:
+            while len(queue) >= self.max_pending_pushes:
+                wait_value, buffer = queue.popleft()
+                if wait_value is not None:
+                    self.parameter_client.wait(wait_value)
+                self._release_push_buffer(group_name, buffer)
+        else:
+            self._drain_wait_queue(queue, group_name)
+
+    def _drain_wait_queue(self, queue: deque, group_name: str):
+        while queue:
+            wait_value, buffer = queue.popleft()
+            if wait_value is not None:
+                self.parameter_client.wait(wait_value)
+            self._release_push_buffer(group_name, buffer)
+
+    def flush_pending_pushes(self):
+        self._drain_wait_queue(self.entity_async_wait_values, "entity")
+        self._drain_wait_queue(self.relation_async_wait_values, "relation")
+
+    def wait_for_pending(self, group_name: str):
+        if group_name not in self.async_wait_values:
+            return
+        self._drain_wait_queue(self.async_wait_values[group_name], group_name)
 
     def pull_all(self):
         """

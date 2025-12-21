@@ -58,12 +58,21 @@ class BatchDataset(torch.utils.data.Dataset):
     def __init__(self, triples, batch_size, shuffle=True):
         self.triples = triples
         # work around for now to have a working shared tensor
-        self.samples = torch.empty([len(triples), ], dtype=torch.int, requires_grad=False).share_memory_()
+        self.samples = (
+            torch.empty([len(triples)], dtype=torch.long, requires_grad=False)
+            .share_memory_()
+        )
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.num_samples = torch.full([1, ], -1, dtype=torch.int, requires_grad=False).share_memory_()
-        self.epoch = torch.full([1, ], -1, dtype=torch.int, requires_grad=False).share_memory_()
-        self.partition_id = torch.full([1, ], -1, dtype=torch.int, requires_grad=False).share_memory_()
+        self.num_samples = (
+            torch.full([1], -1, dtype=torch.int, requires_grad=False).share_memory_()
+        )
+        self.epoch = (
+            torch.full([1], -1, dtype=torch.int, requires_grad=False).share_memory_()
+        )
+        self.partition_id = (
+            torch.full([1], -1, dtype=torch.int, requires_grad=False).share_memory_()
+        )
 
     def __len__(self):
         if self.num_samples.item() <= 0:
@@ -83,17 +92,21 @@ class BatchDataset(torch.utils.data.Dataset):
         if start >= stop:
             print(idx, self.num_samples.item(), start, stop, len(self))
             return None
-        return (self.samples[
-            start: stop
-        ].clone().long(), self.epoch.item(), self.partition_id.item())
+        return (
+            self.samples[start:stop],
+            self.epoch.item(),
+            self.partition_id.item(),
+        )
 
     def set_samples(self, samples: torch.Tensor, epoch, partition_id):
+        samples = samples.to(
+            dtype=torch.long, device=self.samples.device, non_blocking=True
+        )
         if self.shuffle:
-            # shuffling in numpy is slightly faster
-            samples = samples.numpy()
-            np.random.shuffle(samples)
-            samples = torch.from_numpy(samples)
-        self.samples[:len(samples)] = samples
+            # leverage torch to avoid numpy conversions/copies
+            perm = torch.randperm(samples.size(0), device=samples.device)
+            samples = samples.index_select(0, perm)
+        self.samples[: len(samples)] = samples
         self.num_samples[0] = len(samples)
         self.epoch[0] = epoch
         self.partition_id[0] = partition_id
@@ -112,8 +125,42 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         work_scheduler_client=None,
         init_for_load_only=False,
     ):
+        self._non_blocking_transfer = False
         self.parameter_client = parameter_client
         self.min_rank = get_min_rank(config)
+
+        job_device = config.get("job.device")
+        enable_prefetch = (
+            isinstance(job_device, str) and job_device.startswith("cuda")
+        )
+        if enable_prefetch:
+            if config.get("job.distributed.entity_sync_level") == "batch":
+                current = int(config.get("job.distributed.entity_pre_pull"))
+                if current < 2:
+                    config.set("job.distributed.entity_pre_pull", 2)
+                    config.log(
+                        "Auto-enabled entity prefetching (job.distributed.entity_pre_pull=2)"
+                    )
+            if config.get("job.distributed.relation_sync_level") == "batch":
+                current = int(config.get("job.distributed.relation_pre_pull"))
+                if current < 1:
+                    config.set("job.distributed.relation_pre_pull", 1)
+                    config.log(
+                        "Auto-enabled relation prefetching (job.distributed.relation_pre_pull=1)"
+                    )
+
+        configured_workers = int(self.config.get("train.num_workers"))
+        if (
+            isinstance(job_device, str)
+            and job_device.startswith("cuda")
+            and configured_workers == 0
+        ):
+            configured_workers = 2
+            self.config.set("train.num_workers", configured_workers)
+            self.config.log(
+                "Auto-enabled train.num_workers=2 to better overlap parameter transfers."
+            )
+        self._effective_num_workers = configured_workers
 
         if work_scheduler_client is None:
             self.work_scheduler_client = SchedulerClient(config)
@@ -172,15 +219,21 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.relation_sync_level = self.config.get(
             "job.distributed.relation_sync_level"
         )
+        self._need_unique_entities = self.entity_sync_level == "batch"
+        self._need_unique_relations = self.relation_sync_level == "batch"
         self.entity_pre_pull = self.config.get("job.distributed.entity_pre_pull")
         self.relation_pre_pull = self.config.get("job.distributed.relation_pre_pull")
         self.pre_localize_batch = int(
             self.config.get("job.distributed.pre_localize_batch")
         )
         self.entity_mapper_tensors = deque()
-        for i in range(self.config.get("train.num_workers") + 1):
+        self.relation_mapper_tensors = deque()
+        for i in range(self._effective_num_workers + 1):
             self.entity_mapper_tensors.append(
                 torch.full((self.dataset.num_entities(),), -1, dtype=torch.long)
+            )
+            self.relation_mapper_tensors.append(
+                torch.full((self.dataset.num_relations(),), -1, dtype=torch.long)
             )
 
         # also defines the local entities
@@ -189,6 +242,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.hot_entity_tensor = self._load_hot_entity_cache()
         if self.hot_entity_tensor is not None:
             self._localize_hot_entities()
+            try:
+                self.model.get_s_embedder().enable_hot_cache(self.hot_entity_tensor)
+                self.config.log(
+                    f"Hot entity cache enabled for {len(self.hot_entity_tensor)} entities."
+                )
+            except Exception as exc:
+                self.config.log(f"Failed to enable hot entity cache: {exc}")
 
         def stop_and_wait(job):
             job.parameter_client.stop()
@@ -351,35 +411,50 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             triple_ids = batch[0][0]
             epoch = batch[0][1]
             local_partition_id = batch[0][2]
-            triples = self.dataset.split(self.train_split)[triple_ids, :].long()
+            triples = self._pin_triples_if_needed(
+                self.dataset.split(self.train_split)[triple_ids, :]
+            )
 
             negative_samples = list()
             for slot in [S, P, O]:
-                negative_samples.append(self._sampler.sample(triples, slot))
+                sample = self._sampler.sample(triples, slot)
+                if self._non_blocking_transfer:
+                    sample.pin_memory()
+                negative_samples.append(sample)
             unique_time = -time.time()
-            unique_entities = torch.unique(
-                torch.cat(
-                    (
-                        triples[:, [S, O]].view(-1),
-                        negative_samples[S].unique_samples(remove_dropped=False),
-                        negative_samples[O].unique_samples(remove_dropped=False),
-                    )
-                )
-            )
-            unique_relations = torch.unique(
-                torch.cat(
-                    (
-                        triples[:, [P]].view(-1),
-                        negative_samples[P].unique_samples(remove_dropped=False),
-                    )
-                )
-            )
+            unique_entities = None
+            unique_relations = None
             entity_embedder = self.model.get_s_embedder()
             relation_embedder = self.model.get_p_embedder()
-            if hasattr(entity_embedder, "apply_locality_order"):
-                unique_entities = entity_embedder.apply_locality_order(unique_entities)
-            if hasattr(relation_embedder, "apply_locality_order"):
-                unique_relations = relation_embedder.apply_locality_order(unique_relations)
+            if self._need_unique_entities:
+                unique_entities = torch.unique(
+                    torch.cat(
+                        (
+                            triples[:, [S, O]].view(-1),
+                            negative_samples[S].unique_samples(remove_dropped=False),
+                            negative_samples[O].unique_samples(remove_dropped=False),
+                        )
+                    ),
+                    sorted=False,
+                )
+                if hasattr(entity_embedder, "apply_locality_order"):
+                    unique_entities = entity_embedder.apply_locality_order(
+                        unique_entities
+                    )
+            if self._need_unique_relations:
+                unique_relations = torch.unique(
+                    torch.cat(
+                        (
+                            triples[:, [P]].view(-1),
+                            negative_samples[P].unique_samples(remove_dropped=False),
+                        )
+                    ),
+                    sorted=False,
+                )
+                if hasattr(relation_embedder, "apply_locality_order"):
+                    unique_relations = relation_embedder.apply_locality_order(
+                        unique_relations
+                    )
             unique_time += time.time()
 
             return {
@@ -394,13 +469,21 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
         return collate
 
+    def _pin_triples_if_needed(self, triples: torch.Tensor) -> torch.Tensor:
+        if (
+            not self._non_blocking_transfer
+            or triples.device.type != "cpu"
+            or triples.is_pinned()
+        ):
+            return triples
+        return triples.pin_memory()
+
     def _map_ids_to_local(self, batch):
 
         # map ids to local ids
         if self.entity_sync_level == "partition":
             entity_mapper = self.model.get_s_embedder().global_to_local_mapper
         else:
-            # entity_mapper = torch.full((self.dataset.num_entities(),), -1, dtype=torch.long)
             entity_mapper = self.entity_mapper_tensors.popleft()
             entity_mapper[batch["unique_entities"]] = torch.arange(
                 len(batch["unique_entities"]), dtype=torch.long
@@ -408,9 +491,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if self.relation_sync_level == "partition":
             relation_mapper = self.model.get_p_embedder().global_to_local_mapper
         else:
-            relation_mapper = torch.full(
-                (self.dataset.num_relations(),), -1, dtype=torch.long
-            )
+            relation_mapper = self.relation_mapper_tensors.popleft()
             relation_mapper[batch["unique_relations"]] = torch.arange(
                 len(batch["unique_relations"]), dtype=torch.long
             )
@@ -423,26 +504,57 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
         # for debugging reset the entity mapper to -1
         # entity_mapper[:] = -1
-        self.entity_mapper_tensors.append(entity_mapper)
+        if self.entity_sync_level != "partition":
+            entity_mapper[batch["unique_entities"]] = -1
+            self.entity_mapper_tensors.append(entity_mapper)
+        if self.relation_sync_level != "partition":
+            relation_mapper[batch["unique_relations"]] = -1
+            self.relation_mapper_tensors.append(relation_mapper)
         return batch
 
-    def _prepare_batch_ahead(self, batches: deque):
-        if self.entity_pre_pull > 1 or self.relation_pre_pull > 1:
-            batches[0]["triples"] = batches[0]["triples"].to(self.device)
-            for ns in batches[0]["negative_samples"]:
-                ns.positive_triples = batches[0]["triples"]
-            batches[0]["negative_samples"] = [
-                ns.to(self.device) for ns in batches[0]["negative_samples"]
+    def _prepare_batch_ahead(self, batches: deque, new_batch=None):
+        if not batches:
+            return
+        head = batches[0]
+        if (
+            (self.entity_pre_pull > 1 or self.relation_pre_pull > 1)
+            and not head.get("_device_ready")
+        ):
+            head["triples"] = head["triples"].to(
+                self.device, non_blocking=self._non_blocking_transfer
+            )
+            for ns in head["negative_samples"]:
+                ns.positive_triples = head["triples"]
+            head["negative_samples"] = [
+                ns.to(self.device, non_blocking=self._non_blocking_transfer)
+                for ns in head["negative_samples"]
             ]
-        if self.entity_sync_level == "batch" and self.entity_pre_pull > 0:
-            self.model.get_s_embedder().pre_pull(batches[-1]["unique_entities"])
+            head["_device_ready"] = True
+        target = new_batch if new_batch is not None else batches[-1]
+        if (
+            self.entity_sync_level == "batch"
+            and self.entity_pre_pull > 0
+            and target["unique_entities"] is not None
+            and not target.get("_entity_prefetched")
+        ):
+            self.model.get_s_embedder().pre_pull(target["unique_entities"])
             self.model.get_s_embedder().pre_pulled_to_device()
-        if self.relation_sync_level == "batch" and self.relation_pre_pull > 0:
-            self.model.get_p_embedder().pre_pull(batches[-1]["unique_relations"])
+            target["_entity_prefetched"] = True
+        if (
+            self.relation_sync_level == "batch"
+            and self.relation_pre_pull > 0
+            and target["unique_relations"] is not None
+            and not target.get("_relation_prefetched")
+        ):
+            self.model.get_p_embedder().pre_pull(target["unique_relations"])
             self.model.get_p_embedder().pre_pulled_to_device()
-        if self.pre_localize_batch > 0:
+            target["_relation_prefetched"] = True
+        if (
+            self.pre_localize_batch > 0
+            and target["unique_entities"] is not None
+        ):
             self.model.get_s_embedder().localize(
-                batches[-1]["unique_entities"],
+                target["unique_entities"],
                 asynchronous=True
             )
 
@@ -453,11 +565,14 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         # be avoided.
         result.prepare_time -= time.time()
         # result.cpu_gpu_time -= time.time()
-        batch["triples"] = batch["triples"].to(self.device)
+        batch["triples"] = batch["triples"].to(
+            self.device, non_blocking=self._non_blocking_transfer
+        )
         for ns in batch["negative_samples"]:
             ns.positive_triples = batch["triples"]
         batch["negative_samples"] = [
-            ns.to(self.device) for ns in batch["negative_samples"]
+            ns.to(self.device, non_blocking=self._non_blocking_transfer)
+            for ns in batch["negative_samples"]
         ]
         # result.cpu_gpu_time += time.time()
         result.unique_time += batch["unique_time"]
@@ -466,9 +581,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
             result.ps_wait_time -= time.time()
             if not self.entity_async_write_back:
-                for wait_value in self.optimizer.entity_async_wait_values:
-                    self.parameter_client.wait(wait_value)
-                self.optimizer.entity_async_wait_values.clear()
+                self.optimizer.wait_for_pending("entity")
             result.ps_wait_time += time.time()
             if self.entity_localize and not self.entity_partition_localized:
                 self.model.get_s_embedder().localize(
@@ -486,9 +599,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             unique_relations = batch["unique_relations"]
             result.ps_wait_time -= time.time()
             if not self.relation_async_write_back:
-                for wait_value in self.optimizer.relation_async_wait_values:
-                    self.parameter_client.wait(wait_value)
-                self.optimizer.relation_async_wait_values.clear()
+                self.optimizer.wait_for_pending("relation")
             result.ps_wait_time += time.time()
             if self.relation_localize and not self.relation_partition_localized:
                 self.model.get_p_embedder().localize(
@@ -512,8 +623,20 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
     def _init_dataloader(self):
         mp_context = (
             torch.multiprocessing.get_context("fork")
-            if self.config.get("train.num_workers") > 0
+            if self._effective_num_workers > 0
             else None
+        )
+        pin_memory = self.config.get("train.pin_memory")
+        if (
+            not pin_memory
+            and isinstance(self.device, str)
+            and self.device.startswith("cuda")
+        ):
+            pin_memory = True
+        self._non_blocking_transfer = bool(
+            isinstance(self.device, str)
+            and self.device.startswith("cuda")
+            and pin_memory
         )
         self.loader = torch.utils.data.DataLoader(
             self.dataloader_dataset,
@@ -523,9 +646,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             shuffle=False,
             # batch size needs to be 1 since it is handled in the dataset object
             # batch_size=self.batch_size,
-            num_workers=self.config.get("train.num_workers"),
+            num_workers=self._effective_num_workers,
             worker_init_fn=_generate_worker_init_fn(self.config),
-            pin_memory=self.config.get("train.pin_memory"),
+            pin_memory=pin_memory,
             multiprocessing_context=mp_context,
         )
 
@@ -658,9 +781,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     dataloader_time += time.time()
                     pre_pull_time -= time.time()
                     if next_batch is not None:
-                        self._prepare_batch_ahead(pre_load_batches)
+                        self._prepare_batch_ahead(pre_load_batches, new_batch=next_batch)
                     pre_pull_time += time.time()
                     prepare_time += time.time()
+                self._prepare_batch_ahead(pre_load_batches)
                 batch = pre_load_batches.popleft()
 
                 # create initial batch trace (yet incomplete)
@@ -881,6 +1005,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.config.log(
             format_trace_entry("train_epoch", trace_entry, self.config), prefix="  "
         )
+        if hasattr(self, "optimizer") and hasattr(
+            self.optimizer, "flush_pending_pushes"
+        ):
+            self.optimizer.flush_pending_pushes()
         self.current_trace["epoch"] = None
         return trace_entry
 

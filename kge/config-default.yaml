@@ -75,6 +75,9 @@ job:
     pre_localize_partition: False
     pre_localize_batch: False # pre localize entities in batch one batch ahead
     scheduler_data_type: int32 # torch type used for communication of the work scheduler
+    scheduler_prefetch: 1      # number of partitions to prefetch per worker request
+    optimizer:
+      max_pending_pushes: 2
     hot_entity_cache:
       enable: False
       file: ''        # optional override; defaults to dataset/analysis_hot_entities.npy
@@ -84,7 +87,7 @@ job:
       entity_rank_file: analysis_entity_locality_rank.npy
       relation_rank_file: analysis_relation_locality_rank.npy
     scheduler_feedback:
-      enable: False
+      enable: True
       min_history: 3
       slow_partition_factor: 1.5
       target_chunk_size: 0
@@ -95,7 +98,7 @@ job:
       cost_aware_schedule: False
       max_chunk_size: 0
       min_chunk_size: 0
-      dynamic_chunking: False
+      dynamic_chunking: True
       target_chunk_time: 2.0
       chunk_warmup_epochs: 0
       export_feedback: False
@@ -200,9 +203,24 @@ dataset:
   # that the value specified here may be overwritten by dataset-specific choices
   # (in dataset.yaml).
   pickle: True
+  binary_cache:
+    # Store triples as .npy arrays for faster reloads. The cache is recreated
+    # automatically when source .del files are newer.
+    enable: True
+    dtype: int32
+    mmap: True
+
+  analysis:
+    auto_generate: True     # automatically derive degree/locality stats if missing
+    split: train            # split used to compute the statistics
+    hot_entity_percent: 0.01
 
   # Additional dataset specific keys can be added as needed
   +++: +++
+
+  nary:
+    pad_id: -1
+    max_arity: 0
 
 
 ## EXTENSIONS ###################################################################
@@ -510,6 +528,11 @@ negative_sampling:
 
 distributed_negative_sampling:
   class_name: TrainingJobNegativeSamplingDistributed
+
+nary_negative_sampling:
+  class_name: TrainingJobNaryNegativeSampling
+  num_negatives: 5
+  corrupt_all_arguments: False
 
 ## VALIDATION AND EVALUATION ###################################################
 

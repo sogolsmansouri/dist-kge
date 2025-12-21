@@ -62,6 +62,10 @@ class Config:
         for name in key.split("."):
             try:
                 result = result[name]
+            except TypeError:
+                if raise_keyerror:
+                    raise KeyError(f"Error accessing {name} for key {key}")
+                return None
             except KeyError:
                 if raise_keyerror:
                     raise KeyError(f"Error accessing {name} for key {key}")

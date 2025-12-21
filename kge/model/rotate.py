@@ -17,52 +17,32 @@ class RotatEScorer(RelationalScorer):
         super().__init__(config, dataset, configuration_key)
         self._norm = self.get_option("l_norm")
 
+    def _as_complex_entity(self, emb: torch.Tensor) -> torch.Tensor:
+        """Reshape entity embeddings into complex tensors without copying."""
+        new_shape = emb.shape[:-1] + (-1, 2)
+        return torch.view_as_complex(emb.reshape(new_shape))
+
+    def _relation_to_complex(self, p_emb: torch.Tensor) -> torch.Tensor:
+        """Interpret relation embeddings as rotation phases on the complex unit circle."""
+        return torch.polar(torch.ones_like(p_emb), p_emb)
+
     def score_emb(self, s_emb, p_emb, o_emb, combine: str):
         n = p_emb.size(0)
-
-        # determine real and imaginary part
-        s_emb_re, s_emb_im = torch.chunk(s_emb, 2, dim=1)
-        o_emb_re, o_emb_im = torch.chunk(o_emb, 2, dim=1)
-
-        # convert from radians to points on complex unix ball
-        p_emb_re, p_emb_im = torch.cos(p_emb), torch.sin(p_emb)
+        s_complex = self._as_complex_entity(s_emb)
+        o_complex = self._as_complex_entity(o_emb)
+        p_complex = self._relation_to_complex(p_emb)
 
         if combine == "spo":
-            # compute the difference vector (s*p-t)
-            sp_emb_re, sp_emb_im = hadamard_complex(
-                s_emb_re, s_emb_im, p_emb_re, p_emb_im
-            )
-            diff_re, diff_im = diff_complex(sp_emb_re, sp_emb_im, o_emb_re, o_emb_im)
-
-            # compute the absolute values for each (complex) element of the difference
-            # vector
-            diff_abs = abs_complex(diff_re, diff_im)
-
-            # now take the norm of the absolute values of the difference vector
-            out = -norm_nonnegative(diff_abs, dim=1, p=self._norm)
+            diff = s_complex * p_complex - o_complex
+            out = -torch.linalg.vector_norm(diff.abs(), ord=self._norm, dim=1)
         elif combine == "sp_":
-            # as above, but pair each sp-pair with each object
-            sp_emb_re, sp_emb_im = hadamard_complex(
-                s_emb_re, s_emb_im, p_emb_re, p_emb_im
-            )  # sp x dim
-            diff_re, diff_im = pairwise_diff_complex(
-                sp_emb_re, sp_emb_im, o_emb_re, o_emb_im
-            )  # sp x o x dim
-            diff_abs = abs_complex(diff_re, diff_im)  # sp x o x dim
-            out = -norm_nonnegative(diff_abs, dim=2, p=self._norm)
+            sp = s_complex * p_complex
+            diff = sp.unsqueeze(1) - o_complex.unsqueeze(0)
+            out = -torch.linalg.vector_norm(diff.abs(), ord=self._norm, dim=2)
         elif combine == "_po":
-            # compute the complex conjugate (cc) of the relation vector and perform
-            # inverse rotation on tail. This uses || s*p - o || = || s - cc(p)*o || for
-            # a rotation p.
-            p_emb_im = -p_emb_im
-            po_emb_re, po_emb_im = hadamard_complex(
-                p_emb_re, p_emb_im, o_emb_re, o_emb_im
-            )  # po x dim
-            diff_re, diff_im = pairwise_diff_complex(
-                po_emb_re, po_emb_im, s_emb_re, s_emb_im
-            )  # po x s x dim
-            diff_abs = abs_complex(diff_re, diff_im)  # po x s x dim
-            out = -norm_nonnegative(diff_abs, dim=2, p=self._norm)
+            po = torch.conj(p_complex) * o_complex
+            diff = po.unsqueeze(1) - s_complex.unsqueeze(0)
+            out = -torch.linalg.vector_norm(diff.abs(), ord=self._norm, dim=2)
         else:
             return super().score_emb(s_emb, p_emb, o_emb, combine)
 
@@ -147,73 +127,3 @@ class RotatE(KgeModel):
 
             # normalize after each batch
             job.post_batch_hooks.append(lambda job: self.normalize_phases())
-
-
-@torch.jit.script
-def pairwise_sum(X, Y):
-    """Compute pairwise sum of rows of X and Y.
-
-    Returns tensor of shape len(X) x len(Y) x dim."""
-    return X.unsqueeze(1) + Y
-
-
-@torch.jit.script
-def pairwise_diff(X, Y):
-    """Compute pairwise difference of rows of X and Y.
-
-    Returns tensor of shape len(X) x len(Y) x dim."""
-    return X.unsqueeze(1) - Y
-
-
-@torch.jit.script
-def pairwise_hadamard(X, Y):
-    """Compute pairwise Hadamard product of rows of X and Y.
-
-    Returns tensor of shape len(X) x len(Y) x dim."""
-    return X.unsqueeze(1) * Y
-
-
-@torch.jit.script
-def hadamard_complex(x_re, x_im, y_re, y_im):
-    "Hadamard product for complex vectors"
-    result_re = x_re * y_re - x_im * y_im
-    result_im = x_re * y_im + x_im * y_re
-    return result_re, result_im
-
-
-@torch.jit.script
-def pairwise_hadamard_complex(x_re, x_im, y_re, y_im):
-    "Pairwise Hadamard product for complex vectors"
-    result_re = pairwise_hadamard(x_re, y_re) - pairwise_hadamard(x_im, y_im)
-    result_im = pairwise_hadamard(x_re, y_im) + pairwise_hadamard(x_im, y_re)
-    return result_re, result_im
-
-
-@torch.jit.script
-def diff_complex(x_re, x_im, y_re, y_im):
-    "Difference of complex vectors"
-    return x_re - y_re, x_im - y_im
-
-
-@torch.jit.script
-def pairwise_diff_complex(x_re, x_im, y_re, y_im):
-    "Pairwise difference of complex vectors"
-    return pairwise_diff(x_re, y_re), pairwise_diff(x_im, y_im)
-
-
-@torch.jit.script
-def abs_complex(x_re, x_im):
-    "Compute magnitude of given complex numbers"
-    x_re_im = torch.stack((x_re, x_im), dim=0)  # dim0: real, imaginary
-    return torch.norm(x_re_im, dim=0)  # sqrt(real^2+imaginary^2)
-
-
-@torch.jit.script
-def norm_nonnegative(x, dim: int, p: float):
-    "Computes lp-norm along dim assuming that all inputs are non-negative."
-    if p == 1.0:
-        # speed up things for this common case. We known that the inputs are
-        # non-negative here.
-        return torch.sum(x, dim=dim)
-    else:
-        return torch.norm(x, dim=dim, p=p)

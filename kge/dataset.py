@@ -9,13 +9,14 @@ import numpy as np
 import pandas as pd
 import pickle
 import inspect
+from pathlib import Path
 
 from kge import Config, Configurable
 import kge.indexing
 from kge.indexing import create_default_index_functions
 from kge.misc import module_base_dir
 
-from typing import Dict, List, Any, Callable, Union, Optional
+from typing import Dict, List, Any, Callable, Union, Optional, Tuple
 
 
 class Dataset(Configurable):
@@ -57,6 +58,22 @@ class Dataset(Configurable):
         #: split-name to (n,3) int32 tensor
         self._triples: Dict[str, Tensor] = {}
 
+        #: split-name to (n,1+max_arity) tensor storing relation + entity arguments
+        self._nary_facts: Dict[str, Tensor] = {}
+        #: split-name to (n,max_arity) bool mask indicating valid entity positions
+        self._nary_fact_masks: Dict[str, Tensor] = {}
+        #: split-name to (n) tensor with actual arity per fact
+        self._nary_fact_arities: Dict[str, Tensor] = {}
+        try:
+            self._nary_max_arity: int = config.get_default("dataset.nary.max_arity")
+        except KeyError:
+            self._nary_max_arity = 0
+        try:
+            self._nary_pad_id: int = config.get_default("dataset.nary.pad_id")
+        except KeyError:
+            self._nary_pad_id = -1
+        self._has_nary: bool = False
+
         #: meta data that is part if this dataset. Indexed by key.
         self._meta: Dict[str, Any] = {}
 
@@ -65,6 +82,7 @@ class Dataset(Configurable):
 
         #: partitioning type for distributed training
         self._partition_type = None
+        self._analysis_ready: bool = False
 
         #: functions that compute and add indexes as needed; arguments are dataset and
         #: key. Index functions are expected to not recompute an index that is already
@@ -120,7 +138,15 @@ class Dataset(Configurable):
             dataset.entity_ids()
             dataset.relation_ids()
             for split in ["train", "valid", "test"]:
-                dataset.split(split)
+                try:
+                    filetype = dataset.config.get(f"dataset.files.{split}.type")
+                except KeyError:
+                    continue
+                if filetype == "triples":
+                    dataset.split(split)
+                elif filetype == "nary_facts":
+                    dataset.load_nary_facts(split)
+        dataset._ensure_analysis_artifacts()
         return dataset
 
     @staticmethod
@@ -182,7 +208,33 @@ class Dataset(Configurable):
         return s.translate(trans)
 
     @staticmethod
-    def _load_triples(filename: str, delimiter="\t", use_pickle=False) -> Tensor:
+    def _load_triples(
+        filename: str,
+        delimiter: str = "\t",
+        use_pickle: bool = False,
+        binary_cache: Optional[Dict[str, Any]] = None,
+    ) -> Tensor:
+        if binary_cache is None:
+            binary_cache = {}
+        binary_enabled = bool(binary_cache.get("enable", False))
+        binary_dtype = np.dtype(binary_cache.get("dtype", np.int32))
+        binary_mmap = bool(binary_cache.get("mmap", True))
+        binary_filename = filename + ".npy"
+
+        if (
+            binary_enabled
+            and os.path.isfile(binary_filename)
+            and os.path.getmtime(binary_filename) >= os.path.getmtime(filename)
+        ):
+            mmap_mode = "r" if binary_mmap else None
+            triples_np = np.load(binary_filename, mmap_mode=mmap_mode)
+            triples_np = triples_np[:, :3]
+            if triples_np.dtype != np.int32:
+                triples_np = triples_np.astype(np.int32, copy=False)
+            if not triples_np.flags.writeable:
+                triples_np = np.array(triples_np, copy=True)
+            return torch.from_numpy(triples_np)
+
         if use_pickle:
             # check if there is a pickled, up-to-date version of the file
             pickle_suffix = Dataset._to_valid_filename(f"-{delimiter}.pckl")
@@ -192,13 +244,209 @@ class Dataset(Configurable):
                 return triples
 
         # numpy loadtxt is very slow, use pandas instead
-        triples = pd.read_csv(
-            filename, sep=delimiter, dtype=np.int32, header=None, usecols=range(0, 3)
+        triples_np = pd.read_csv(
+            filename,
+            sep=delimiter,
+            dtype=binary_dtype,
+            header=None,
+            usecols=range(0, 3),
         ).to_numpy()
-        triples = torch.from_numpy(triples)
+        if triples_np.dtype != np.int32:
+            triples_np = triples_np.astype(np.int32, copy=False)
+        if not triples_np.flags.writeable:
+            triples_np = np.array(triples_np, copy=True)
+        triples = torch.from_numpy(triples_np)
+        if binary_enabled:
+            tmp_binary_filename = binary_filename + ".tmp"
+            with open(tmp_binary_filename, "wb") as f:
+                np.save(f, triples_np)
+            os.replace(tmp_binary_filename, binary_filename)
         if use_pickle:
             Dataset._pickle_dump_atomic(triples, pickle_filename)
         return triples
+
+    def _ensure_analysis_artifacts(self) -> None:
+        if self._analysis_ready or not self.folder:
+            self._analysis_ready = True
+            return
+        try:
+            auto_generate = bool(
+                self.config.get_default("dataset.analysis.auto_generate")
+            )
+        except KeyError:
+            auto_generate = False
+        if not auto_generate:
+            self._analysis_ready = True
+            return
+
+        analysis_dir = Path(self.folder)
+        entity_deg_file = analysis_dir / "analysis_entity_degrees.npy"
+        relation_cnt_file = analysis_dir / "analysis_relation_counts.npy"
+        hot_entity_file = analysis_dir / "analysis_hot_entities.npy"
+        entity_rank_file = analysis_dir / "analysis_entity_locality_rank.npy"
+        relation_rank_file = analysis_dir / "analysis_relation_locality_rank.npy"
+
+        files_needed = [
+            entity_deg_file,
+            relation_cnt_file,
+            entity_rank_file,
+            relation_rank_file,
+        ]
+        try:
+            hot_percent = float(
+                self.config.get_default("dataset.analysis.hot_entity_percent")
+            )
+        except KeyError:
+            hot_percent = 0.0
+        if hot_percent > 0.0:
+            files_needed.append(hot_entity_file)
+
+        if all(path.is_file() for path in files_needed):
+            self._analysis_ready = True
+            return
+
+        try:
+            analysis_split = self.config.get_default("dataset.analysis.split")
+        except KeyError:
+            analysis_split = "train"
+
+        try:
+            triples = self.split(analysis_split)
+        except Exception as exc:
+            self.config.log(
+                f"Skipping dataset analysis auto-generation (failed to load split "
+                f"'{analysis_split}'): {exc}"
+            )
+            self._analysis_ready = True
+            return
+
+        if triples.numel() == 0:
+            self._analysis_ready = True
+            return
+
+        self.config.log("Generating dataset analysis artifacts (degrees/locality).")
+        num_entities = self.num_entities()
+        num_relations = self.num_relations()
+        np_entities = triples[:, 0].cpu().numpy()
+        np_relations = triples[:, 1].cpu().numpy()
+        np_objects = triples[:, 2].cpu().numpy()
+
+        entity_min_len = num_entities
+        if entity_min_len is None:
+            max_idx = 0
+            if np_entities.size > 0:
+                max_idx = max(max_idx, int(np_entities.max()))
+            if np_objects.size > 0:
+                max_idx = max(max_idx, int(np_objects.max()))
+            entity_min_len = max_idx + 1
+
+        if not entity_deg_file.is_file():
+            out_deg = np.bincount(np_entities, minlength=entity_min_len)
+            in_deg = np.bincount(np_objects, minlength=entity_min_len)
+            entity_degrees = (out_deg + in_deg).astype(np.int64, copy=False)
+            np.save(entity_deg_file, entity_degrees, allow_pickle=False)
+        else:
+            entity_degrees = np.load(entity_deg_file, allow_pickle=False)
+
+        relation_counts = None
+        if relation_cnt_file.is_file():
+            relation_counts = np.load(relation_cnt_file, allow_pickle=False)
+        else:
+            rel_min_len = num_relations
+            if rel_min_len is None:
+                if np_relations.size > 0:
+                    rel_min_len = int(np_relations.max()) + 1
+                else:
+                    rel_min_len = 0
+            if rel_min_len > 0 or np_relations.size > 0:
+                relation_counts = np.bincount(
+                    np_relations, minlength=rel_min_len
+                ).astype(np.int64, copy=False)
+                np.save(relation_cnt_file, relation_counts, allow_pickle=False)
+
+        hot_entities = None
+        if hot_percent > 0.0 and not hot_entity_file.is_file():
+            total = len(entity_degrees)
+            if total > 0:
+                target = max(1, int(total * hot_percent))
+                if target >= total:
+                    hot_entities = np.argsort(-entity_degrees, kind="mergesort")
+                else:
+                    candidates = np.argpartition(entity_degrees, -target)[-target:]
+                    order = np.argsort(entity_degrees[candidates], kind="mergesort")[
+                        ::-1
+                    ]
+                    hot_entities = candidates[order]
+                np.save(hot_entity_file, hot_entities, allow_pickle=False)
+        elif hot_entity_file.is_file():
+            hot_entities = np.load(hot_entity_file, allow_pickle=False)
+
+        if not entity_rank_file.is_file() and len(entity_degrees):
+            base_order = np.argsort(-entity_degrees, kind="mergesort")
+            if hot_entities is not None and hot_entities.size > 0:
+                hot_set = np.array(hot_entities, dtype=np.int64, copy=False)
+                seen = np.full(len(entity_degrees), True, dtype=bool)
+                seen[hot_set] = False
+                cold = base_order[seen[base_order]]
+                combined = np.concatenate((hot_set, cold))
+            else:
+                combined = base_order
+            entity_rank = np.empty(len(entity_degrees), dtype=np.int64)
+            entity_rank[combined] = np.arange(len(entity_degrees), dtype=np.int64)
+            np.save(entity_rank_file, entity_rank, allow_pickle=False)
+
+        if (
+            relation_counts is not None
+            and len(relation_counts)
+            and not relation_rank_file.is_file()
+        ):
+            relation_order = np.argsort(-relation_counts, kind="mergesort")
+            relation_rank = np.empty(len(relation_counts), dtype=np.int64)
+            relation_rank[relation_order] = np.arange(
+                len(relation_counts), dtype=np.int64
+            )
+            np.save(relation_rank_file, relation_rank, allow_pickle=False)
+
+        self._analysis_ready = True
+
+    @staticmethod
+    def _load_nary_facts(
+        filename: str, pad_id: int = -1
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        facts: List[List[int]] = []
+        max_arity = 0
+        with open(filename, "r") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if raw == "":
+                    continue
+                parts = [int(tok) for tok in raw.split("\t") if tok]
+                if len(parts) < 2:
+                    continue
+                arity = len(parts) - 1
+                max_arity = max(max_arity, arity)
+                facts.append(parts)
+        if len(facts) == 0:
+            return (
+                torch.empty((0, 0), dtype=torch.long),
+                torch.empty((0, 0), dtype=torch.bool),
+                torch.empty(0, dtype=torch.long),
+            )
+        tensor = torch.full(
+            (len(facts), 1 + max_arity), pad_id, dtype=torch.long
+        )
+        mask = torch.zeros((len(facts), max_arity), dtype=torch.bool)
+        arities = torch.zeros(len(facts), dtype=torch.long)
+        for row, fact in enumerate(facts):
+            tensor[row, 0] = fact[0]
+            arity = len(fact) - 1
+            if arity > 0:
+                tensor[row, 1 : 1 + arity] = torch.tensor(
+                    fact[1:], dtype=torch.long
+                )
+                mask[row, :arity] = True
+            arities[row] = arity
+        return tensor, mask, arities
 
     def load_triples(self, key: str) -> Tensor:
         "Load or return the triples with the specified key."
@@ -214,11 +462,55 @@ class Dataset(Configurable):
             triples = Dataset._load_triples(
                 os.path.join(self.folder, filename),
                 use_pickle=self.config.get("dataset.pickle"),
+                binary_cache={
+                    "enable": self.config.get("dataset.binary_cache.enable"),
+                    "dtype": self.config.get("dataset.binary_cache.dtype"),
+                    "mmap": self.config.get("dataset.binary_cache.mmap"),
+                },
             )
             self.config.log(f"Loaded {len(triples)} {key} triples")
             self._triples[key] = triples
 
         return self._triples[key]
+
+    def load_nary_facts(
+        self, key: str
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Load or return n-ary facts for the specified split.
+
+        Returns a tuple (facts, mask, arities), where `facts` is an
+        (n, 1 + max_arity) tensor storing relation id and padded entity ids,
+        `mask` indicates valid entity positions, and `arities` contains the
+        actual number of entity arguments for each fact.
+        """
+        if key not in self._nary_facts:
+            self.ensure_available(key)
+            filename = self.config.get(f"dataset.files.{key}.filename")
+            filetype = self.config.get(f"dataset.files.{key}.type")
+            if filetype != "nary_facts":
+                raise ValueError(
+                    "Unexpected file type: "
+                    f"dataset.files.{key}.type='{filetype}', expected 'nary_facts'"
+                )
+            facts, mask, arities = Dataset._load_nary_facts(
+                os.path.join(self.folder, filename), pad_id=self._nary_pad_id
+            )
+            self._nary_facts[key] = facts
+            self._nary_fact_masks[key] = mask
+            self._nary_fact_arities[key] = arities
+            self._nary_max_arity = max(
+                self._nary_max_arity, facts.size(1) - 1
+            )
+            self._has_nary = True
+            self.config.log(
+                f"Loaded {len(facts)} {key} n-ary facts "
+                f"(max arity {self._nary_max_arity})"
+            )
+        return (
+            self._nary_facts[key],
+            self._nary_fact_masks[key],
+            self._nary_fact_arities[key],
+        )
 
     @staticmethod
     def _load_map(
@@ -522,6 +814,22 @@ NOT RECOMMENDED: You can update the timestamp of all cached files using:
 
         """
         return self.load_triples(split)
+
+    def has_nary_facts(self) -> bool:
+        """Return True if dataset provides n-ary fact files."""
+        return self._has_nary
+
+    def nary_split(
+        self, split: str
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Return the n-ary facts for the specified split."""
+        return self.load_nary_facts(split)
+
+    def nary_max_arity(self) -> int:
+        return self._nary_max_arity
+
+    def nary_pad_id(self) -> int:
+        return self._nary_pad_id
 
     def entity_ids(
         self, indexes: Optional[Union[int, Tensor]] = None

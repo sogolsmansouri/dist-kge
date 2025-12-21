@@ -1,0 +1,25 @@
+import:
+  - nary_tucker
+
+job:
+  type: train
+  device: cpu
+
+dataset:
+  name: narytoy
+
+model: nary_tucker
+
+train:
+  type: nary_negative_sampling
+  max_epochs: 5
+  batch_size: 2
+  optimizer:
+    default:
+      type: Adagrad
+      args:
+        lr: 0.1
+
+nary_negative_sampling:
+  num_negatives: 3
+  corrupt_all_arguments: True

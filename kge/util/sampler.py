@@ -271,9 +271,20 @@ class BatchNegativeSample(Configurable):
         samples = self.samples(indexes)
         return torch.unique(samples.view(-1), return_inverse=return_inverse)
 
-    def to(self, device) -> "BatchNegativeSample":
+    def to(self, device, non_blocking: bool = False) -> "BatchNegativeSample":
         """Move the negative samples to the specified device."""
-        self.positive_triples = self.positive_triples.to(device)
+        self.positive_triples = self.positive_triples.to(
+            device, non_blocking=non_blocking
+        )
+        return self
+
+    def pin_memory(self) -> "BatchNegativeSample":
+        """Pin underlying CPU buffers to enable non-blocking transfers."""
+        if (
+            self.positive_triples.device.type == "cpu"
+            and not self.positive_triples.is_pinned()
+        ):
+            self.positive_triples = self.positive_triples.pin_memory()
         return self
 
     def map_samples(self, mapper):
@@ -394,9 +405,15 @@ class DefaultBatchNegativeSample(BatchNegativeSample):
     def samples(self, indexes=None) -> torch.Tensor:
         return self._samples if indexes is None else self._samples[indexes]
 
-    def to(self, device) -> "DefaultBatchNegativeSample":
-        super().to(device)
-        self._samples = self._samples.to(device)
+    def to(self, device, non_blocking: bool = False) -> "DefaultBatchNegativeSample":
+        super().to(device, non_blocking=non_blocking)
+        self._samples = self._samples.to(device, non_blocking=non_blocking)
+        return self
+
+    def pin_memory(self) -> "DefaultBatchNegativeSample":
+        super().pin_memory()
+        if self._samples.device.type == "cpu" and not self._samples.is_pinned():
+            self._samples = self._samples.pin_memory()
         return self
 
     def map_samples(self, mapper):
@@ -491,10 +508,28 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
 
         return scores
 
-    def to(self, device) -> "NaiveSharedNegativeSample":
-        super().to(device)
-        self._unique_samples = self._unique_samples.to(device)
-        self._repeat_indexes = self._repeat_indexes.to(device)
+    def to(self, device, non_blocking: bool = False) -> "NaiveSharedNegativeSample":
+        super().to(device, non_blocking=non_blocking)
+        self._unique_samples = self._unique_samples.to(
+            device, non_blocking=non_blocking
+        )
+        self._repeat_indexes = self._repeat_indexes.to(
+            device, non_blocking=non_blocking
+        )
+        return self
+
+    def pin_memory(self) -> "NaiveSharedNegativeSample":
+        super().pin_memory()
+        if (
+            self._unique_samples.device.type == "cpu"
+            and not self._unique_samples.is_pinned()
+        ):
+            self._unique_samples = self._unique_samples.pin_memory()
+        if (
+            self._repeat_indexes.device.type == "cpu"
+            and not self._repeat_indexes.is_pinned()
+        ):
+            self._repeat_indexes = self._repeat_indexes.pin_memory()
         return self
 
 
@@ -610,11 +645,31 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
 
         return scores
 
-    def to(self, device):
-        super().to(device)
-        self._unique_samples = self._unique_samples.to(device)
-        self._drop_index = self._drop_index.to(device)
-        self._repeat_indexes = self._repeat_indexes.to(device)
+    def to(self, device, non_blocking: bool = False):
+        super().to(device, non_blocking=non_blocking)
+        self._unique_samples = self._unique_samples.to(
+            device, non_blocking=non_blocking
+        )
+        self._drop_index = self._drop_index.to(device, non_blocking=non_blocking)
+        self._repeat_indexes = self._repeat_indexes.to(
+            device, non_blocking=non_blocking
+        )
+        return self
+
+    def pin_memory(self) -> "DefaultSharedNegativeSample":
+        super().pin_memory()
+        if (
+            self._unique_samples.device.type == "cpu"
+            and not self._unique_samples.is_pinned()
+        ):
+            self._unique_samples = self._unique_samples.pin_memory()
+        if self._drop_index.device.type == "cpu" and not self._drop_index.is_pinned():
+            self._drop_index = self._drop_index.pin_memory()
+        if (
+            self._repeat_indexes.device.type == "cpu"
+            and not self._repeat_indexes.is_pinned()
+        ):
+            self._repeat_indexes = self._repeat_indexes.pin_memory()
         return self
 
 
@@ -691,9 +746,24 @@ class CombinedSharedBatchNegativeSample(BatchNegativeSample):
             return scores_1
         return torch.cat((scores_1, scores_2), dim=1)
 
-    def to(self, device) -> "CombinedSharedBatchNegativeSample":
-        self.batch_negative_sample_1 = self.batch_negative_sample_1.to(device)
-        self.batch_negative_sample_2 = self.batch_negative_sample_2.to(device)
+    def to(
+        self, device, non_blocking: bool = False
+    ) -> "CombinedSharedBatchNegativeSample":
+        self.batch_negative_sample_1 = self.batch_negative_sample_1.to(
+            device, non_blocking=non_blocking
+        )
+        self.batch_negative_sample_2 = self.batch_negative_sample_2.to(
+            device, non_blocking=non_blocking
+        )
+        self.positive_triples = self.positive_triples.to(
+            device, non_blocking=non_blocking
+        )
+        return self
+
+    def pin_memory(self) -> "CombinedSharedBatchNegativeSample":
+        super().pin_memory()
+        self.batch_negative_sample_1 = self.batch_negative_sample_1.pin_memory()
+        self.batch_negative_sample_2 = self.batch_negative_sample_2.pin_memory()
         return self
 
 
@@ -709,67 +779,41 @@ class KgeUniformSampler(KgeSampler):
     def _sample_shared(
         self, positive_triples: torch.Tensor, slot: int, num_samples: int
     ):
-        # For shared_type=naive, produces:
-        # - a tensor `unique_samples` of size U holding a list of unique negative
-        # samples.
-        # - a tensor `repeat_indexes` of size `num_samples-U` holding the indexes of
-        #   repeated unique samples
-        #
-        # For shared_type=default, additionally produces:
-        # - one more negative sample in `unique_samples`
-        # - a tensor `drop_index` that indicates for each positive triple, which unique
-        #   sample is not used for that positive. The dropped sample should be replaced
-        #   with the last entry in `unique_samples`. The option to drop a negative
-        #   sample is used to avoid using the true positive from `positive_triples` as a
-        #   negative sample: when that true positive is `unique_samples`, it should be
-        #   ignored.
-        #
-        # In both case, the data structures are wrapped in the corresponding subclass of
-        # BatchNegativeSample.
         batch_size = len(positive_triples)
+        vocab_size = int(self.vocabulary_size[slot])
 
         # determine number of distinct negative samples for each positive
-        if self.with_replacement:
-            # Simple way to get a sample from the distribution of number of distinct
-            # values in the negative sample (for "default" type: WR sampling except the
-            # positive, hence the - 1)
-            num_unique = len(
-                np.unique(
-                    np.random.choice(
-                        self.vocabulary_size[slot]
-                        if self.shared_type == "naive"
-                        else self.vocabulary_size[slot] - 1,
-                        num_samples,
-                        replace=True,
-                    )
-                )
+        if self.with_replacement and num_samples > 0:
+            population = vocab_size - (0 if self.shared_type == "naive" else 1)
+            population = max(population, 1)
+            draws = torch.randint(
+                population, (num_samples,), device=torch.device("cpu")
             )
+            num_unique = int(torch.unique(draws, sorted=False).numel())
         else:  # WOR -> all samples distinct
             num_unique = num_samples
 
-        # Take the WOR sample. For default, take one more WOR sample than necessary
-        # (used to replace sampled positives). Numpy is horribly slow for large
-        # vocabulary sizes, so we use random.sample instead.
-        #
-        # SLOW:
-        # unique_samples = np.random.choice(
-        #     self.vocabulary_size[slot], num_unique, replace=False
-        # )
-        unique_samples = random.sample(
-            range(self.vocabulary_size[slot]),
-            num_unique if self.shared_type == "naive" else num_unique + 1,
-        )
+        samples_needed = num_unique if self.shared_type == "naive" else num_unique + 1
+        if samples_needed > vocab_size:
+            raise ValueError(
+                "Requested more unique negative samples than vocabulary size."
+            )
+        if samples_needed > 0:
+            unique_samples = torch.randperm(vocab_size, device="cpu")[:samples_needed]
+        else:
+            unique_samples = torch.empty(0, dtype=torch.long)
 
-        # For WR, we need to upsample. To do so, we compute the set of additional
-        # (repeated) sample indexes.
-        if num_unique != num_samples:  # only happens with WR
-            repeat_indexes = torch.tensor(
-                np.random.choice(num_unique, num_samples - num_unique, replace=True)
+        if num_unique != num_samples and num_unique > 0:
+            repeat_indexes = torch.randint(
+                0,
+                num_unique,
+                (num_samples - num_unique,),
+                dtype=torch.long,
+                device="cpu",
             )
         else:
-            repeat_indexes = torch.empty(0)  # WOR or WR when all samples unique
+            repeat_indexes = torch.empty(0, dtype=torch.long, device="cpu")
 
-        # for naive shared sampling, we are done
         if self.shared_type == "naive":
             return NaiveSharedNegativeSample(
                 self.config,
@@ -777,42 +821,47 @@ class KgeUniformSampler(KgeSampler):
                 positive_triples,
                 slot,
                 num_samples,
-                torch.tensor(unique_samples, dtype=torch.long),
+                unique_samples.long(),
                 repeat_indexes,
             )
 
-        # For default, we now filter the positives. For each row i (positive triple),
-        # select a sample to drop. For rows that contain its positive as a negative
-        # example, drop that positive. For all other rows, drop a random position. Here
-        # we start with random drop position for each row and then update the ones that
-        # contain its positive in the negative samples
-        positives = positive_triples[:, slot].numpy()
-        drop_index = self._create_shared_drop_index(positives, unique_samples, num_unique)
+        positives = positive_triples[:, slot].to("cpu").long()
+        drop_index = self._create_shared_drop_index(
+            positives, unique_samples.long(), num_unique
+        )
 
-        # now we are done for default
         return DefaultSharedNegativeSample(
             self.config,
             self.configuration_key,
             positive_triples,
             slot,
             num_samples,
-            torch.tensor(unique_samples, dtype=torch.long),
-            torch.tensor(drop_index),
+            unique_samples.long(),
+            drop_index,
             repeat_indexes,
         )
 
     @staticmethod
-    @numba.jit
-    def _create_shared_drop_index(positives, unique_samples, num_unique):
-        batch_size = len(positives)
-        drop_index = np.random.randint(0, num_unique, batch_size)
-        unique_samples_index = dict()
-        for i in range(len(unique_samples)):
-            unique_samples_index[unique_samples[i]] = i
-        for i in range(batch_size):
-            if positives[i] not in unique_samples_index:
-                continue
-            drop_index[i] = unique_samples_index.get(positives[i])
+    def _create_shared_drop_index(
+        positives: torch.Tensor, unique_samples: torch.Tensor, num_unique: int
+    ) -> torch.Tensor:
+        batch_size = positives.numel()
+        if num_unique == 0:
+            return torch.zeros(batch_size, dtype=torch.long)
+
+        drop_index = torch.randint(0, num_unique, (batch_size,), dtype=torch.long)
+        active = unique_samples[:num_unique]
+        sorted_vals, order = torch.sort(active)
+        positions = torch.searchsorted(sorted_vals, positives, right=False)
+        valid = positions < sorted_vals.numel()
+        if valid.any():
+            pos_valid = positions[valid]
+            matches = sorted_vals[pos_valid] == positives[valid]
+            if matches.any():
+                replacement = order[pos_valid[matches]]
+                tmp = drop_index[valid]
+                tmp[matches] = replacement
+                drop_index[valid] = tmp
         return drop_index
 
     def _filter_and_resample_fast(

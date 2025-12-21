@@ -45,6 +45,9 @@ class KgeOptimizer:
                 is_row=is_row,
                 use_lr_scheduler=use_lr_scheduler,
                 min_rank=min_rank,
+                max_pending_pushes=config.get(
+                    "job.distributed.optimizer.max_pending_pushes"
+                ),
                 **config.get("train.optimizer.default.args"),
             )
             return optimizer

@@ -96,9 +96,65 @@ class WorkScheduler(mp.get_context("fork").Process):
         Note that partitioning types assigning entity sets for partitions define those
         entities together with the WorkPackage.
         """
+        if self._set_local_entities_from_partitions():
+            return
         entity_keys = torch.arange(self.dataset.num_entities(), dtype=self.data_type)
         local_entities = entity_keys[torch.randperm(len(entity_keys))].chunk(self.num_clients)
         self.local_entities = dict(zip(range(self.min_rank, self.min_rank + self.num_clients), local_entities))
+
+    def _load_entity_partition_assignments(self):
+        if self.num_partitions <= 0:
+            return None
+        partition_type = getattr(self.dataset, "_partition_type", None)
+        if partition_type is None:
+            return None
+        try:
+            assignments = self.dataset.load_entities_to_partitions(self.num_partitions)
+        except (FileNotFoundError, OSError):
+            return None
+        except Exception as e:
+            self.config.log(
+                f"Failed to load entity partition assignments for local pools: {e}"
+            )
+            return None
+        assignments = torch.as_tensor(assignments, dtype=torch.long).view(-1)
+        if assignments.numel() == 0:
+            return None
+        return assignments
+
+    def _set_local_entities_from_partitions(self):
+        assignments = self._load_entity_partition_assignments()
+        if assignments is None:
+            return False
+        partition_entities = dict()
+        for partition_id in range(self.num_partitions):
+            indexes = torch.nonzero(assignments == partition_id, as_tuple=False).view(-1)
+            if indexes.numel() == 0:
+                continue
+            partition_entities[partition_id] = indexes.to(dtype=self.data_type)
+        if not partition_entities:
+            return False
+        worker_assignments = {
+            rank: []
+            for rank in range(self.min_rank, self.min_rank + self.num_clients)
+        }
+        ordered_partitions = sorted(partition_entities.keys())
+        for idx, partition_id in enumerate(ordered_partitions):
+            rank = self.min_rank + (idx % self.num_clients)
+            worker_assignments[rank].append(partition_entities[partition_id])
+        if ordered_partitions:
+            fill_index = 0
+            for rank, segments in worker_assignments.items():
+                if segments:
+                    continue
+                partition_id = ordered_partitions[fill_index % len(ordered_partitions)]
+                fill_index += 1
+                worker_assignments[rank].append(partition_entities[partition_id])
+        self.local_entities = dict()
+        for rank, entity_lists in worker_assignments.items():
+            merged = torch.unique(torch.cat(entity_lists)).to(dtype=self.data_type)
+            self.local_entities[rank] = merged
+        return True
 
     def _config_check(self, config):
         if (
@@ -1409,6 +1465,12 @@ class SchedulerClient:
         if config.get("job.distributed.scheduler_data_type") not in ["int", "int32", "int64", "long"]:
             raise ValueError("Only long and int is supported as dtype for the scheduler communication")
         self.data_type = getattr(torch, config.get("job.distributed.scheduler_data_type"))
+        try:
+            prefetch = int(config.get("job.distributed.scheduler_prefetch"))
+        except KeyError:
+            prefetch = 1
+        self.prefetch_per_request = max(1, prefetch)
+        self._prefetched_work = deque()
 
     def get_init_info(self):
         cmd = torch.tensor([SCHEDULER_CMDS.INIT_INFO, 0], dtype=self.data_type)
@@ -1447,6 +1509,32 @@ class SchedulerClient:
             dist.recv(relation_buffer, src=self.scheduler_rank)
         return work_buffer, entity_buffer, relation_buffer
 
+    def _request_single_work(
+        self,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        while True:
+            cmd = torch.tensor(
+                [SCHEDULER_CMDS.GET_WORK, self.machine_id], dtype=self.data_type
+            )
+            dist.send(cmd, dst=self.scheduler_rank)
+            dist.recv(cmd, src=self.scheduler_rank)
+            if cmd[0] == SCHEDULER_CMDS.WORK:
+                return self._receive_work(cmd)
+            elif cmd[0] == SCHEDULER_CMDS.WAIT:
+                wait = max(0.0, float(cmd[1].item()))
+                if wait > 0:
+                    time.sleep(wait)
+            else:
+                return None, None, None
+
+    def _fill_prefetch_queue(self):
+        target = self.prefetch_per_request
+        while len(self._prefetched_work) < target:
+            work, entities, relations = self._request_single_work()
+            if work is None:
+                break
+            self._prefetched_work.append((work, entities, relations))
+
     def get_work(
         self,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -1457,17 +1545,13 @@ class SchedulerClient:
             entity_buffer: tensor containing the entities
             relation_buffer: tensor containing the relations
         """
-        while True:
-            cmd = torch.tensor([SCHEDULER_CMDS.GET_WORK, self.machine_id], dtype=self.data_type)
-            dist.send(cmd, dst=self.scheduler_rank)
-            dist.recv(cmd, src=self.scheduler_rank)
-            if cmd[0] == SCHEDULER_CMDS.WORK:
-                return self._receive_work(cmd)
-            elif cmd[0] == SCHEDULER_CMDS.WAIT:
-                # print("waiting for a block")
-                time.sleep(cmd[1].item())
-            else:
-                return None, None, None
+        if self.prefetch_per_request <= 1:
+            return self._request_single_work()
+        if not self._prefetched_work:
+            self._fill_prefetch_queue()
+        if self._prefetched_work:
+            return self._prefetched_work.popleft()
+        return None, None, None
 
     def get_pre_localize_work(self):
         """

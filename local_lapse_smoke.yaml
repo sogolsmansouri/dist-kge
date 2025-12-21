@@ -1,0 +1,23 @@
+job:
+  device: cpu
+  distributed:
+    parameter_server: lapse
+    master_ip: 127.0.0.1
+    master_port: 29500
+    lapse_port: 9091
+    num_workers: 2
+    num_workers_machine: 2
+    num_eval_workers: 0
+    already_init_workers: 0
+
+dataset:
+  name: toy
+
+model: complex
+
+lookup_embedder:
+  dim: 50
+
+train:
+  max_epochs: 1
+  batch_size: 256

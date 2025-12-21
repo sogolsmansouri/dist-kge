@@ -13,7 +13,7 @@ from kge import Config, Dataset
 from kge.model import LookupEmbedder, KgeEmbedder
 from kge.distributed.misc import get_optimizer_dim
 
-from typing import List
+from typing import List, Optional, Tuple
 
 
 class DistributedLookupEmbedder(LookupEmbedder):
@@ -97,6 +97,11 @@ class DistributedLookupEmbedder(LookupEmbedder):
             with torch.cuda.device(config.get("job.device")):
                 self.copy_stream = torch.cuda.Stream()
         self.locality_rank = self._load_locality_rank()
+        self._hot_cache_ids: Optional[torch.Tensor] = None
+        self._hot_cache_id_to_slot: Optional[torch.Tensor] = None
+        self._hot_cache_embeddings: Optional[torch.Tensor] = None
+        self._hot_cache_optimizer: Optional[torch.Tensor] = None
+        self._last_hot_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def to_device(self, move_optim_data=True):
         """Needs to be called after model.to(self.device)"""
@@ -279,20 +284,61 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
         len_indexes = len(indexes)
         self.pulled_ids = indexes
-        pull_indexes = (indexes + self.lapse_offset).cpu()
-        self.local_to_lapse_mapper[:len_indexes] = pull_indexes
-        pull_tensor = self.pull_tensors[0][1][:len_indexes]
-        pull_time -= time.time()
-        self.parameter_client.pull(pull_indexes, pull_tensor)
-        pull_time += time.time()
-        cpu_gpu_time -= time.time()
-        # split tensor already before moving to gpu to reduce memory footprint on gpu
-        pulled_embeddings, pulled_optim_values, _ = torch.split(
-            pull_tensor, [self.dim, self.optimizer_dim, self.unnecessary_dim], dim=1
-        )
-        self._embeddings.weight.data[:len_indexes].copy_(pulled_embeddings, non_blocking=True)
-        self.optimizer_values[:len_indexes].copy_(pulled_optim_values, non_blocking=True)
-        cpu_gpu_time += time.time()
+        output_rows = torch.arange(len_indexes, dtype=torch.long)
+        indexes_cpu = indexes.cpu().long()
+        device = self._embeddings.weight.device
+        hot_mask = None
+        if self._hot_cache_id_to_slot is not None:
+            slots = self._hot_cache_id_to_slot[indexes_cpu]
+            hot_mask = slots >= 0
+            if hot_mask.any():
+                hot_rows = output_rows[hot_mask]
+                cache_rows = slots[hot_mask]
+                hot_rows_device = hot_rows.to(device)
+                cache_rows_device = cache_rows.to(device)
+                self._embeddings.weight.data[hot_rows_device] = self._hot_cache_embeddings[
+                    cache_rows_device
+                ]
+                self.optimizer_values[hot_rows_device] = self._hot_cache_optimizer[
+                    cache_rows_device
+                ]
+                self._last_hot_batch = (
+                    hot_rows.clone(),
+                    cache_rows.clone(),
+                )
+            else:
+                self._last_hot_batch = None
+        else:
+            slots = None
+            self._last_hot_batch = None
+
+        if hot_mask is None:
+            cold_mask = torch.ones(len_indexes, dtype=torch.bool)
+        else:
+            cold_mask = ~hot_mask
+
+        cold_rows = output_rows[cold_mask]
+        num_cold = cold_rows.numel()
+        if num_cold > 0:
+            cold_indexes = indexes_cpu[cold_mask]
+            pull_tensor = self.pull_tensors[0][1][:num_cold]
+            pull_time -= time.time()
+            self.parameter_client.pull(
+                cold_indexes + self.lapse_offset, pull_tensor
+            )
+            pull_time += time.time()
+            cpu_gpu_time -= time.time()
+            pulled_embeddings, pulled_optim_values, _ = torch.split(
+                pull_tensor, [self.dim, self.optimizer_dim, self.unnecessary_dim], dim=1
+            )
+            cold_rows_device = cold_rows.to(device)
+            self._embeddings.weight.data[cold_rows_device] = pulled_embeddings.to(device)
+            self.optimizer_values[cold_rows_device] = pulled_optim_values.to(
+                self.optimizer_values.device
+            )
+            cpu_gpu_time += time.time()
+
+        self.local_to_lapse_mapper[output_rows] = indexes_cpu + self.lapse_offset
         return pull_time, cpu_gpu_time
 
     def localize(self, indexes: Tensor, asynchronous=False, make_unique=False):
@@ -315,6 +361,21 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
     @torch.no_grad()
     def push_back(self):
+        if (
+            self._hot_cache_embeddings is not None
+            and self._last_hot_batch is not None
+        ):
+            batch_rows, cache_rows = self._last_hot_batch
+            if batch_rows.numel() > 0:
+                batch_rows_device = batch_rows.to(self._embeddings.weight.device)
+                cache_rows_device = cache_rows.to(self._hot_cache_embeddings.device)
+                self._hot_cache_embeddings[cache_rows_device] = self._embeddings.weight[
+                    batch_rows_device
+                ]
+                self._hot_cache_optimizer[cache_rows_device] = self.optimizer_values[
+                    batch_rows_device
+                ]
+        self._last_hot_batch = None
         self.local_to_lapse_mapper[:] = -1
         self.num_pulled = 0
 
@@ -370,6 +431,42 @@ class DistributedLookupEmbedder(LookupEmbedder):
             raise ValueError(f"Invalid value regularize={self.regularize}")
 
         return result
+
+    def enable_hot_cache(self, hot_ids: torch.Tensor):
+        if hot_ids is None or len(hot_ids) == 0:
+            return
+        hot_ids = torch.unique(hot_ids.long())
+        device = self._embeddings.weight.device
+        optimizer_device = self.optimizer_values.device
+        num_hot = len(hot_ids)
+        mapping_size = self.complete_vocab_size or self.dataset.num_entities()
+        mapping_size = max(mapping_size, int(hot_ids.max().item()) + 1)
+        mapping = torch.full(
+            (mapping_size,), -1, dtype=torch.long
+        )
+        mapping[hot_ids.cpu()] = torch.arange(num_hot, dtype=torch.long)
+        self._hot_cache_id_to_slot = mapping
+        self._hot_cache_embeddings = torch.empty(
+            (num_hot, self.dim), device=device
+        )
+        self._hot_cache_optimizer = torch.empty(
+            (num_hot, self.optimizer_dim), device=optimizer_device
+        )
+        pull_tensor = torch.empty(
+            (num_hot, self.dim + self.optimizer_dim + self.unnecessary_dim),
+            dtype=torch.float32,
+            device="cpu",
+        )
+        self.parameter_client.pull(
+            (hot_ids + self.lapse_offset).cpu(), pull_tensor
+        )
+        embeddings, optim_values, _ = torch.split(
+            pull_tensor, [self.dim, self.optimizer_dim, self.unnecessary_dim], dim=1
+        )
+        self._hot_cache_embeddings.copy_(embeddings.to(device))
+        self._hot_cache_optimizer.copy_(optim_values.to(optimizer_device))
+        self._hot_cache_ids = hot_ids
+        self._last_hot_batch = None
 
     def _load_locality_rank(self):
         cfg = self.config.get("job.distributed.locality_ordering") or {}
