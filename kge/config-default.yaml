@@ -94,6 +94,7 @@ job:
       min_chunk_size: 1024
       max_splits_per_partition: 8
       ema_decay: 0.5
+    gradient_snapshot_interval: 0
     graph_cut:
       cost_aware_schedule: False
       max_chunk_size: 0
@@ -113,6 +114,23 @@ job:
       #  diagonals lying next to each other will be combined
       #  e.g.: (0,0) and (1,1)
       combine_mirror: True
+    glow:
+      base_partition_type: random
+      window_size: 2
+      window_overlap: 1
+      min_gradient_count: 1
+      enable_windows: True
+      bandit:
+        enable: True
+        reward_alpha: 0.3
+        reward_scale: 0.001
+        conflict_penalty: 0.5
+      reshape:
+        enable: False
+        check_interval: 200
+        hot_splits: 1
+        cold_merges: 1
+        min_partition_size: 2048
 
 # The seeds of the PRNGs can be set manually for (increased) reproducibility.
 # Use -1 to disable explicit seeding.

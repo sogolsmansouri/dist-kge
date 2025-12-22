@@ -102,6 +102,8 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._hot_cache_embeddings: Optional[torch.Tensor] = None
         self._hot_cache_optimizer: Optional[torch.Tensor] = None
         self._last_hot_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._active_partition_id: Optional[int] = None
+        self._active_partition_version: Optional[int] = None
 
     def to_device(self, move_optim_data=True):
         """Needs to be called after model.to(self.device)"""
@@ -508,3 +510,17 @@ class DistributedLookupEmbedder(LookupEmbedder):
         ranks = self.locality_rank[indexes]
         order = torch.argsort(ranks)
         return indexes[order]
+
+    def set_partition_context(self, partition_id: int, partition_version: int):
+        self._active_partition_id = partition_id
+        self._active_partition_version = partition_version
+
+    def clear_partition_context(self):
+        self._active_partition_id = None
+        self._active_partition_version = None
+
+    def get_partition_context(self):
+        return {
+            "partition_id": self._active_partition_id,
+            "partition_version": self._active_partition_version,
+        }

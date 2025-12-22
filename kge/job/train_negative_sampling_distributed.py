@@ -126,6 +126,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         init_for_load_only=False,
     ):
         self._non_blocking_transfer = False
+        self.config = config
         self.parameter_client = parameter_client
         self.min_rank = get_min_rank(config)
 
@@ -219,6 +220,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.relation_sync_level = self.config.get(
             "job.distributed.relation_sync_level"
         )
+        self._current_partition_version = None
+        self._current_partition_id = None
+        self._partition_grad_sum = 0.0
+        self._partition_grad_samples = 0
+        self._last_finished_partition = None
+        self._current_window_members = None
+        self._current_window_entities = None
         self._need_unique_entities = self.entity_sync_level == "batch"
         self._need_unique_relations = self.relation_sync_level == "batch"
         self.entity_pre_pull = self.config.get("job.distributed.entity_pre_pull")
@@ -359,7 +367,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if batch_index % 100 != 0:
             return
         if not job.work_pre_localized:
-            work, entities, relations, wait = job.work_scheduler_client.get_pre_localize_work()
+            work, entities, relations, partition_id, partition_version, wait = job.work_scheduler_client.get_pre_localize_work()
             if wait:
                 return
             if entities is not None:
@@ -418,7 +426,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             negative_samples = list()
             for slot in [S, P, O]:
                 sample = self._sampler.sample(triples, slot)
-                if self._non_blocking_transfer:
+                if (
+                    self._non_blocking_transfer
+                    and getattr(self, "_effective_num_workers", 0) == 0
+                ):
                     sample.pin_memory()
                 negative_samples.append(sample)
             unique_time = -time.time()
@@ -470,11 +481,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         return collate
 
     def _pin_triples_if_needed(self, triples: torch.Tensor) -> torch.Tensor:
-        if (
-            not self._non_blocking_transfer
-            or triples.device.type != "cpu"
-            or triples.is_pinned()
-        ):
+        if not self._non_blocking_transfer:
+            return triples
+        if getattr(self, "_effective_num_workers", 0) > 0:
+            return triples
+        if not isinstance(self.device, str) or not self.device.startswith("cuda"):
+            return triples
+        if not torch.cuda.is_available():
+            return triples
+        if triples.device.type != "cpu":
+            return triples
+        if triples.is_pinned():
             return triples
         return triples.pin_memory()
 
@@ -652,6 +669,79 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             multiprocessing_context=mp_context,
         )
 
+    def _reset_partition_gradient_trace(self):
+        self._partition_grad_sum = 0.0
+        self._partition_grad_samples = 0
+
+    def _accumulate_partition_gradient(self):
+        if self.is_forward_only or self._current_partition_id is None:
+            return
+        grad_norm = self._compute_batch_gradient_norm()
+        if grad_norm is None:
+            return
+        self._partition_grad_sum += grad_norm
+        self._partition_grad_samples += 1
+
+    def _compute_batch_gradient_norm(self):
+        total = 0.0
+        has_grad = False
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            has_grad = True
+            grad = param.grad.detach()
+            total += grad.pow(2).sum().item()
+        if not has_grad:
+            return 0.0
+        return math.sqrt(total)
+
+    def _flush_partition_gradient_trace(self):
+        if (
+            self._current_partition_id is None
+            or self._partition_grad_samples <= 0
+        ):
+            return
+        grad_sum = self._partition_grad_sum
+        count = self._partition_grad_samples
+        self.work_scheduler_client.register_partition_gradient(
+            self._current_partition_id, grad_sum, count
+        )
+        self._reset_partition_gradient_trace()
+
+    def _notify_partition_start(self):
+        if (
+            self._current_partition_id is None
+            or self._current_partition_version is None
+        ):
+            return
+        if hasattr(self.optimizer, "set_partition_context"):
+            self.optimizer.set_partition_context(
+                self._current_partition_id, self._current_partition_version
+            )
+        for embedder in (
+            self.model.get_s_embedder(),
+            self.model.get_p_embedder(),
+        ):
+            if hasattr(embedder, "set_partition_context"):
+                embedder.set_partition_context(
+                    self._current_partition_id, self._current_partition_version
+                )
+
+    def _notify_partition_end(self):
+        finished = (self._current_partition_id, self._current_partition_version)
+        if hasattr(self.optimizer, "finalize_partition_context"):
+            self.optimizer.finalize_partition_context()
+        for embedder in (
+            self.model.get_s_embedder(),
+            self.model.get_p_embedder(),
+        ):
+            if hasattr(embedder, "clear_partition_context"):
+                embedder.clear_partition_context()
+        self._last_finished_partition = finished
+        self._current_window_members = None
+        self._current_window_entities = None
+        return finished
+
     def run_epoch(self) -> Dict[str, Any]:
         """ Runs an epoch and returns its trace entry. """
 
@@ -696,7 +786,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             scheduler_time = -time.time()
 
             # load new work package
-            work, work_entities, work_relations = self.work_scheduler_client.get_work()
+            (
+                work,
+                work_entities,
+                work_relations,
+                current_partition_id,
+                current_partition_version,
+                window_members,
+                window_entities,
+            ) = self.work_scheduler_client.get_work()
             if work_entities is not None:
                 work_entities = work_entities.long()
             if work_relations is not None:
@@ -705,6 +803,24 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.relation_partition_localized = False
             if work is None:
                 break
+            if window_members is not None and len(window_members) > 0:
+                self._current_window_members = window_members.long()
+            else:
+                self._current_window_members = None
+            if window_entities is not None and len(window_entities) > 0:
+                self._current_window_entities = torch.unique(window_entities.long())
+            else:
+                self._current_window_entities = None
+            if current_partition_id is not None and current_partition_id >= 0:
+                self._current_partition_id = int(current_partition_id)
+            else:
+                self._current_partition_id = None
+            if current_partition_version is not None and current_partition_version >= 0:
+                self._current_partition_version = int(current_partition_version)
+            else:
+                self._current_partition_version = None
+            self._notify_partition_start()
+            self._reset_partition_gradient_trace()
             local_partition_counter += 1
             self.work_pre_localized = False
             partition_start_time = time.time()
@@ -749,9 +865,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 work_entities is not None
                 and self.config.get("negative_sampling.sampling_type") == "pooled"
             ):
+                pool_entities = work_entities
+                if (
+                    self._current_window_entities is not None
+                    and self._current_window_entities.numel() > 0
+                ):
+                    pool_entities = torch.unique(
+                        torch.cat((work_entities, self._current_window_entities))
+                    )
                 self.local_entities = work_entities
-                self._sampler.set_pool(work_entities, S)
-                self._sampler.set_pool(work_entities, O)
+                self._sampler.set_pool(pool_entities, S)
+                self._sampler.set_pool(pool_entities, O)
             self.dataloader_dataset.set_samples(
                 work, self.epoch, local_partition_counter
             )
@@ -833,6 +957,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     sum_penalties[penalty_key] += penalty_value_torch.item()
                 sum_penalty += penalty
                 batch_backward_time += time.time()
+                self._accumulate_partition_gradient()
 
                 # determine full cost
                 cost_value = batch_result.avg_loss + penalty
@@ -956,7 +1081,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 # self.model.get_p_embedder().global_to_local_mapper[:] = -1
                 self.model.get_p_embedder().push_back()
             partition_duration = time.time() - partition_start_time
-            self.work_scheduler_client.register_partition_result(partition_duration)
+            self._flush_partition_gradient_trace()
+            finished_context = self._notify_partition_end()
+            status, replay_version = self.work_scheduler_client.register_partition_result(
+                partition_duration, self._current_partition_version
+            )
+            self._handle_partition_conflict(status, replay_version, finished_context)
+            self._last_finished_partition = None
+            self._current_partition_id = None
+            self._current_partition_version = None
             self.work_scheduler_client.work_done()
 
             # add results to trace entry
@@ -1129,3 +1262,32 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             relation_ids = torch.arange(self.dataset.num_relations(), dtype=torch.long)
             self.parameter_client.pull(relation_ids + lapse_offset, pull_tensor)
             torch.save(pull_tensor, f"{file}_relations.{file_ending}")
+    def _handle_partition_conflict(
+        self, status: int, replay_version: int, finished_context
+    ):
+        if status != 1:
+            return
+        partition_id = None
+        partition_version = None
+        if finished_context is not None:
+            partition_id, partition_version = finished_context
+        if partition_id is None or partition_version is None:
+            return
+        if not hasattr(self.optimizer, "replay_partition_updates"):
+            return
+        try:
+            replayed = self.optimizer.replay_partition_updates(
+                partition_id, partition_version, replay_version
+            )
+        except Exception as exc:
+            self.config.log(
+                f"Failed to replay updates for partition {partition_id} "
+                f"(version {partition_version}): {exc}"
+            )
+            return
+        if replayed:
+            self.config.log(
+                f"Replayed updates for partition {partition_id} "
+                f"(original version {partition_version}, "
+                f"replay version {replay_version})."
+            )

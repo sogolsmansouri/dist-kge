@@ -91,6 +91,10 @@ class DistSGD(Optimizer):
             model._relation_embedder.local_to_lapse_mapper,
         ]
         self.parameter_client = parameter_client
+        self._partition_context = {
+            "partition_id": None,
+            "partition_version": None,
+        }
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
         super(DistSGD, self).__init__(params, defaults)
@@ -173,3 +177,19 @@ class DistSGD(Optimizer):
 
     def push_all(self):
         pass
+
+    def set_partition_context(self, partition_id: int, partition_version: int):
+        self._partition_context["partition_id"] = partition_id
+        self._partition_context["partition_version"] = partition_version
+
+    def finalize_partition_context(self):
+        self._partition_context["partition_id"] = None
+        self._partition_context["partition_version"] = None
+
+    def get_partition_context(self):
+        return dict(self._partition_context)
+
+    def replay_partition_updates(
+        self, partition_id: int, original_version: int, replay_version: int
+    ):
+        return False

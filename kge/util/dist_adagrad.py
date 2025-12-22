@@ -81,6 +81,15 @@ class DistAdagrad(Optimizer):
             "relation": self.relation_async_wait_values,
         }
         self.max_pending_pushes = max(1, int(max_pending_pushes))
+        self._partition_context = {
+            "partition_id": None,
+            "partition_version": None,
+        }
+        self._current_replay_key = None
+        self._current_replay_payloads = {"entity": [], "relation": []}
+        self._replay_archive = {}
+        self._replay_archive_order = deque()
+        self._replay_archive_capacity = 8
 
         defaults = dict(
             lr=lr,
@@ -198,6 +207,11 @@ class DistAdagrad(Optimizer):
                             asynchronous=self._async_write_back_map[group["name"]],
                         )
                         self._enqueue_wait(group["name"], wait_value, payload_buffer)
+                        self._record_partition_push(
+                            group["name"],
+                            push_keys.clone(),
+                            payload[: len(update_value)].clone(),
+                        )
                     else:
                         fused_embedding_optimizer_update(
                             p.data,
@@ -324,3 +338,69 @@ class DistAdagrad(Optimizer):
             if group["name"] != "default":
                 if self.parameter_client.get_lr(group["name"]) == 0:
                     self.parameter_client.set_lr(group["name"], group["lr"])
+
+    def set_partition_context(self, partition_id: int, partition_version: int):
+        self._partition_context["partition_id"] = partition_id
+        self._partition_context["partition_version"] = partition_version
+        self._current_replay_key = (partition_id, partition_version)
+        self._current_replay_payloads = {"entity": [], "relation": []}
+
+    def finalize_partition_context(self):
+        if self._current_replay_key is not None:
+            self._store_replay_entry(
+                self._current_replay_key, self._current_replay_payloads
+            )
+        self._current_replay_key = None
+        self._current_replay_payloads = {"entity": [], "relation": []}
+        self._partition_context["partition_id"] = None
+        self._partition_context["partition_version"] = None
+
+    def get_partition_context(self):
+        return dict(self._partition_context)
+
+    def _store_replay_entry(self, key, payloads):
+        entry = {
+            "entity": [self._clone_record(rec) for rec in payloads.get("entity", [])],
+            "relation": [
+                self._clone_record(rec) for rec in payloads.get("relation", [])
+            ],
+        }
+        self._replay_archive[key] = entry
+        self._replay_archive_order.append(key)
+        while len(self._replay_archive_order) > self._replay_archive_capacity:
+            old_key = self._replay_archive_order.popleft()
+            self._replay_archive.pop(old_key, None)
+
+    @staticmethod
+    def _clone_record(record):
+        keys, payload = record
+        return (keys.clone(), payload.clone())
+
+    def _record_partition_push(self, group_name, keys, payload):
+        if self._current_replay_key is None:
+            return
+        if keys.numel() == 0 or payload.numel() == 0:
+            return
+        self._current_replay_payloads[group_name].append(
+            (keys.cpu(), payload.cpu())
+        )
+
+    def replay_partition_updates(
+        self, partition_id: int, original_version: int, replay_version: int
+    ):
+        key = (partition_id, original_version)
+        entry = self._replay_archive.get(key)
+        if entry is None:
+            return False
+        for group_name in ("entity", "relation"):
+            for keys, payload in entry[group_name]:
+                if keys.numel() == 0:
+                    continue
+                self.parameter_client.push(keys, payload, asynchronous=False)
+        new_key = (
+            (partition_id, replay_version)
+            if replay_version is not None and replay_version >= 0
+            else key
+        )
+        self._store_replay_entry(new_key, entry)
+        return True
