@@ -211,6 +211,25 @@ def main():
                 "{} is not a valid config file for resuming".format(args.config)
             )
 
+    def _parse_device_pool_arg(raw_value):
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, list):
+            if not raw_value:
+                return []
+            if all(isinstance(v, str) and len(v) == 1 for v in raw_value):
+                raw = "".join(raw_value)
+            elif all(isinstance(v, str) for v in raw_value):
+                return [v.strip().strip("'\"") for v in raw_value if v.strip()]
+            else:
+                raw = "".join(str(v) for v in raw_value)
+        else:
+            raw = str(raw_value)
+        raw = raw.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        return [part.strip().strip("'\"") for part in raw.split(",") if part.strip()]
+
     # overwrite configuration with command line arguments
     for key, value in vars(args).items():
         if key in [
@@ -224,7 +243,7 @@ def main():
             continue
         if value is not None:
             if key == "search.device_pool" or key == "job.device_pool":
-                value = "".join(value).split(",")
+                value = _parse_device_pool_arg(value)
             try:
                 if isinstance(config.get(key), bool):
                     value = argparse_bool_type(value)

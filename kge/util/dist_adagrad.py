@@ -43,6 +43,7 @@ class DistAdagrad(Optimizer):
         use_lr_scheduler=False,
         min_rank=-1,
         max_pending_pushes=2,
+        conflict_free_merge=False,
     ):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -81,6 +82,7 @@ class DistAdagrad(Optimizer):
             "relation": self.relation_async_wait_values,
         }
         self.max_pending_pushes = max(1, int(max_pending_pushes))
+        self.conflict_free_merge = bool(conflict_free_merge)
         self._partition_context = {
             "partition_id": None,
             "partition_version": None,
@@ -201,7 +203,7 @@ class DistAdagrad(Optimizer):
                         self._pack_push_payload(
                             payload, update_value, sum_update_values
                         )
-                        wait_value = self.parameter_client.push(
+                        wait_value = self._push_with_context(
                             push_keys,
                             payload,
                             asynchronous=self._async_write_back_map[group["name"]],
@@ -227,6 +229,24 @@ class DistAdagrad(Optimizer):
                     )
 
         return loss
+
+    def _push_with_context(self, keys, payload, asynchronous=False):
+        if (
+            self.conflict_free_merge
+            and self._partition_context["partition_id"] is not None
+            and self._partition_context["partition_version"] is not None
+            and hasattr(self.parameter_client, "push_versioned")
+        ):
+            return self.parameter_client.push_versioned(
+                keys,
+                payload,
+                self._partition_context["partition_id"],
+                self._partition_context["partition_version"],
+                asynchronous=asynchronous,
+            )
+        return self.parameter_client.push(
+            keys, payload, asynchronous=asynchronous
+        )
 
     def _acquire_push_buffer(self, group_name: str, rows: int) -> torch.Tensor:
         pool = self._push_buffer_pool[group_name]

@@ -33,6 +33,16 @@ class KgeParameterClient:
     def push(self, keys, push_tensor, asynchronous=False):
         raise NotImplementedError()
 
+    def push_versioned(
+        self,
+        keys,
+        push_tensor,
+        partition_id: Optional[int],
+        partition_version: Optional[int],
+        asynchronous=False,
+    ):
+        return self.push(keys, push_tensor, asynchronous=asynchronous)
+
     def set(self, keys, set_tensor, asynchronous=False):
         raise NotImplementedError()
 
@@ -280,6 +290,10 @@ class SharedParameterClient(KgeParameterClient):
         KgeParameterClient.__init__(self, config, rank)
         self.parameters = parameters
         self.num_keys = len(parameters)
+        self._conflict_free_merge = bool(
+            config.get("job.distributed.conflict_free_merge")
+        )
+        self._partition_version_state = {}
         self.data_type = torch.float32
         self.lr_buffer = torch.zeros(1, dtype=torch.float32)
         self._stop_key = torch.LongTensor([self.num_keys - self.num_meta_keys])
@@ -312,6 +326,29 @@ class SharedParameterClient(KgeParameterClient):
     def push(self, keys, push_tensor, asynchronous=False):
         self.parameters[keys, :] += push_tensor
         #self.parameters.index_add_(0, keys, push_tensor)
+
+    @torch.no_grad()
+    def push_versioned(
+        self,
+        keys,
+        push_tensor,
+        partition_id: Optional[int],
+        partition_version: Optional[int],
+        asynchronous=False,
+    ):
+        if (
+            not self._conflict_free_merge
+            or partition_id is None
+            or partition_version is None
+        ):
+            self.push(keys, push_tensor, asynchronous=asynchronous)
+            return
+        current = self._partition_version_state.get(partition_id, -1)
+        if partition_version < current:
+            return
+        if partition_version > current:
+            self._partition_version_state[partition_id] = partition_version
+        self.parameters[keys, :] += push_tensor
 
     @torch.no_grad()
     def set(self, keys, set_tensor, asynchronous=False):
@@ -358,4 +395,3 @@ class SharedParameterClient(KgeParameterClient):
     def set_lr(self, group_name, lr):
         getattr(self, f"_{group_name}_lr_tensor")[:] = lr
         self.set(getattr(self, f"_{group_name}_lr_key"), getattr(self, f"_{group_name}_lr_tensor"))
-

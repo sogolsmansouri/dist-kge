@@ -19,6 +19,9 @@ class KgeOptimizer:
                 model,
                 parameter_client=parameter_client,
                 lapse_indexes=lapse_indexes,
+                conflict_free_merge=config.get(
+                    "job.distributed.conflict_free_merge"
+                ),
                 **config.get("train.optimizer.default.args"),
             )
             return optimizer
@@ -47,6 +50,9 @@ class KgeOptimizer:
                 min_rank=min_rank,
                 max_pending_pushes=config.get(
                     "job.distributed.optimizer.max_pending_pushes"
+                ),
+                conflict_free_merge=config.get(
+                    "job.distributed.conflict_free_merge"
                 ),
                 **config.get("train.optimizer.default.args"),
             )

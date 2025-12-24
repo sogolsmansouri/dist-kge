@@ -64,6 +64,10 @@ class KgeSampler(Configurable):
                 else:
                     self.num_samples[slot] = 0
 
+    def supports_device_sampling(self, positive_triples: torch.Tensor) -> bool:
+        """Returns True if the sampler can operate directly on the triples' device."""
+        return False
+
     @staticmethod
     def create(
         config: Config, configuration_key: str, dataset: Dataset
@@ -249,6 +253,7 @@ class BatchNegativeSample(Configurable):
         )
         self.forward_time = 0.0
         self.prepare_time = 0.0
+        self._lookahead_payload = None
 
     def samples(self, indexes=None) -> torch.Tensor:
         """Returns a tensor holding the indexes of the negative samples.
@@ -286,6 +291,38 @@ class BatchNegativeSample(Configurable):
         ):
             self.positive_triples = self.positive_triples.pin_memory()
         return self
+
+    @staticmethod
+    def _device_key(device) -> str:
+        if isinstance(device, torch.device):
+            if device.index is None:
+                return device.type
+            return f"{device.type}:{device.index}"
+        return str(device)
+
+    def attach_lookahead(self, payload: Optional[dict]):
+        """Attach prefetched buffers that can be consumed later."""
+        if payload is None:
+            return
+        self._lookahead_payload = payload
+
+    def _consume_lookahead(self, device):
+        if self._lookahead_payload is None:
+            return None
+        payload = self._lookahead_payload
+        device_key = payload.get("device")
+        if device_key is not None and device_key != self._device_key(device):
+            return None
+        self._lookahead_payload = None
+        return payload
+
+    def build_lookahead_payload(self, device, non_blocking: bool = False):
+        """Create a device-resident copy of the samples for reuse."""
+        try:
+            samples = self.samples().to(device, non_blocking=non_blocking)
+        except Exception:
+            return None
+        return {"device": self._device_key(device), "samples": samples}
 
     def map_samples(self, mapper):
         """Maps samples to new ids"""
@@ -406,8 +443,13 @@ class DefaultBatchNegativeSample(BatchNegativeSample):
         return self._samples if indexes is None else self._samples[indexes]
 
     def to(self, device, non_blocking: bool = False) -> "DefaultBatchNegativeSample":
+        payload = self._consume_lookahead(device)
         super().to(device, non_blocking=non_blocking)
-        self._samples = self._samples.to(device, non_blocking=non_blocking)
+        if payload and payload.get("samples") is not None:
+            self._samples = payload["samples"]
+            payload["samples"] = None
+        else:
+            self._samples = self._samples.to(device, non_blocking=non_blocking)
         return self
 
     def pin_memory(self) -> "DefaultBatchNegativeSample":
@@ -417,7 +459,19 @@ class DefaultBatchNegativeSample(BatchNegativeSample):
         return self
 
     def map_samples(self, mapper):
-        self._samples = mapper[self._samples]
+        device = self._samples.device
+        mapper_device = mapper.device if isinstance(mapper, torch.Tensor) else device
+        if mapper_device is None:
+            mapper_device = torch.device("cpu")
+        indexes = self._samples
+        if indexes.device != mapper_device:
+            indexes_cpu = indexes.to(mapper_device)
+        else:
+            indexes_cpu = indexes
+        mapped = mapper[indexes_cpu]
+        if mapped.device != device:
+            mapped = mapped.to(device)
+        self._samples = mapped
 
 
 class NaiveSharedNegativeSample(BatchNegativeSample):
@@ -440,6 +494,23 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
         super().__init__(config, configuration_key, positive_triples, slot, num_samples)
         self._unique_samples = unique_samples
         self._repeat_indexes = repeat_indexes
+        self._unique_samples_cpu = None
+        self._repeat_indexes_cpu = None
+
+    def _tensor_for_device(self, tensor, cache_attr, device):
+        if tensor.device == device:
+            return tensor
+        if device.type == "cpu":
+            cached = getattr(self, cache_attr)
+            if (
+                cached is None
+                or cached.device != device
+                or cached.size() != tensor.size()
+            ):
+                cached = tensor.to(device)
+                setattr(self, cache_attr, cached)
+            return cached
+        return tensor.to(device)
 
     def unique_samples(self, indexes=None, return_inverse=False, remove_dropped=True) -> torch.Tensor:
         if return_inverse:
@@ -447,7 +518,10 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
             samples = self.samples(indexes)
             return torch.unique(samples.contiguous().view(-1), return_inverse=True)
         else:
-            return self._unique_samples
+            device = self.positive_triples.device
+            return self._tensor_for_device(
+                self._unique_samples, "_unique_samples_cpu", device
+            )
 
     def samples(self, indexes=None) -> torch.Tensor:
         # create one row, then expand to chunk size
@@ -456,20 +530,32 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
         else:
             chunk_size = len(indexes) if indexes else len(self.positive_triples)
         device = self.positive_triples.device
-        num_unique = len(self._unique_samples)
+        unique_samples = self._tensor_for_device(
+            self._unique_samples, "_unique_samples_cpu", device
+        )
+        num_unique = len(unique_samples)
         if num_unique == self.num_samples:
-            negative_samples1 = self._unique_samples
+            negative_samples1 = unique_samples
         else:
             negative_samples1 = torch.empty(
                 self.num_samples, dtype=torch.long, device=device
             )
-            negative_samples1[:num_unique] = self._unique_samples
-            negative_samples1[num_unique:] = self._unique_samples[self._repeat_indexes]
+            negative_samples1[:num_unique] = unique_samples
+            repeat_indexes = self._tensor_for_device(
+                self._repeat_indexes, "_repeat_indexes_cpu", device
+            )
+            if repeat_indexes.numel() > 0:
+                negative_samples1[num_unique:] = unique_samples[repeat_indexes]
 
         return negative_samples1.unsqueeze(0).expand((chunk_size, -1))
 
     def map_samples(self, mapper):
-        self._unique_samples = mapper[self._unique_samples]
+        cpu_samples = self._tensor_for_device(
+            self._unique_samples, "_unique_samples_cpu", mapper.device
+        )
+        mapped = mapper[cpu_samples]
+        self._unique_samples = mapped.to(self._unique_samples.device)
+        self._unique_samples_cpu = None
 
     def score(self, model, indexes=None) -> torch.Tensor:
         if self._implementation != "batch":
@@ -508,14 +594,33 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
 
         return scores
 
+    def build_lookahead_payload(self, device, non_blocking: bool = False):
+        try:
+            unique = self._unique_samples.to(device, non_blocking=non_blocking)
+            repeat = self._repeat_indexes.to(device, non_blocking=non_blocking)
+        except Exception:
+            return None
+        return {
+            "device": self._device_key(device),
+            "unique_samples": unique,
+            "repeat_indexes": repeat,
+        }
+
     def to(self, device, non_blocking: bool = False) -> "NaiveSharedNegativeSample":
+        payload = self._consume_lookahead(device)
         super().to(device, non_blocking=non_blocking)
-        self._unique_samples = self._unique_samples.to(
-            device, non_blocking=non_blocking
-        )
-        self._repeat_indexes = self._repeat_indexes.to(
-            device, non_blocking=non_blocking
-        )
+        if payload and "unique_samples" in payload:
+            self._unique_samples = payload["unique_samples"]
+            self._repeat_indexes = payload.get("repeat_indexes", self._repeat_indexes)
+        else:
+            self._unique_samples = self._unique_samples.to(
+                device, non_blocking=non_blocking
+            )
+            self._repeat_indexes = self._repeat_indexes.to(
+                device, non_blocking=non_blocking
+            )
+        self._unique_samples_cpu = None
+        self._repeat_indexes_cpu = None
         return self
 
     def pin_memory(self) -> "NaiveSharedNegativeSample":
@@ -525,11 +630,13 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
             and not self._unique_samples.is_pinned()
         ):
             self._unique_samples = self._unique_samples.pin_memory()
+            self._unique_samples_cpu = None
         if (
             self._repeat_indexes.device.type == "cpu"
             and not self._repeat_indexes.is_pinned()
         ):
             self._repeat_indexes = self._repeat_indexes.pin_memory()
+            self._repeat_indexes_cpu = None
         return self
 
 
@@ -549,6 +656,24 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
         self._unique_samples = unique_samples
         self._drop_index = drop_index
         self._repeat_indexes = repeat_indexes
+        self._unique_samples_cpu = None
+        self._drop_index_cpu = None
+        self._repeat_indexes_cpu = None
+
+    def _tensor_for_device(self, tensor, cache_attr, device):
+        if tensor.device == device:
+            return tensor
+        if device.type == "cpu":
+            cached = getattr(self, cache_attr)
+            if (
+                cached is None
+                or cached.device != device
+                or cached.size() != tensor.size()
+            ):
+                cached = tensor.to(device)
+                setattr(self, cache_attr, cached)
+            return cached
+        return tensor.to(device)
 
     def unique_samples(self, indexes=None, return_inverse=False, remove_dropped=True) -> torch.Tensor:
         if return_inverse:
@@ -557,16 +682,31 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
                 indexes=indexes, return_inverse=return_inverse
             )
         if remove_dropped:
-            drop_index = self._drop_index if indexes is None else self._drop_index[indexes]
+            drop_index = self._tensor_for_device(
+                self._drop_index, "_drop_index_cpu", self.positive_triples.device
+            )
+            drop_index = drop_index if indexes is None else drop_index[indexes]
             if torch.all(drop_index == drop_index[0]).item():
                 # same sample dropped for every triple in the batch
                 not_drop_mask = torch.ones(len(self._unique_samples), dtype=torch.bool)
                 not_drop_mask[drop_index[0]] = False
-                return self._unique_samples[not_drop_mask]
-        return self._unique_samples
+                unique_samples = self._tensor_for_device(
+                    self._unique_samples,
+                    "_unique_samples_cpu",
+                    self.positive_triples.device,
+                )
+                return unique_samples[not_drop_mask]
+        return self._tensor_for_device(
+            self._unique_samples, "_unique_samples_cpu", self.positive_triples.device
+        )
 
     def map_samples(self, mapper):
-        self._unique_samples = mapper[self._unique_samples]
+        cpu_samples = self._tensor_for_device(
+            self._unique_samples, "_unique_samples_cpu", mapper.device
+        )
+        mapped = mapper[cpu_samples]
+        self._unique_samples = mapped.to(self._unique_samples.device)
+        self._unique_samples_cpu = None
 
     def samples(self, indexes=None) -> torch.Tensor:
         num_samples = self.num_samples
@@ -575,29 +715,36 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
             if indexes is None
             else self.positive_triples[indexes, :]
         )
-        drop_index = self._drop_index if indexes is None else self._drop_index[indexes]
+        drop_index = self._tensor_for_device(
+            self._drop_index, "_drop_index_cpu", triples.device
+        )
+        drop_index = drop_index if indexes is None else drop_index[indexes]
         chunk_size = len(triples)
 
         # create output tensor
         device = self.positive_triples.device
-        num_unique = len(self._unique_samples) - 1
+        unique_samples = self._tensor_for_device(
+            self._unique_samples, "_unique_samples_cpu", device
+        )
+        num_unique = len(unique_samples) - 1
         negative_samples = torch.empty(
             chunk_size, num_unique, dtype=torch.long, device=device
         )
 
         # Add the first num_distinct samples for each positive. Dropping is
         # performed by copying the last shared sample over the dropped sample
-        negative_samples[:, :] = self._unique_samples[:-1]
+        negative_samples[:, :] = unique_samples[:-1]
         drop_rows = torch.nonzero(drop_index != num_unique, as_tuple=False).squeeze()
-        negative_samples[drop_rows, drop_index[drop_rows]] = self._unique_samples[-1]
+        negative_samples[drop_rows, drop_index[drop_rows]] = unique_samples[-1]
 
         # repeat indexes as needed for WR sampling
         if num_unique != num_samples:
+            repeat_indexes = self._tensor_for_device(
+                self._repeat_indexes, "_repeat_indexes_cpu", device
+            )
             negative_samples = negative_samples[
                 :,
-                torch.cat(
-                    (torch.arange(num_unique, device=device), self._repeat_indexes)
-                ),
+                torch.cat((torch.arange(num_unique, device=device), repeat_indexes)),
             ]
 
         return negative_samples
@@ -611,12 +758,17 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
         self.prepare_time = 0.0
         self.forward_time = 0.0
         slot = self.slot
-        unique_targets = self._unique_samples
+        unique_targets = self._tensor_for_device(
+            self._unique_samples, "_unique_samples_cpu", self.positive_triples.device
+        )
         num_unique = len(unique_targets) - 1
         triples = (
             self.positive_triples[indexes, :] if indexes else self.positive_triples
         )
-        drop_index = self._drop_index[indexes] if indexes else self._drop_index
+        drop_index = self._tensor_for_device(
+            self._drop_index, "_drop_index_cpu", triples.device
+        )
+        drop_index = drop_index[indexes] if indexes else drop_index
         drop_rows = torch.nonzero(drop_index != num_unique, as_tuple=False).squeeze()
         chunk_size = len(triples)
 
@@ -635,11 +787,12 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
 
         # repeat scores as needed for WR sampling
         if num_unique != self.num_samples:
+            repeat_indexes = self._tensor_for_device(
+                self._repeat_indexes, "_repeat_indexes_cpu", device
+            )
             scores = scores[
                 :,
-                torch.cat(
-                    (torch.arange(num_unique, device=device), self._repeat_indexes)
-                ),
+                torch.cat((torch.arange(num_unique, device=device), repeat_indexes)),
             ]
         self.forward_time += time.time()
 
@@ -654,6 +807,9 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
         self._repeat_indexes = self._repeat_indexes.to(
             device, non_blocking=non_blocking
         )
+        self._unique_samples_cpu = None
+        self._drop_index_cpu = None
+        self._repeat_indexes_cpu = None
         return self
 
     def pin_memory(self) -> "DefaultSharedNegativeSample":
@@ -663,13 +819,16 @@ class DefaultSharedNegativeSample(BatchNegativeSample):
             and not self._unique_samples.is_pinned()
         ):
             self._unique_samples = self._unique_samples.pin_memory()
+            self._unique_samples_cpu = None
         if self._drop_index.device.type == "cpu" and not self._drop_index.is_pinned():
             self._drop_index = self._drop_index.pin_memory()
+            self._drop_index_cpu = None
         if (
             self._repeat_indexes.device.type == "cpu"
             and not self._repeat_indexes.is_pinned()
         ):
             self._repeat_indexes = self._repeat_indexes.pin_memory()
+            self._repeat_indexes_cpu = None
         return self
 
 
@@ -771,9 +930,27 @@ class KgeUniformSampler(KgeSampler):
     def __init__(self, config: Config, configuration_key: str, dataset: Dataset):
         super().__init__(config, configuration_key, dataset)
 
+    def supports_device_sampling(self, positive_triples: torch.Tensor) -> bool:
+        if positive_triples.device.type != "cuda":
+            return False
+        if not self.config.get("job.distributed.sample_on_gpu"):
+            return False
+        if any(self.filter_positives):
+            return False
+        if self.shared and self.shared_type != "naive":
+            return False
+        return True
+
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
+        device = (
+            positive_triples.device
+            if positive_triples.device.type == "cuda"
+            else torch.device("cpu")
+        )
         return torch.randint(
-            self.vocabulary_size[slot], (positive_triples.size(0), num_samples)
+            self.vocabulary_size[slot],
+            (positive_triples.size(0), num_samples),
+            device=device,
         )
 
     def _sample_shared(
@@ -781,13 +958,20 @@ class KgeUniformSampler(KgeSampler):
     ):
         batch_size = len(positive_triples)
         vocab_size = int(self.vocabulary_size[slot])
+        target_device = (
+            positive_triples.device
+            if positive_triples.device.type == "cuda"
+            else torch.device("cpu")
+        )
 
         # determine number of distinct negative samples for each positive
         if self.with_replacement and num_samples > 0:
             population = vocab_size - (0 if self.shared_type == "naive" else 1)
             population = max(population, 1)
             draws = torch.randint(
-                population, (num_samples,), device=torch.device("cpu")
+                population,
+                (num_samples,),
+                device=target_device if target_device.type != "cuda" else "cpu",
             )
             num_unique = int(torch.unique(draws, sorted=False).numel())
         else:  # WOR -> all samples distinct
@@ -799,7 +983,10 @@ class KgeUniformSampler(KgeSampler):
                 "Requested more unique negative samples than vocabulary size."
             )
         if samples_needed > 0:
+            # torch.randperm with a large vocab is more reliable on CPU; slice and move.
             unique_samples = torch.randperm(vocab_size, device="cpu")[:samples_needed]
+            if target_device.type == "cuda":
+                unique_samples = unique_samples.to(target_device)
         else:
             unique_samples = torch.empty(0, dtype=torch.long)
 
@@ -809,10 +996,10 @@ class KgeUniformSampler(KgeSampler):
                 num_unique,
                 (num_samples - num_unique,),
                 dtype=torch.long,
-                device="cpu",
+                device=target_device,
             )
         else:
-            repeat_indexes = torch.empty(0, dtype=torch.long, device="cpu")
+            repeat_indexes = torch.empty(0, dtype=torch.long, device=target_device)
 
         if self.shared_type == "naive":
             return NaiveSharedNegativeSample(
@@ -1122,20 +1309,34 @@ class KgeBatchSampler(KgeSampler):
                     "without replacement sampling not supported with batch sampling"
                 )
 
+    def supports_device_sampling(self, positive_triples: torch.Tensor) -> bool:
+        if positive_triples.device.type != "cuda":
+            return False
+        if not self.config.get("job.distributed.sample_on_gpu"):
+            return False
+        if any(self.filter_positives):
+            return False
+        return True
+
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
+        device = positive_triples.device
         return positive_triples[:, slot][
             torch.randint(
                 len(positive_triples),
                 [len(positive_triples), num_samples],
                 dtype=torch.long,
+                device=device,
             )
         ]
 
     def _sample_shared(
         self, positive_triples: torch.Tensor, slot: int, num_samples: int
     ):
+        device = positive_triples.device
         batch_samples = positive_triples[:, slot][
-            torch.randint(len(positive_triples), (num_samples,), dtype=torch.long)
+            torch.randint(
+                len(positive_triples), (num_samples,), dtype=torch.long, device=device
+            )
         ]
         return NaiveSharedNegativeSample(
             self.config,
@@ -1206,6 +1407,12 @@ class KgeCombinedSampler(KgeSampler):
             # here we avoid that a repeat index is used in the naive shared sampler
             warnings.warn("setting with replacement to true to sampler 1. This allows for more efficient scoring. Only used in the combination of naive shared sampling with batch sampling.")
             self.sampler_1.with_replacement = False
+
+    def supports_device_sampling(self, positive_triples: torch.Tensor) -> bool:
+        return (
+            self.sampler_1.supports_device_sampling(positive_triples)
+            and self.sampler_2.supports_device_sampling(positive_triples)
+        )
 
     def _create_second_sampler_config(self):
         """
@@ -1308,15 +1515,41 @@ class KgePooledSampler(KgeSampler):
         self.sample_pools[S] = torch.randperm(self.vocabulary_size[S]).share_memory_()
         self.sample_pools[P] = torch.randperm(self.vocabulary_size[P]).share_memory_()
         self.sample_pools[O] = self.sample_pools[S]
+        self.sample_pools_device = {S: None, P: None, O: None}
         self.sample_pool_sizes = dict()
         self.sample_pool_sizes[S] = torch.zeros([1, ], dtype=torch.int).share_memory_()
         self.sample_pool_sizes[P] = torch.zeros([1, ], dtype=torch.int).share_memory_()
         self.sample_pool_sizes[O] = self.sample_pool_sizes[S]
 
+    def supports_device_sampling(self, positive_triples: torch.Tensor) -> bool:
+        if positive_triples.device.type != "cuda":
+            return False
+        if not self.config.get("job.distributed.sample_on_gpu"):
+            return False
+        if any(self.filter_positives):
+            return False
+        if self.shared and self.shared_type != "naive":
+            return False
+        for slot in SLOTS:
+            if int(self.num_samples[slot].item()) <= 0:
+                continue
+            if self.sample_pools_device.get(slot) is None:
+                return False
+        return True
+
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
-        return self.sample_pools[slot][
+        pool = self.sample_pools_device.get(slot)
+        if pool is not None:
+            idx = torch.randint(
+                pool.size(0),
+                (positive_triples.size(0), num_samples),
+                device=pool.device,
+            )
+            return pool.index_select(0, idx.view(-1)).view_as(idx)
+        cpu_pool = self.sample_pools[slot]
+        return cpu_pool[
             torch.randint(
-                len(self.sample_pools[slot]), (positive_triples.size(0), num_samples)
+                len(cpu_pool), (positive_triples.size(0), num_samples)
             )
         ]
 
@@ -1358,17 +1591,39 @@ class KgePooledSampler(KgeSampler):
         #     self.vocabulary_size[slot], num_unique, replace=False
         # )
 
+        device_pool = self.sample_pools_device.get(slot)
+        if (
+            device_pool is not None
+            and self.shared_type == "naive"
+            and device_pool.size(0) > 0
+        ):
+            return self._sample_shared_device(
+                positive_triples, slot, num_samples, device_pool
+            )
+
         # set pool size to ensure it does not fail in P-slot
         pool_size = max(1, pool_size)
         if not num_unique + 1 > pool_size:
-            unique_samples = self.sample_pools[slot][torch.tensor(random.sample(
-                range(pool_size),
-                num_unique if self.shared_type == "naive" else num_unique + 1,
-            ), dtype=torch.long)]
+            unique_samples = self.sample_pools[slot][torch.tensor(
+                random.sample(
+                    range(pool_size),
+                    num_unique if self.shared_type == "naive" else num_unique + 1,
+                ),
+                dtype=torch.long,
+            )]
         else:
             unique_samples = self.sample_pools[slot][torch.tensor(
-                np.random.randint(0, pool_size, [num_unique if self.shared_type == "naive" else num_unique + 1,]),
-                dtype=torch.long)]
+                np.random.randint(
+                    0,
+                    pool_size,
+                    [
+                        num_unique
+                        if self.shared_type == "naive"
+                        else num_unique + 1,
+                    ],
+                ),
+                dtype=torch.long,
+            )]
 
         # For WR, we need to upsample. To do so, we compute the set of additional
         # (repeated) sample indexes.
@@ -1423,5 +1678,75 @@ class KgePooledSampler(KgeSampler):
         )
 
     def set_pool(self, pool: torch.Tensor, slot: int):
-        self.sample_pools[slot][:len(pool)] = pool
-        self.sample_pool_sizes[slot][0] = len(pool)
+        pool_len = len(pool)
+        self.sample_pool_sizes[slot][0] = pool_len
+        if pool.is_cuda:
+            device_pool = self.sample_pools_device.get(slot)
+            needs_alloc = (
+                device_pool is None
+                or device_pool.device != pool.device
+                or device_pool.size(0) < pool_len
+            )
+            if needs_alloc:
+                device_pool = torch.empty(
+                    (pool_len,), dtype=pool.dtype, device=pool.device
+                )
+            device_pool[:pool_len] = pool
+            self.sample_pools_device[slot] = device_pool
+            return
+
+        self.sample_pools[slot][:pool_len] = pool
+        self.sample_pools_device[slot] = None
+
+    def _sample_shared_device(
+        self,
+        positive_triples: torch.Tensor,
+        slot: int,
+        num_samples: int,
+        pool: torch.Tensor,
+    ):
+        pool_size = int(self.sample_pool_sizes[slot].item())
+        pool_size = min(pool_size, pool.size(0))
+        pool_size = max(pool_size, 1)
+        device = pool.device
+        if self.with_replacement:
+            draws = torch.randint(pool_size, (num_samples,), device=device)
+            unique_indexes = torch.unique(draws, sorted=False)
+        else:
+            if num_samples <= pool_size:
+                unique_indexes = torch.empty(0, dtype=torch.long, device=device)
+                while unique_indexes.numel() < num_samples:
+                    remaining = num_samples - unique_indexes.numel()
+                    candidates = torch.randint(
+                        pool_size, (max(remaining * 2, remaining),), device=device
+                    )
+                    unique_indexes = torch.unique(
+                        torch.cat((unique_indexes, candidates)), sorted=False
+                    )
+                    unique_indexes = unique_indexes[:num_samples]
+            else:
+                draws = torch.randint(pool_size, (num_samples,), device=device)
+                unique_indexes = torch.unique(draws, sorted=False)
+        num_unique = unique_indexes.numel()
+        if num_unique == 0:
+            unique_indexes = torch.zeros(1, dtype=torch.long, device=device)
+            num_unique = 1
+        unique_samples = pool.index_select(0, unique_indexes)
+        if num_unique != num_samples:
+            repeat_indexes = torch.randint(
+                num_unique,
+                (num_samples - num_unique,),
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            repeat_indexes = torch.empty(0, dtype=torch.long, device=device)
+        return NaiveSharedNegativeSample(
+            self.config,
+            self.configuration_key,
+            positive_triples,
+            slot,
+            num_samples,
+            unique_samples,
+            repeat_indexes,
+        )

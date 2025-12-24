@@ -10,7 +10,7 @@ import itertools
 from pathlib import Path
 
 from collections import defaultdict, deque
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from kge.job import Job
 from kge.job.train import TrainingJob, _generate_worker_init_fn
@@ -20,6 +20,7 @@ from kge.util import KgeOptimizer
 from kge.job.trace import format_trace_entry
 from kge.distributed.work_scheduler import SchedulerClient
 from kge.distributed.misc import get_min_rank
+from kge.distributed.partition_stager import PartitionStager
 
 SLOTS = [0, 1, 2]
 S, P, O = SLOTS
@@ -55,15 +56,31 @@ class InfiniteSequentialSampler(torch.utils.data.Sampler):
 
 
 class BatchDataset(torch.utils.data.Dataset):
-    def __init__(self, triples, batch_size, shuffle=True):
+    def __init__(
+        self,
+        triples,
+        batch_size,
+        shuffle=True,
+        materialize=False,
+        materialize_device=None,
+    ):
         self.triples = triples
-        # work around for now to have a working shared tensor
-        self.samples = (
+        # shared buffers used when we need to reshuffle samples
+        self._samples_buffer = (
             torch.empty([len(triples)], dtype=torch.long, requires_grad=False)
             .share_memory_()
         )
+        self.samples = self._samples_buffer
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.materialize = materialize
+        self.materialize_device = materialize_device
+        self.materialized_triples_device = None
+        self.materialized_triples = None
+        self.materialized_size = 0
+        self.materialization_events = (
+            torch.zeros([1], dtype=torch.long, requires_grad=False).share_memory_()
+        )
         self.num_samples = (
             torch.full([1], -1, dtype=torch.int, requires_grad=False).share_memory_()
         )
@@ -73,6 +90,24 @@ class BatchDataset(torch.utils.data.Dataset):
         self.partition_id = (
             torch.full([1], -1, dtype=torch.int, requires_grad=False).share_memory_()
         )
+        self._materialize_device = None
+        self.partition_stager = None
+        self._staged_partition = None
+        self._staged_version = None
+        self._staged_local_ids = False
+        if self.materialize and self.materialize_device is not None:
+            try:
+                device_obj = (
+                    self.materialize_device
+                    if isinstance(self.materialize_device, torch.device)
+                    else torch.device(self.materialize_device)
+                )
+            except (TypeError, RuntimeError, ValueError):
+                device_obj = None
+            if device_obj is not None and device_obj.type == "cuda":
+                self.partition_stager = PartitionStager(device=device_obj)
+                self._materialize_device = device_obj
+        self._debug_stats = defaultdict(int)
 
     def __len__(self):
         if self.num_samples.item() <= 0:
@@ -98,18 +133,222 @@ class BatchDataset(torch.utils.data.Dataset):
             self.partition_id.item(),
         )
 
-    def set_samples(self, samples: torch.Tensor, epoch, partition_id):
+    def _ensure_materialized_buffer(self, size: int):
+        if self.partition_stager is not None:
+            return
+        if (
+            self.materialized_triples is None
+            or self.materialized_triples.size(0) < size
+        ):
+            self.materialized_triples = (
+                torch.empty(
+                    (size, self.triples.size(1)),
+                    dtype=self.triples.dtype,
+                    requires_grad=False,
+                )
+                .share_memory_()
+            )
+        if (
+            self.materialize_device
+            and self.materialize_device.startswith("cuda")
+            and (
+                self.materialized_triples_device is None
+                or self.materialized_triples_device.size(0) < size
+            )
+        ):
+            self.materialized_triples_device = torch.empty(
+                (size, self.triples.size(1)),
+                dtype=self.triples.dtype,
+                device=self.materialize_device,
+                requires_grad=False,
+            )
+
+    def set_samples(
+        self,
+        samples: torch.Tensor,
+        epoch,
+        partition_id,
+        partition_version=None,
+        entity_mapper=None,
+        relation_mapper=None,
+        stage_local_ids: bool = False,
+    ):
         samples = samples.to(
-            dtype=torch.long, device=self.samples.device, non_blocking=True
+            dtype=torch.long, device=self._samples_buffer.device, non_blocking=True
         )
         if self.shuffle:
-            # leverage torch to avoid numpy conversions/copies
             perm = torch.randperm(samples.size(0), device=samples.device)
             samples = samples.index_select(0, perm)
-        self.samples[: len(samples)] = samples
+        self._staged_partition = None
+        self._staged_version = None
+        self._staged_local_ids = bool(stage_local_ids)
+        if self.materialize:
+            self._ensure_materialized_buffer(len(samples))
+            dataset_indices = samples.to(self.triples.device)
+            partition_triples = self.triples.index_select(0, dataset_indices)
+            if stage_local_ids and entity_mapper is not None:
+                partition_triples[:, S] = entity_mapper[partition_triples[:, S]]
+                partition_triples[:, O] = entity_mapper[partition_triples[:, O]]
+            if stage_local_ids and relation_mapper is not None:
+                partition_triples[:, P] = relation_mapper[partition_triples[:, P]]
+            if self.partition_stager is not None:
+                version = (
+                    int(partition_version)
+                    if partition_version is not None
+                    else 0
+                )
+                stage = self.partition_stager.stage(
+                    partition_id=partition_id, version=version, triples=partition_triples
+                )
+                self._staged_partition = stage
+                self._staged_version = version
+                self.materialized_triples = stage.host_view
+                self.materialized_triples_device = stage.device_view
+            else:
+                self.materialized_triples[: len(samples)] = partition_triples.cpu()
+                if self.materialized_triples_device is not None:
+                    self.materialized_triples_device[: len(samples)] = partition_triples.to(
+                        self.materialized_triples_device.device, non_blocking=True
+                    )
+            self.materialized_size = len(samples)
+            self.materialization_events[0] += 1
+            self.samples = self._samples_buffer
+            self.samples[: len(samples)] = torch.arange(
+                len(samples), dtype=torch.long, device=self.samples.device
+            )
+            partition_triples = None
+        elif self.shuffle:
+            self.samples = self._samples_buffer
+            self.samples[: len(samples)] = samples
+            self.materialized_triples = None
+            self.materialized_size = 0
+            self.materialized_triples_device = None
+            self._staged_partition = None
+        else:
+            if samples.device.type != "cpu":
+                samples = samples.cpu()
+            if not samples.is_shared():
+                samples = samples.contiguous().share_memory_()
+            self.samples = samples
+            self.materialized_triples = None
+            self.materialized_size = 0
+            self.materialized_triples_device = None
+            self._staged_partition = None
         self.num_samples[0] = len(samples)
         self.epoch[0] = epoch
         self.partition_id[0] = partition_id
+        self._debug_stats.clear()
+
+    def fetch_triples(self, sample_indices: torch.Tensor) -> torch.Tensor:
+        sample_indices = sample_indices.long()
+        staged_host = self._slice_staged_view(sample_indices, on_device=False)
+        if staged_host is not None:
+            self._debug_stats["materialized_fetches"] += 1
+            return staged_host
+        if (
+            self.materialize
+            and self.materialized_triples is not None
+            and self.materialized_size >= sample_indices.max().item() + 1
+        ):
+            self._debug_stats["materialized_fetches"] += 1
+            return self.materialized_triples[sample_indices, :]
+        self._debug_stats["corpus_fetches"] += 1
+        return self.triples[sample_indices, :]
+
+    def fetch_triples_device(self, sample_indices: torch.Tensor):
+        if not self._staged_local_ids:
+            return None
+        staged_device = self._slice_staged_view(sample_indices, on_device=True)
+        if staged_device is not None:
+            return staged_device
+        return None
+
+    def write_triples_to_device(
+        self, sample_indices: torch.Tensor, mapped_triples: torch.Tensor, device
+    ):
+        if (
+            self.materialized_triples_device is None
+            or self.materialized_size <= 0
+            or sample_indices.numel() == 0
+        ):
+            return None
+        start = int(sample_indices[0].item())
+        expected = torch.arange(
+            start, start + sample_indices.numel(), device=sample_indices.device
+        )
+        if not torch.equal(sample_indices, expected):
+            return None
+        stop = start + mapped_triples.size(0)
+        if stop > self.materialized_size:
+            return None
+        if (
+            self._staged_local_ids
+            and self.partition_stager is not None
+            and self._staged_partition is not None
+        ):
+            device_view = self.materialized_triples_device[start:stop]
+        else:
+            device_view = self.materialized_triples_device[start:stop]
+            device_view.copy_(mapped_triples.to(device, non_blocking=True))
+        self._debug_stats["device_writes"] += 1
+        return device_view
+
+    def materialization_count(self) -> int:
+        return int(self.materialization_events[0].item())
+
+    def collect_debug_stats(self):
+        stats = dict(self._debug_stats)
+        self._debug_stats.clear()
+        return stats
+
+    def _slice_staged_view(
+        self, sample_indices: torch.Tensor, on_device: bool
+    ) -> Optional[torch.Tensor]:
+        stage = self._staged_partition
+        if stage is None:
+            return None
+        if sample_indices.numel() == 0:
+            return None
+        indices = sample_indices
+        if indices.device.type != "cpu":
+            indices = indices.to("cpu")
+        start = int(indices[0].item())
+        expected = torch.arange(
+            start, start + indices.numel(), device=indices.device, dtype=indices.dtype
+        )
+        if not torch.equal(indices, expected):
+            return None
+        stop = start + indices.numel()
+        if stop > stage.num_triples:
+            return None
+        base = stage.device_view if on_device else stage.host_view
+        if base is None:
+            return None
+        return base[start:stop]
+
+
+class MaterializedBatchIterator:
+    def __init__(self, dataset: BatchDataset, collate_fn):
+        self.dataset = dataset
+        self.collate_fn = collate_fn
+        self.position = 0
+
+    def reset(self):
+        self.position = 0
+
+    def __iter__(self):
+        self.reset()
+        return self
+
+    def __next__(self):
+        if self.dataset.num_samples.item() <= 0:
+            raise StopIteration
+        total_batches = len(self.dataset)
+        if total_batches <= 0 or self.position >= total_batches:
+            raise StopIteration
+        entry = self.dataset[self.position]
+        self.position += 1
+        return self.collate_fn([entry])
 
 
 class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
@@ -162,6 +401,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 "Auto-enabled train.num_workers=2 to better overlap parameter transfers."
             )
         self._effective_num_workers = configured_workers
+        if self.config.get("job.distributed.materialize_partition_batches"):
+            if self._effective_num_workers != 0:
+                self._effective_num_workers = 0
+                self.config.log(
+                    "Disabled train.num_workers because materialized partitions are streamed directly."
+                )
 
         if work_scheduler_client is None:
             self.work_scheduler_client = SchedulerClient(config)
@@ -205,6 +450,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             work_scheduler_client=work_scheduler_client,
         )
         self.type_str = "negative_sampling"
+        self._map_ids_on_gpu = bool(
+            self.config.get("job.distributed.map_ids_on_gpu")
+        )
+        self._map_ids_device = self._resolve_map_ids_device()
+        self._entity_partition_mapper_device = None
+        self._relation_partition_mapper_device = None
+        self._gpu_sampling_logged = False
         self.entity_localize = self.config.get("job.distributed.entity_localize")
         self.relation_localize = self.config.get("job.distributed.relation_localize")
         self.entity_partition_localized = False
@@ -220,13 +472,48 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.relation_sync_level = self.config.get(
             "job.distributed.relation_sync_level"
         )
+        self._entity_vocab_size = self.dataset.num_entities()
+        self._relation_vocab_size = self.dataset.num_relations()
+        self._debug_id_bounds = bool(
+            self.config.get("job.distributed.debug_id_bounds")
+        )
         self._current_partition_version = None
         self._current_partition_id = None
         self._partition_grad_sum = 0.0
         self._partition_grad_samples = 0
+        self._relation_gradient_trace = bool(
+            self.config.get("job.distributed.relation_gradient_trace")
+        )
+        self._relation_grad_sum = None
+        self._relation_grad_count = None
+        if self._relation_gradient_trace:
+            self._relation_grad_sum = torch.zeros(
+                self._relation_vocab_size, dtype=torch.float32, device="cpu"
+            )
+            self._relation_grad_count = torch.zeros(
+                self._relation_vocab_size, dtype=torch.long, device="cpu"
+            )
         self._last_finished_partition = None
         self._current_window_members = None
         self._current_window_entities = None
+        self._current_partition_size = 0
+        glow_cfg = self.config.get("job.distributed.glow") or {}
+        self._prefetch_window_entities = bool(
+            glow_cfg.get("prefetch_window_entities", False)
+        )
+        self._lookahead_negatives = bool(
+            glow_cfg.get("lookahead_negatives", False)
+        )
+        self._overlap_negative_sampling = bool(
+            glow_cfg.get("overlap_negative_sampling", False)
+        )
+        self._overlap_sampling_logged = False
+        self._window_prefetch_key = None
+        self._materialize_partitions = False
+        self._materialization_notice_logged = False
+        self._stage_local_ids = False
+        self._materialized_iterator = None
+        self._loader_debug_stats = defaultdict(int)
         self._need_unique_entities = self.entity_sync_level == "batch"
         self._need_unique_relations = self.relation_sync_level == "batch"
         self.entity_pre_pull = self.config.get("job.distributed.entity_pre_pull")
@@ -236,12 +523,27 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         )
         self.entity_mapper_tensors = deque()
         self.relation_mapper_tensors = deque()
+        mapper_device = (
+            self._map_ids_device
+            if self._map_ids_device.type == "cuda"
+            else None
+        )
         for i in range(self._effective_num_workers + 1):
             self.entity_mapper_tensors.append(
-                torch.full((self.dataset.num_entities(),), -1, dtype=torch.long)
+                torch.full(
+                    (self.dataset.num_entities(),),
+                    -1,
+                    dtype=torch.long,
+                    device=mapper_device,
+                )
             )
             self.relation_mapper_tensors.append(
-                torch.full((self.dataset.num_relations(),), -1, dtype=torch.long)
+                torch.full(
+                    (self.dataset.num_relations(),),
+                    -1,
+                    dtype=torch.long,
+                    device=mapper_device,
+                )
             )
 
         # also defines the local entities
@@ -389,11 +691,42 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         super()._prepare()
 
         self.num_examples = self.dataset.split(self.train_split).size(0)
+        shuffle_partitions = self.config.get(
+            "job.distributed.shuffle_partition_samples"
+        )
+        materialize_partitions = self.config.get(
+            "job.distributed.materialize_partition_batches"
+        )
+        self._collate_fn = self._get_collate_fun()
         self.dataloader_dataset = BatchDataset(
             self.dataset.split(self.train_split),
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=shuffle_partitions,
+            materialize=materialize_partitions,
+            materialize_device=self.device if isinstance(self.device, str) else None,
         )
+        self._materialize_partitions = materialize_partitions
+        self._materialization_notice_logged = False
+        self._stage_local_ids = bool(
+            self.config.get("job.distributed.stage_local_ids")
+        )
+        if self._stage_local_ids and not materialize_partitions:
+            self.config.log(
+                "Disabled GPU staging of local IDs because materialized partitions are disabled."
+            )
+            self._stage_local_ids = False
+        if self._stage_local_ids and (
+            self.entity_sync_level != "partition"
+            or self.relation_sync_level != "partition"
+        ):
+            self.config.log(
+                "Disabled GPU staging of local IDs because sync level is not partition."
+            )
+            self._stage_local_ids = False
+        if materialize_partitions:
+            self.config.log(
+                "Materialized partition batches enabled; staging triples once per partition chunk."
+            )
         # initializing dataloader as soon as we got the triples from work scheduler
         self.loader = None
         if self.config.get("negative_sampling.sampling_type") == "pooled":
@@ -402,7 +735,6 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self.parameter_client.localize(self.local_entities)
             self._sampler.set_pool(self.local_entities, S)
             self._sampler.set_pool(self.local_entities, O)
-
     def _get_collate_fun(self):
         # create the collate function
         def collate(batch):
@@ -419,13 +751,24 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             triple_ids = batch[0][0]
             epoch = batch[0][1]
             local_partition_id = batch[0][2]
-            triples = self._pin_triples_if_needed(
-                self.dataset.split(self.train_split)[triple_ids, :]
-            )
+            triples = self.dataloader_dataset.fetch_triples(triple_ids)
+            gpu_triples = self.dataloader_dataset.fetch_triples_device(triple_ids)
+            triples = self._pin_triples_if_needed(triples)
+            sampler_triples = triples
+            if (
+                gpu_triples is not None
+                and self._sampler.supports_device_sampling(gpu_triples)
+            ):
+                sampler_triples = gpu_triples
+                if not self._gpu_sampling_logged:
+                    self.config.log(
+                        "GPU sampling enabled for negative sampling batches."
+                    )
+                    self._gpu_sampling_logged = True
 
             negative_samples = list()
             for slot in [S, P, O]:
-                sample = self._sampler.sample(triples, slot)
+                sample = self._sampler.sample(sampler_triples, slot)
                 if (
                     self._non_blocking_transfer
                     and getattr(self, "_effective_num_workers", 0) == 0
@@ -438,12 +781,23 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             entity_embedder = self.model.get_s_embedder()
             relation_embedder = self.model.get_p_embedder()
             if self._need_unique_entities:
+                # Unique-id construction stays on CPU even if samplers produced
+                # device-resident buffers (e.g., when experimenting with GPU staging).
+                pos_entities = triples[:, [S, O]].view(-1)
+                if pos_entities.device.type != "cpu":
+                    pos_entities = pos_entities.cpu()
+                neg_s = negative_samples[S].unique_samples(remove_dropped=False)
+                if neg_s.device.type != "cpu":
+                    neg_s = neg_s.cpu()
+                neg_o = negative_samples[O].unique_samples(remove_dropped=False)
+                if neg_o.device.type != "cpu":
+                    neg_o = neg_o.cpu()
                 unique_entities = torch.unique(
                     torch.cat(
                         (
-                            triples[:, [S, O]].view(-1),
-                            negative_samples[S].unique_samples(remove_dropped=False),
-                            negative_samples[O].unique_samples(remove_dropped=False),
+                            pos_entities,
+                            neg_s,
+                            neg_o,
                         )
                     ),
                     sorted=False,
@@ -453,11 +807,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         unique_entities
                     )
             if self._need_unique_relations:
+                pos_relations = triples[:, [P]].view(-1)
+                if pos_relations.device.type != "cpu":
+                    pos_relations = pos_relations.cpu()
+                neg_p = negative_samples[P].unique_samples(remove_dropped=False)
+                if neg_p.device.type != "cpu":
+                    neg_p = neg_p.cpu()
                 unique_relations = torch.unique(
                     torch.cat(
                         (
-                            triples[:, [P]].view(-1),
-                            negative_samples[P].unique_samples(remove_dropped=False),
+                            pos_relations,
+                            neg_p,
                         )
                     ),
                     sorted=False,
@@ -476,6 +836,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 "unique_time": unique_time,
                 "epoch": epoch,
                 "local_partition_id": local_partition_id,
+                "triple_ids": triple_ids,
+                "_gpu_triples": gpu_triples,
             }
 
         return collate
@@ -495,23 +857,104 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             return triples
         return triples.pin_memory()
 
-    def _map_ids_to_local(self, batch):
+    def _resolve_map_ids_device(self) -> torch.device:
+        if not self._map_ids_on_gpu:
+            return torch.device("cpu")
+        device = self.device
+        if isinstance(device, torch.device):
+            return device if device.type == "cuda" else torch.device("cpu")
+        if isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
+            return torch.device(device)
+        return torch.device("cpu")
 
+    def _ensure_partition_mapper_device(self, kind: str) -> Optional[torch.Tensor]:
+        if self._map_ids_device.type != "cuda":
+            return None
+        if kind == "entity":
+            size = self._entity_vocab_size
+            attr = "_entity_partition_mapper_device"
+        else:
+            size = self._relation_vocab_size
+            attr = "_relation_partition_mapper_device"
+        mapper = getattr(self, attr)
+        if (
+            mapper is None
+            or mapper.device != self._map_ids_device
+            or mapper.numel() != size
+        ):
+            mapper = torch.full(
+                (size,), -1, dtype=torch.long, device=self._map_ids_device
+            )
+            setattr(self, attr, mapper)
+        return mapper
+
+    def _map_ids_to_local(self, batch):
+        map_device = self._map_ids_device
+        if map_device.type == "cuda":
+            if batch["triples"].device != map_device:
+                batch["triples"] = batch["triples"].to(
+                    map_device, non_blocking=self._non_blocking_transfer
+                )
+            for idx, ns in enumerate(batch["negative_samples"]):
+                if ns.positive_triples.device != map_device:
+                    batch["negative_samples"][idx] = ns.to(
+                        map_device, non_blocking=self._non_blocking_transfer
+                    )
+        else:
+            if batch["triples"].device.type != "cpu":
+                batch["triples"] = batch["triples"].cpu()
+            for idx, ns in enumerate(batch["negative_samples"]):
+                if ns.positive_triples.device.type != "cpu":
+                    batch["negative_samples"][idx] = ns.to("cpu")
+        if self._debug_id_bounds:
+            self._debug_validate_batch_ids(batch)
         # map ids to local ids
         if self.entity_sync_level == "partition":
-            entity_mapper = self.model.get_s_embedder().global_to_local_mapper
+            if map_device.type == "cuda":
+                entity_mapper = self._ensure_partition_mapper_device("entity")
+                if entity_mapper is None:
+                    entity_mapper = self.model.get_s_embedder().global_to_local_mapper
+            else:
+                entity_mapper = self.model.get_s_embedder().global_to_local_mapper
         else:
             entity_mapper = self.entity_mapper_tensors.popleft()
-            entity_mapper[batch["unique_entities"]] = torch.arange(
-                len(batch["unique_entities"]), dtype=torch.long
-            )
+            unique_entities = batch.get("unique_entities")
+            if unique_entities is None:
+                raise RuntimeError("Missing unique_entities for batch-level sync.")
+            if map_device.type == "cuda":
+                unique_entities_device = unique_entities.to(
+                    map_device, non_blocking=self._non_blocking_transfer
+                )
+                entity_mapper[unique_entities_device] = torch.arange(
+                    len(unique_entities), dtype=torch.long, device=map_device
+                )
+            else:
+                entity_mapper[unique_entities] = torch.arange(
+                    len(unique_entities), dtype=torch.long
+                )
         if self.relation_sync_level == "partition":
-            relation_mapper = self.model.get_p_embedder().global_to_local_mapper
+            if map_device.type == "cuda":
+                relation_mapper = self._ensure_partition_mapper_device("relation")
+                if relation_mapper is None:
+                    relation_mapper = self.model.get_p_embedder().global_to_local_mapper
+            else:
+                relation_mapper = self.model.get_p_embedder().global_to_local_mapper
         else:
             relation_mapper = self.relation_mapper_tensors.popleft()
-            relation_mapper[batch["unique_relations"]] = torch.arange(
-                len(batch["unique_relations"]), dtype=torch.long
-            )
+            unique_relations = batch.get("unique_relations")
+            if unique_relations is None:
+                raise RuntimeError("Missing unique_relations for batch-level sync.")
+            if map_device.type == "cuda":
+                unique_relations_device = unique_relations.to(
+                    map_device, non_blocking=self._non_blocking_transfer
+                )
+                relation_mapper[unique_relations_device] = torch.arange(
+                    len(unique_relations), dtype=torch.long, device=map_device
+                )
+            else:
+                relation_mapper[unique_relations] = torch.arange(
+                    len(unique_relations), dtype=torch.long
+                )
         batch["triples"][:, S] = entity_mapper[batch["triples"][:, S]]
         batch["triples"][:, P] = relation_mapper[batch["triples"][:, P]]
         batch["triples"][:, O] = entity_mapper[batch["triples"][:, O]]
@@ -522,12 +965,106 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         # for debugging reset the entity mapper to -1
         # entity_mapper[:] = -1
         if self.entity_sync_level != "partition":
-            entity_mapper[batch["unique_entities"]] = -1
+            if map_device.type == "cuda":
+                entity_mapper[unique_entities_device] = -1
+            else:
+                entity_mapper[unique_entities] = -1
             self.entity_mapper_tensors.append(entity_mapper)
         if self.relation_sync_level != "partition":
-            relation_mapper[batch["unique_relations"]] = -1
+            if map_device.type == "cuda":
+                relation_mapper[unique_relations_device] = -1
+            else:
+                relation_mapper[unique_relations] = -1
             self.relation_mapper_tensors.append(relation_mapper)
+        if self._debug_id_bounds:
+            self._debug_validate_local_ids(batch)
         return batch
+
+    def _debug_validate_batch_ids(self, batch):
+        """Ensure triples/negatives stay within global vocab bounds."""
+        triples = batch.get("triples")
+        if triples is None or triples.numel() == 0:
+            return
+
+        def _check_range(values, limit, name):
+            if values is None or values.numel() == 0:
+                return
+            max_id = int(values.max().item())
+            min_id = int(values.min().item())
+            if min_id < 0 or max_id >= limit:
+                part = batch.get("local_partition_id")
+                epoch = batch.get("epoch")
+                raise RuntimeError(
+                    f"[ID bounds] {name} out of range ({min_id},{max_id}) "
+                    f"with limit {limit} (partition={part}, epoch={epoch})."
+                )
+
+        subjects = triples[:, S].view(-1)
+        objects = triples[:, O].view(-1)
+        relations = triples[:, P].view(-1)
+        _check_range(subjects, self._entity_vocab_size, "triples.subject")
+        _check_range(objects, self._entity_vocab_size, "triples.object")
+        _check_range(relations, self._relation_vocab_size, "triples.relation")
+
+        for slot, limit, desc in (
+            (S, self._entity_vocab_size, "neg.subject"),
+            (O, self._entity_vocab_size, "neg.object"),
+            (P, self._relation_vocab_size, "neg.relation"),
+        ):
+            neg_sample = batch["negative_samples"][slot]
+            samples = None
+            try:
+                samples = neg_sample.unique_samples(remove_dropped=False)
+            except Exception:
+                try:
+                    samples = neg_sample.samples()
+                except Exception:
+                    samples = None
+            if samples is None or samples.numel() == 0:
+                continue
+            _check_range(samples.view(-1), limit, desc)
+
+    def _debug_validate_local_ids(self, batch):
+        """Ensure localized ids fit inside the local embedder size."""
+        entity_vocab = self.model.get_s_embedder().vocab_size
+        relation_vocab = self.model.get_p_embedder().vocab_size
+
+        def _check_local(values, limit, name):
+            if values is None or values.numel() == 0:
+                return
+            max_id = int(values.max().item())
+            min_id = int(values.min().item())
+            if min_id < 0 or max_id >= limit:
+                part = batch.get("local_partition_id")
+                epoch = batch.get("epoch")
+                raise RuntimeError(
+                    f"[Local ID bounds] {name} out of range ({min_id},{max_id}) "
+                    f"with local limit {limit} (partition={part}, epoch={epoch})."
+                )
+
+        triples = batch.get("triples")
+        if triples is not None and triples.numel() > 0:
+            _check_local(triples[:, S].view(-1), entity_vocab, "local subject")
+            _check_local(triples[:, O].view(-1), entity_vocab, "local object")
+            _check_local(triples[:, P].view(-1), relation_vocab, "local relation")
+
+        for slot, limit, desc in (
+            (S, entity_vocab, "local neg subject"),
+            (O, entity_vocab, "local neg object"),
+            (P, relation_vocab, "local neg relation"),
+        ):
+            neg_sample = batch["negative_samples"][slot]
+            samples = None
+            try:
+                samples = neg_sample.unique_samples(remove_dropped=False)
+            except Exception:
+                try:
+                    samples = neg_sample.samples()
+                except Exception:
+                    samples = None
+            if samples is None or samples.numel() == 0:
+                continue
+            _check_local(samples.view(-1), limit, desc)
 
     def _prepare_batch_ahead(self, batches: deque, new_batch=None):
         if not batches:
@@ -537,17 +1074,34 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             (self.entity_pre_pull > 1 or self.relation_pre_pull > 1)
             and not head.get("_device_ready")
         ):
-            head["triples"] = head["triples"].to(
-                self.device, non_blocking=self._non_blocking_transfer
-            )
-            for ns in head["negative_samples"]:
-                ns.positive_triples = head["triples"]
-            head["negative_samples"] = [
-                ns.to(self.device, non_blocking=self._non_blocking_transfer)
-                for ns in head["negative_samples"]
-            ]
-            head["_device_ready"] = True
+            gpu_triples = head.get("_gpu_triples")
+            if gpu_triples is not None:
+                head["triples"] = gpu_triples
+            else:
+                head["triples"] = head["triples"].to(
+                    self.device, non_blocking=self._non_blocking_transfer
+                )
+        lookahead_entries = head.get("_lookahead_negative_samples")
+        for idx, ns in enumerate(head["negative_samples"]):
+            ns.positive_triples = head["triples"]
+            if lookahead_entries and len(lookahead_entries) > idx:
+                payload = lookahead_entries[idx]
+                if self._validate_lookahead_payload(payload):
+                    ns.attach_lookahead(payload)
+                    self._loader_debug_stats["lookahead_hits"] += 1
+                else:
+                    self._loader_debug_stats["lookahead_rejected"] += 1
+                lookahead_entries[idx] = None
+        if lookahead_entries and all(entry is None for entry in lookahead_entries):
+            head.pop("_lookahead_negative_samples", None)
+        head["negative_samples"] = [
+            ns.to(self.device, non_blocking=self._non_blocking_transfer)
+            for ns in head["negative_samples"]
+        ]
+        head["_device_ready"] = True
+        # prepare look-ahead negatives for the next batch
         target = new_batch if new_batch is not None else batches[-1]
+        self._prepare_negative_lookahead(target)
         if (
             self.entity_sync_level == "batch"
             and self.entity_pre_pull > 0
@@ -582,11 +1136,26 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         # be avoided.
         result.prepare_time -= time.time()
         # result.cpu_gpu_time -= time.time()
-        batch["triples"] = batch["triples"].to(
-            self.device, non_blocking=self._non_blocking_transfer
-        )
-        for ns in batch["negative_samples"]:
+        gpu_triples = batch.get("_gpu_triples")
+        if gpu_triples is not None:
+            batch["triples"] = gpu_triples
+        else:
+            batch["triples"] = batch["triples"].to(
+                self.device, non_blocking=self._non_blocking_transfer
+            )
+        lookahead_entries = batch.get("_lookahead_negative_samples")
+        for idx, ns in enumerate(batch["negative_samples"]):
             ns.positive_triples = batch["triples"]
+            if lookahead_entries and len(lookahead_entries) > idx:
+                payload = lookahead_entries[idx]
+                if self._validate_lookahead_payload(payload):
+                    ns.attach_lookahead(payload)
+                    self._loader_debug_stats["lookahead_hits"] += 1
+                else:
+                    self._loader_debug_stats["lookahead_rejected"] += 1
+                lookahead_entries[idx] = None
+        if lookahead_entries and all(entry is None for entry in lookahead_entries):
+            batch.pop("_lookahead_negative_samples", None)
         batch["negative_samples"] = [
             ns.to(self.device, non_blocking=self._non_blocking_transfer)
             for ns in batch["negative_samples"]
@@ -658,7 +1227,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.loader = torch.utils.data.DataLoader(
             self.dataloader_dataset,
             sampler=InfiniteSequentialSampler(self.dataloader_dataset),
-            collate_fn=self._get_collate_fun(),
+            collate_fn=self._collate_fn,
             # shuffle needs to be False since it is handled in the dataset object
             shuffle=False,
             # batch size needs to be 1 since it is handled in the dataset object
@@ -669,9 +1238,19 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             multiprocessing_context=mp_context,
         )
 
+    def _use_materialized_iterator(self):
+        return self._materialize_partitions and self._effective_num_workers == 0
+
     def _reset_partition_gradient_trace(self):
         self._partition_grad_sum = 0.0
         self._partition_grad_samples = 0
+        self._reset_partition_relation_gradient_trace()
+
+    def _reset_partition_relation_gradient_trace(self):
+        if not self._relation_gradient_trace or self._relation_grad_sum is None:
+            return
+        self._relation_grad_sum.zero_()
+        self._relation_grad_count.zero_()
 
     def _accumulate_partition_gradient(self):
         if self.is_forward_only or self._current_partition_id is None:
@@ -681,6 +1260,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             return
         self._partition_grad_sum += grad_norm
         self._partition_grad_samples += 1
+        self._accumulate_partition_relation_gradients()
 
     def _compute_batch_gradient_norm(self):
         total = 0.0
@@ -695,6 +1275,46 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             return 0.0
         return math.sqrt(total)
 
+    def _accumulate_partition_relation_gradients(self):
+        if (
+            not self._relation_gradient_trace
+            or self._current_partition_id is None
+            or self.is_forward_only
+        ):
+            return
+        embedder = self.model.get_p_embedder()
+        pulled_ids = getattr(embedder, "pulled_ids", None)
+        if pulled_ids is None:
+            return
+        grad = getattr(embedder._embeddings.weight, "grad", None)
+        if grad is None:
+            return
+        grad = grad.detach()
+        if grad.is_sparse:
+            grad = grad.coalesce()
+            row_ids = grad.indices()[0]
+            row_norms = torch.zeros(
+                grad.size(0), device=grad.device, dtype=grad.dtype
+            )
+            row_norms.index_add_(0, row_ids, grad.values().pow(2).sum(dim=1))
+            grad_norms = row_norms.sqrt()
+        else:
+            grad_norms = grad.pow(2).sum(dim=1).sqrt()
+        grad_norms_cpu = grad_norms.to(
+            device="cpu", dtype=self._relation_grad_sum.dtype
+        )
+        pulled_ids_cpu = pulled_ids.detach().to(device="cpu", dtype=torch.long)
+        if grad_norms_cpu.numel() != pulled_ids_cpu.numel():
+            return
+        mask = grad_norms_cpu != 0
+        if not mask.any():
+            return
+        rel_ids = pulled_ids_cpu[mask]
+        rel_vals = grad_norms_cpu[mask]
+        self._relation_grad_sum.index_add_(0, rel_ids, rel_vals)
+        ones = torch.ones_like(rel_ids, dtype=self._relation_grad_count.dtype)
+        self._relation_grad_count.index_add_(0, rel_ids, ones)
+
     def _flush_partition_gradient_trace(self):
         if (
             self._current_partition_id is None
@@ -706,7 +1326,129 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.work_scheduler_client.register_partition_gradient(
             self._current_partition_id, grad_sum, count
         )
+        if self._relation_gradient_trace and self._relation_grad_sum is not None:
+            mask = self._relation_grad_count > 0
+            if mask.any():
+                rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+                rel_sums = self._relation_grad_sum[mask]
+                rel_counts = self._relation_grad_count[mask]
+                self.work_scheduler_client.register_partition_relation_gradient(
+                    self._current_partition_id, rel_ids, rel_sums, rel_counts
+                )
         self._reset_partition_gradient_trace()
+
+    def _prefetch_glow_window_entities(self, work_entities: torch.Tensor):
+        if (
+            not self._prefetch_window_entities
+            or not self.entity_localize
+            or self._current_window_entities is None
+            or self._current_window_entities.numel() == 0
+        ):
+            self._window_prefetch_key = None
+            return
+        window_key = None
+        if (
+            self._current_window_members is not None
+            and self._current_window_members.numel() > 0
+        ):
+            window_key = tuple(int(x) for x in self._current_window_members.tolist())
+            if window_key == self._window_prefetch_key:
+                return
+        extras = self._current_window_entities.cpu()
+        if work_entities is not None and work_entities.numel() > 0:
+            try:
+                extras_np = np.setdiff1d(
+                    extras.numpy(), work_entities.cpu().numpy(), assume_unique=False
+                )
+                extras = torch.from_numpy(extras_np)
+            except Exception:
+                work_set = set(work_entities.cpu().tolist())
+                extras = torch.tensor(
+                    [idx for idx in extras.tolist() if idx not in work_set],
+                    dtype=extras.dtype,
+                )
+        extras = torch.unique(extras)
+        if extras.numel() == 0:
+            self._window_prefetch_key = window_key
+            return
+        try:
+            self.model.get_s_embedder().localize(
+                extras.to(dtype=torch.long), asynchronous=True, make_unique=False
+            )
+            if window_key is not None:
+                self.config.log(
+                    f"Glow prelocalized {extras.numel()} overlapping entities for window {window_key}."
+                )
+        except Exception as exc:
+            self.config.log(f"Glow window prefetch failed: {exc}")
+        self._window_prefetch_key = window_key
+
+    def _current_window_key(self):
+        if (
+            self._current_window_members is None
+            or self._current_window_members.numel() == 0
+        ):
+            return None
+        return tuple(int(x) for x in self._current_window_members.cpu().tolist())
+
+    def _validate_lookahead_payload(self, payload):
+        if not payload:
+            return False
+        pid = payload.get("partition_id")
+        if (
+            pid is not None
+            and self._current_partition_id is not None
+            and pid != self._current_partition_id
+        ):
+            self._loader_debug_stats["lookahead_partition_miss"] += 1
+            return False
+        version = payload.get("partition_version")
+        if (
+            version is not None
+            and self._current_partition_version is not None
+            and version != self._current_partition_version
+        ):
+            self._loader_debug_stats["lookahead_version_miss"] += 1
+            return False
+        # window membership changes frequently due to Glow overlap scheduling; allow reuse
+        # within the same partition/version even if the window shifted.
+        return True
+
+    def _prepare_negative_lookahead(self, batch):
+        if (
+            not self._lookahead_negatives
+            or batch is None
+            or "_lookahead_negative_samples" in batch
+        ):
+            return
+        if not isinstance(self.device, str) or not self.device.startswith("cuda"):
+            return
+        lookahead_entries = []
+        success = False
+        context = {
+            "partition_id": self._current_partition_id,
+            "partition_version": self._current_partition_version,
+        }
+        window_key = self._current_window_key()
+        if window_key is not None:
+            context["window_key"] = window_key
+        for ns in batch["negative_samples"]:
+            payload = ns.build_lookahead_payload(
+                self.device, non_blocking=self._non_blocking_transfer
+            )
+            if payload is None:
+                lookahead_entries.append(None)
+                continue
+            payload.update(context)
+            lookahead_entries.append(payload)
+            success = True
+        if success:
+            self._loader_debug_stats["lookahead_prepared"] += 1
+            payload_count = sum(1 for entry in lookahead_entries if entry is not None)
+            self._loader_debug_stats["lookahead_payloads"] += payload_count
+            batch["_lookahead_negative_samples"] = lookahead_entries
+        elif self._lookahead_negatives:
+            self._loader_debug_stats["lookahead_skipped"] += 1
 
     def _notify_partition_start(self):
         if (
@@ -764,6 +1506,74 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
         trace_entry = None
         local_partition_counter = -1
+        profile_interval_batches = self.config.get("train.profile_interval_batches")
+        profile_stats = defaultdict(float)
+        profile_batch_counter = 0
+        profile_total_batches = 0
+
+        def maybe_log_profile(force=False):
+            nonlocal profile_stats, profile_batch_counter, profile_total_batches
+            if profile_interval_batches <= 0:
+                return
+            if not force and profile_batch_counter < profile_interval_batches:
+                return
+            if profile_batch_counter == 0:
+                return
+            start = profile_total_batches - profile_batch_counter + 1
+            end = profile_total_batches
+            compute_time = (
+                profile_stats["prepare"]
+                + profile_stats["forward"]
+                + profile_stats["backward"]
+                + profile_stats["optimizer"]
+            )
+            total_time = compute_time + profile_stats["dataloader"]
+            throughput = (
+                profile_stats["examples"] / total_time if total_time > 0 else float("inf")
+            )
+            self.config.log(
+                (
+                    "[profile] batches {start}-{end}: {throughput:.1f} triples/s; "
+                    "times(s) -> dataloader={data:.3f}, prepare={prep:.3f}, "
+                    "forward={fwd:.3f}, backward={bwd:.3f}, optimizer={opt:.3f}, "
+                    "entity_pull={epull:.3f}, relation_pull={rpull:.3f}, "
+                    "pull_map={pull_map:.3f}"
+                ).format(
+                    start=start,
+                    end=end,
+                    throughput=throughput,
+                    data=profile_stats["dataloader"],
+                    prep=profile_stats["prepare"],
+                    fwd=profile_stats["forward"],
+                    bwd=profile_stats["backward"],
+                    opt=profile_stats["optimizer"],
+                    epull=profile_stats["entity_pull"],
+                    rpull=profile_stats["relation_pull"],
+                    pull_map=profile_stats["pull_and_map"],
+                )
+            )
+            dataset_stats = {}
+            if getattr(self, "dataloader_dataset", None) is not None:
+                dataset_stats = self.dataloader_dataset.collect_debug_stats()
+            loader_stats = dict(self._loader_debug_stats)
+            self._loader_debug_stats.clear()
+            debug_messages = []
+            if dataset_stats:
+                debug_messages.append(
+                    "dataset=" + ", ".join(
+                        f"{k}:{v}" for k, v in sorted(dataset_stats.items())
+                    )
+                )
+            if loader_stats:
+                debug_messages.append(
+                    "lookahead=" + ", ".join(
+                        f"{k}:{v}" for k, v in sorted(loader_stats.items())
+                    )
+                )
+            if debug_messages:
+                self.config.log("[profile-debug] " + " | ".join(debug_messages))
+            profile_stats = defaultdict(float)
+            profile_batch_counter = 0
         while True:
             # variables that record various statitics
             sum_loss = 0.0
@@ -803,6 +1613,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.relation_partition_localized = False
             if work is None:
                 break
+            self._current_partition_size = int(work.numel())
             if window_members is not None and len(window_members) > 0:
                 self._current_window_members = window_members.long()
             else:
@@ -824,8 +1635,37 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             local_partition_counter += 1
             self.work_pre_localized = False
             partition_start_time = time.time()
+            entity_pull_ids = work_entities
+            pool_entities = work_entities
+            if (
+                work_entities is not None
+                and self.config.get("negative_sampling.sampling_type") == "pooled"
+                and self._current_window_entities is not None
+                and self._current_window_entities.numel() > 0
+                and (
+                    self._overlap_negative_sampling
+                    or self.entity_sync_level != "partition"
+                )
+            ):
+                pool_entities = torch.unique(
+                    torch.cat((work_entities, self._current_window_entities))
+                )
+                if self.entity_sync_level == "partition":
+                    max_vocab = self.model.get_s_embedder().vocab_size
+                    if pool_entities.numel() <= max_vocab:
+                        entity_pull_ids = pool_entities
+                    else:
+                        if not self._overlap_sampling_logged:
+                            self.config.log(
+                                "Glow overlap negative sampling disabled for "
+                                "partition-level sync because pool size "
+                                f"{pool_entities.numel()} exceeds embedder "
+                                f"vocab size {max_vocab}."
+                            )
+                            self._overlap_sampling_logged = True
+                        pool_entities = work_entities
             if work_entities is not None and self.entity_localize:
-                self.model.get_s_embedder().localize(work_entities)
+                self.model.get_s_embedder().localize(entity_pull_ids)
                 self.entity_partition_localized = True
             if work_relations is not None and self.relation_localize:
                 self.model.get_p_embedder().localize(work_relations)
@@ -833,10 +1673,27 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if self.entity_sync_level == "partition":
                 if work_entities is not None:
                     entity_pull_time -= time.time()
-                    actual_entity_pull_time, entity_cpu_gpu_time = self.model.get_s_embedder()._pull_embeddings(work_entities)
+                    actual_entity_pull_time, entity_cpu_gpu_time = self.model.get_s_embedder()._pull_embeddings(
+                        entity_pull_ids
+                    )
                     self.model.get_s_embedder().global_to_local_mapper[
-                        work_entities
-                    ] = torch.arange(len(work_entities), dtype=torch.long, device="cpu")
+                        entity_pull_ids
+                    ] = torch.arange(
+                        len(entity_pull_ids), dtype=torch.long, device="cpu"
+                    )
+                    if self._map_ids_device.type == "cuda" and not self._stage_local_ids:
+                        entity_mapper_device = self._ensure_partition_mapper_device(
+                            "entity"
+                        )
+                        if entity_mapper_device is not None:
+                            work_entities_device = entity_pull_ids.to(
+                                self._map_ids_device, non_blocking=True
+                            )
+                            entity_mapper_device[work_entities_device] = torch.arange(
+                                len(entity_pull_ids),
+                                dtype=torch.long,
+                                device=self._map_ids_device,
+                            )
                     entity_pull_time += time.time()
                     cpu_gpu_time += entity_cpu_gpu_time
                 else:
@@ -853,6 +1710,19 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     ] = torch.arange(
                         len(work_relations), dtype=torch.long, device="cpu"
                     )
+                    if self._map_ids_device.type == "cuda" and not self._stage_local_ids:
+                        relation_mapper_device = self._ensure_partition_mapper_device(
+                            "relation"
+                        )
+                        if relation_mapper_device is not None:
+                            work_relations_device = work_relations.to(
+                                self._map_ids_device, non_blocking=True
+                            )
+                            relation_mapper_device[work_relations_device] = torch.arange(
+                                len(work_relations),
+                                dtype=torch.long,
+                                device=self._map_ids_device,
+                            )
                     relation_pull_time += time.time()
                     cpu_gpu_time += relation_cpu_gpu_time
                 else:
@@ -861,64 +1731,162 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         "syncing relations on a partition level"
                     )
 
+            self._prefetch_glow_window_entities(work_entities)
+
             if (
                 work_entities is not None
                 and self.config.get("negative_sampling.sampling_type") == "pooled"
             ):
-                pool_entities = work_entities
-                if (
-                    self._current_window_entities is not None
-                    and self._current_window_entities.numel() > 0
-                ):
-                    pool_entities = torch.unique(
-                        torch.cat((work_entities, self._current_window_entities))
+                pool_entities = (
+                    pool_entities if pool_entities is not None else work_entities
+                )
+                if self._stage_local_ids:
+                    pool_entities = torch.arange(
+                        len(entity_pull_ids), dtype=torch.long
                     )
-                self.local_entities = work_entities
+                self.local_entities = pool_entities
+                pool_device = None
+                if self._materialize_partitions and self.device.startswith("cuda"):
+                    try:
+                        pool_device = pool_entities.to(self.device, non_blocking=True)
+                    except RuntimeError:
+                        pool_device = None
                 self._sampler.set_pool(pool_entities, S)
                 self._sampler.set_pool(pool_entities, O)
+                if pool_device is not None:
+                    self._sampler.set_pool(pool_device, S)
+                    self._sampler.set_pool(pool_device, O)
+            if self._stage_local_ids and work_entities is not None:
+                local_entities_count = len(entity_pull_ids)
+                self._sampler.vocabulary_size[S] = local_entities_count
+                self._sampler.vocabulary_size[O] = local_entities_count
+                if work_relations is not None:
+                    self._sampler.vocabulary_size[P] = len(work_relations)
             self.dataloader_dataset.set_samples(
-                work, self.epoch, local_partition_counter
+                work,
+                self.epoch,
+                local_partition_counter,
+                partition_version=self._current_partition_version,
+                entity_mapper=(
+                    self.model.get_s_embedder().global_to_local_mapper
+                    if self._stage_local_ids
+                    else None
+                ),
+                relation_mapper=(
+                    self.model.get_p_embedder().global_to_local_mapper
+                    if self._stage_local_ids
+                    else None
+                ),
+                stage_local_ids=self._stage_local_ids,
             )
-            if self.loader is None:
-                self._init_dataloader()
-                self.iter_dataloader = iter(self.loader)
-            object.__setattr__(self.loader, "sampler",
-                               InfiniteSequentialSampler(self.dataloader_dataset))
-            object.__setattr__(self.iter_dataloader, "_sampler_iter",
-                               iter(self.iter_dataloader._index_sampler))
+            if (
+                self._materialize_partitions
+                and not self._materialization_notice_logged
+                and self.dataloader_dataset.materialization_count() > 0
+            ):
+                self.config.log(
+                    f"Materialized {self.dataloader_dataset.materialized_size} triples "
+                    f"for partition {local_partition_counter}; reusing staged buffer for batches."
+                )
+                self._materialization_notice_logged = True
+            if self._use_materialized_iterator():
+                self._materialized_iterator = MaterializedBatchIterator(
+                    self.dataloader_dataset, self._collate_fn
+                )
+            if self._use_materialized_iterator():
+                self.loader = None
+                self.iter_dataloader = None
+            else:
+                if self.loader is None:
+                    self._init_dataloader()
+                    self.iter_dataloader = iter(self.loader)
+                object.__setattr__(
+                    self.loader,
+                    "sampler",
+                    InfiniteSequentialSampler(self.dataloader_dataset),
+                )
+                object.__setattr__(
+                    self.iter_dataloader,
+                    "_sampler_iter",
+                    iter(self.iter_dataloader._index_sampler),
+                )
             scheduler_time += time.time()
 
             # process each batch
             pre_load_batches = deque()
             batch_index = 0
             num_prepulls = max(self.entity_pre_pull, self.relation_pre_pull, self.pre_localize_batch, 1)
+            use_materialized_iter = self._use_materialized_iterator() and self._materialized_iterator is not None
+            materialized_iter = iter(self._materialized_iterator) if use_materialized_iter else None
             while batch_index < len(self.dataloader_dataset):
+                exhausted = False
                 while len(pre_load_batches) < num_prepulls + 1:
                     prepare_time -= time.time()
-                    dataloader_time -= time.time()
-                    next_batch = next(self.iter_dataloader)
-                    while next_batch["epoch"] != self.epoch or next_batch[
-                        "local_partition_id"] != local_partition_counter:
+                    load_start = time.time()
+                    dataloader_time -= load_start
+                    if use_materialized_iter:
+                        try:
+                            next_batch = next(materialized_iter)
+                        except StopIteration:
+                            next_batch = None
+                            exhausted = True
+                        load_end = time.time()
+                        dataloader_time += load_end
+                        if profile_interval_batches > 0 and next_batch is not None:
+                            profile_stats["dataloader"] += load_end - load_start
+                        if next_batch is None:
+                            break
+                        if not self._stage_local_ids:
+                            next_batch = self._map_ids_to_local(next_batch)
+                    else:
                         next_batch = next(self.iter_dataloader)
-                    next_batch = self._map_ids_to_local(next_batch)
+                        while next_batch["epoch"] != self.epoch or next_batch[
+                            "local_partition_id"] != local_partition_counter:
+                            next_batch = next(self.iter_dataloader)
+                        if not self._stage_local_ids:
+                            next_batch = self._map_ids_to_local(next_batch)
+                        load_end = time.time()
+                        dataloader_time += load_end
+                        if profile_interval_batches > 0:
+                            profile_stats["dataloader"] += load_end - load_start
+                    if exhausted:
+                        break
+                    if next_batch is not None and "triple_ids" in next_batch:
+                        if next_batch.get("_gpu_triples") is not None:
+                            self._loader_debug_stats["gpu_triple_batches"] += 1
+                        else:
+                            device_view = self.dataloader_dataset.write_triples_to_device(
+                                next_batch["triple_ids"], next_batch["triples"], self.device
+                            )
+                            if device_view is not None:
+                                next_batch["_gpu_triples"] = device_view
+                                self._loader_debug_stats["gpu_triple_batches"] += 1
+                            else:
+                                self._loader_debug_stats["cpu_triple_batches"] += 1
                     pre_load_batches.append(next_batch)
-                    dataloader_time += time.time()
                     pre_pull_time -= time.time()
                     if next_batch is not None:
                         self._prepare_batch_ahead(pre_load_batches, new_batch=next_batch)
                     pre_pull_time += time.time()
                     prepare_time += time.time()
+                if exhausted and not pre_load_batches:
+                    break
                 self._prepare_batch_ahead(pre_load_batches)
                 batch = pre_load_batches.popleft()
 
                 # create initial batch trace (yet incomplete)
+                total_batches = (
+                    len(self.loader)
+                    if self.loader is not None
+                    else self.dataloader_dataset.get_real_len()
+                )
                 self.current_trace["batch"] = {
                     "type": self.type_str,
                     "scope": "batch",
                     "epoch": self.epoch,
                     "split": self.train_split,
                     "batch": batch_index,
-                    "batches": len(self.loader),
+                    "batches": total_batches,
                 }
                 if not self.is_forward_only:
                     self.current_trace["batch"].update(
@@ -1054,6 +2022,22 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
                 batch_index += 1
 
+                if profile_interval_batches > 0:
+                    profile_batch_counter += 1
+                    profile_total_batches += 1
+                    profile_stats["examples"] += batch_result.size
+                    profile_stats["prepare"] += batch_result.prepare_time
+                    profile_stats["forward"] += batch_forward_time
+                    profile_stats["backward"] += batch_backward_time
+                    profile_stats["optimizer"] += batch_optimizer_time
+                    profile_stats["pull_and_map"] += batch_result.pull_and_map_time
+                    profile_stats["entity_pull"] += batch_result.entity_pull_time
+                    profile_stats["relation_pull"] += batch_result.relation_pull_time
+                    profile_stats["unique"] += batch_result.unique_time
+                    profile_stats["cpu_gpu"] += batch_result.cpu_gpu_time
+                    profile_stats["ps_wait"] += batch_result.ps_wait_time
+                    maybe_log_profile()
+
             # all done; now trace and log
             epoch_time += time.time()
             self.config.print("\033[2K\r", end="", flush=True)  # clear line and go back
@@ -1084,12 +2068,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._flush_partition_gradient_trace()
             finished_context = self._notify_partition_end()
             status, replay_version = self.work_scheduler_client.register_partition_result(
-                partition_duration, self._current_partition_version
+                partition_duration,
+                self._current_partition_version,
+                self._current_partition_size,
             )
             self._handle_partition_conflict(status, replay_version, finished_context)
             self._last_finished_partition = None
             self._current_partition_id = None
             self._current_partition_version = None
+            self._current_partition_size = 0
             self.work_scheduler_client.work_done()
 
             # add results to trace entry
@@ -1120,7 +2107,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     embedding_mapping_time=self.model.get_s_embedder().mapping_time
                     + self.model.get_p_embedder().mapping_time,
                     event="epoch_completed",
-                    batches=len(self.loader),
+                    batches=(
+                        len(self.loader)
+                        if self.loader is not None
+                        else self.dataloader_dataset.get_real_len()
+                    ),
                     dataloader_time=dataloader_time,
                 )
             )
@@ -1143,6 +2134,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         ):
             self.optimizer.flush_pending_pushes()
         self.current_trace["epoch"] = None
+        maybe_log_profile(force=True)
         return trace_entry
 
     def handle_validation(self, metric_name):
@@ -1266,6 +2258,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self, status: int, replay_version: int, finished_context
     ):
         if status != 1:
+            return
+        if (
+            self.config.get("job.distributed.conflict_free_merge")
+            and self.config.get("job.distributed.parameter_server") == "shared"
+        ):
+            self.config.log(
+                "Skipping replay for conflicting partition updates "
+                "because conflict_free_merge is enabled."
+            )
             return
         partition_id = None
         partition_version = None

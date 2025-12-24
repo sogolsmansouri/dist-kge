@@ -64,6 +64,7 @@ class DistSGD(Optimizer):
         parameter_client=None,
         lapse_indexes=None,
         local_index_mappers=None,
+        conflict_free_merge=False,
     ):
         params = [p for p in model.parameters() if p.requires_grad]
         if lr is not required and lr < 0.0:
@@ -91,6 +92,7 @@ class DistSGD(Optimizer):
             model._relation_embedder.local_to_lapse_mapper,
         ]
         self.parameter_client = parameter_client
+        self.conflict_free_merge = bool(conflict_free_merge)
         self._partition_context = {
             "partition_id": None,
             "partition_version": None,
@@ -148,10 +150,10 @@ class DistSGD(Optimizer):
                     push_tensor = d_p._values().mul_(-group["lr"]).cpu()
                     update_indexes = d_p._indices().cpu()
                     push_keys = self.local_to_lapse_mappers[i][update_indexes].view(-1)
-                    self.parameter_client.push(push_keys, push_tensor)
+                    self._push_with_context(push_keys, push_tensor)
                 else:
                     indexes_to_push_mask = self.local_to_lapse_mappers[i] != -1
-                    self.parameter_client.push(
+                    self._push_with_context(
                         self.local_to_lapse_mappers[i][indexes_to_push_mask],
                         (-group["lr"] * d_p).cpu()[indexes_to_push_mask],
                     )
@@ -159,6 +161,21 @@ class DistSGD(Optimizer):
                 # p.add_(d_p, alpha=-group['lr'])
 
         return loss
+
+    def _push_with_context(self, keys, payload):
+        if (
+            self.conflict_free_merge
+            and self._partition_context["partition_id"] is not None
+            and self._partition_context["partition_version"] is not None
+            and hasattr(self.parameter_client, "push_versioned")
+        ):
+            return self.parameter_client.push_versioned(
+                keys,
+                payload,
+                self._partition_context["partition_id"],
+                self._partition_context["partition_version"],
+            )
+        return self.parameter_client.push(keys, payload)
 
     def pull_entities(self, entity_ids):
         pass

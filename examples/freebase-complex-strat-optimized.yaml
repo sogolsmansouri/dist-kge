@@ -19,10 +19,16 @@ job:
   - cuda:1
   - cuda:2
   distributed:
-    num_partitions: 4
+    num_partitions: 32
     num_workers: 3
     partition_type: stratification
     parameter_server: shared
+    entity_sync_level: partition
+    relation_sync_level: partition
+    shuffle_partition_samples: false
+    materialize_partition_batches: true
+    stage_local_ids: true
+    debug_id_bounds: true
     hot_entity_cache:
       enable: true
       max_entities: 512
@@ -33,6 +39,8 @@ job:
       target_chunk_size: 40000
       min_chunk_size: 8000
       max_splits_per_partition: 8
+    glow:
+      base_partition_type: stratification
 lookup_embedder:
   dim: 128
   initialize: xavier_uniform_
@@ -51,15 +59,16 @@ lookup_embedder:
   sparse: true
 model: distributed_model
 negative_sampling:
+  sampling_type: pooled
   implementation: batch
   num_samples:
-    o: 400
-    s: 191
+    o: 200
+    s: 96
   shared: true
   shared_type: naive
 train:
   auto_correct: true
-  batch_size: 1024
+  batch_size: 2048
   loss_arg: .nan
   lr_scheduler: ReduceLROnPlateau
   lr_scheduler_args:
