@@ -130,6 +130,9 @@ class KgeOptimizer:
                     "local_to_lapse_mapper"] = getattr(
                     model,
                     f"_{group_name}_embedder").local_to_lapse_mapper
+                optimizer_settings[group_name]["args"]["lapse_offset"] = getattr(
+                    model,
+                    f"_{group_name}_embedder").lapse_offset
                 optimizer_settings[group_name]["args"]["optimizer_values"] = getattr(
                     model,
                     f"_{group_name}_embedder"

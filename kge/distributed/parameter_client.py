@@ -136,6 +136,11 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
         self.meta_key_tensor = torch.zeros(
             (self.num_meta_keys, self.key_size), dtype=torch.float32
         )
+        self._conflict_free_merge = bool(
+            config.get("job.distributed.conflict_free_merge")
+        )
+        self._causal_merge = bool(config.get("job.distributed.causal_merge"))
+        self._partition_version_state = {}
 
     def pull(
         self, keys, pull_tensor: Optional[torch.Tensor] = None, asynchronous=False
@@ -148,6 +153,28 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
 
     def push(self, keys, push_tensor: torch.Tensor, asynchronous=False):
         return super(LapseParameterClient, self).push(keys, push_tensor, asynchronous)
+
+    def push_versioned(
+        self,
+        keys,
+        push_tensor,
+        partition_id: Optional[int],
+        partition_version: Optional[int],
+        asynchronous=False,
+    ):
+        if (
+            not (self._conflict_free_merge or self._causal_merge)
+            or partition_id is None
+            or partition_version is None
+        ):
+            return self.push(keys, push_tensor, asynchronous=asynchronous)
+        current = self._partition_version_state.get(partition_id, -1)
+        if partition_version < current:
+            if not self._causal_merge:
+                return None
+        if partition_version > current:
+            self._partition_version_state[partition_id] = partition_version
+        return self.push(keys, push_tensor, asynchronous=asynchronous)
 
     def set(self, keys, set_tensor, asynchronous=False):
         super(LapseParameterClient, self).set(keys, set_tensor, asynchronous)
@@ -215,6 +242,11 @@ class TorchParameterClient(KgeParameterClient):
         self.lr_buffer = torch.zeros(1, dtype=torch.float32)
         self._stop_key = torch.LongTensor([self.num_keys - self.num_meta_keys])
         self._stop_value_tensor = torch.zeros((1, self.dim), dtype=torch.float32)
+        self._conflict_free_merge = bool(
+            config.get("job.distributed.conflict_free_merge")
+        )
+        self._causal_merge = bool(config.get("job.distributed.causal_merge"))
+        self._partition_version_state = {}
 
     def pull(self, keys, pull_tensor=None, asynchronous=False):
         cmd = torch.LongTensor([TORCH_PARAMETER_SERVER_CMDS.PULL_CMD, len(keys)])
@@ -229,6 +261,28 @@ class TorchParameterClient(KgeParameterClient):
         dist.send(cmd, dst=self.server_rank)
         dist.send(keys, dst=self.server_rank)
         dist.send(push_tensor, dst=self.server_rank)
+
+    def push_versioned(
+        self,
+        keys,
+        push_tensor,
+        partition_id: Optional[int],
+        partition_version: Optional[int],
+        asynchronous=False,
+    ):
+        if (
+            not (self._conflict_free_merge or self._causal_merge)
+            or partition_id is None
+            or partition_version is None
+        ):
+            return self.push(keys, push_tensor, asynchronous=asynchronous)
+        current = self._partition_version_state.get(partition_id, -1)
+        if partition_version < current:
+            if not self._causal_merge:
+                return None
+        if partition_version > current:
+            self._partition_version_state[partition_id] = partition_version
+        return self.push(keys, push_tensor, asynchronous=asynchronous)
 
     def set(self, keys, set_tensor, asynchronous=False):
         cmd = torch.LongTensor([TORCH_PARAMETER_SERVER_CMDS.SET_CMD, len(keys)])
@@ -361,7 +415,8 @@ class SharedParameterClient(KgeParameterClient):
             return
         current = self._partition_version_state.get(partition_id, -1)
         if partition_version < current:
-            return
+            if not self._causal_merge:
+                return
         if partition_version > current:
             self._partition_version_state[partition_id] = partition_version
         self.parameters[keys, :] += push_tensor

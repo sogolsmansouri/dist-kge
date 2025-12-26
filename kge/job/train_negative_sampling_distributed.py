@@ -482,7 +482,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             "job.distributed.relation_sync_level"
         )
         # DistAdagrad already pushes sparse updates per step; avoid full set at partition end.
-        self._skip_partition_set = isinstance(self.optimizer, DistAdagrad)
+        self._skip_partition_set = (
+            isinstance(self.optimizer, DistAdagrad)
+            or bool(self.config.get("job.distributed.causal_merge"))
+            or bool(self._window_work)
+        )
         self._entity_vocab_size = self.dataset.num_entities()
         self._relation_vocab_size = self.dataset.num_relations()
         self._debug_id_bounds = bool(
@@ -522,6 +526,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._last_finished_partition = None
         self._current_window_members = None
         self._current_window_entities = None
+        self._current_window_versions = None
         self._current_partition_size = 0
         glow_cfg = self.config.get("job.distributed.glow") or {}
         self._prefetch_window_entities = bool(
@@ -538,6 +543,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         )
         self._overlap_sampling_logged = False
         self._window_prefetch_key = None
+        self._window_work = bool(glow_cfg.get("window_work", False))
+        self._partition_maps_ready = False
+        self._entity_partition_map = None
+        self._relation_partition_map = None
         self._materialize_partitions = False
         self._materialization_notice_logged = False
         self._stage_local_ids = False
@@ -1560,15 +1569,64 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         elif self._lookahead_negatives:
             self._loader_debug_stats["lookahead_skipped"] += 1
 
+    def _init_partition_maps(self):
+        if self._partition_maps_ready:
+            return
+        num_partitions = int(self.config.get("job.distributed.num_partitions"))
+        try:
+            entity_map = self.dataset.load_entities_to_partitions(num_partitions)
+            entity_map = np.asarray(entity_map).reshape(-1).astype(np.int64)
+            if entity_map.size == 0:
+                raise ValueError("empty entity partition map")
+            self._entity_partition_map = torch.from_numpy(entity_map)
+        except Exception as exc:
+            self.config.log(
+                f"Glow window_work: falling back to modulo entity map ({exc})."
+            )
+            self._entity_partition_map = (
+                torch.arange(self.dataset.num_entities(), dtype=torch.long)
+                % num_partitions
+            )
+        try:
+            relation_map = self.dataset.load_relations_to_partitions(num_partitions)
+            relation_map = np.asarray(relation_map).reshape(-1).astype(np.int64)
+            if relation_map.size == 0:
+                raise ValueError("empty relation partition map")
+            self._relation_partition_map = torch.from_numpy(relation_map)
+        except Exception as exc:
+            self.config.log(
+                f"Glow window_work: falling back to modulo relation map ({exc})."
+            )
+            self._relation_partition_map = (
+                torch.arange(self.dataset.num_relations(), dtype=torch.long)
+                % num_partitions
+            )
+        self._partition_maps_ready = True
+
     def _notify_partition_start(self):
         if (
-            self._current_partition_id is None
-            or self._current_partition_version is None
+            self._current_partition_id is not None
+            and self._current_partition_version is not None
+            and hasattr(self.optimizer, "set_partition_context")
         ):
-            return
-        if hasattr(self.optimizer, "set_partition_context"):
             self.optimizer.set_partition_context(
                 self._current_partition_id, self._current_partition_version
+            )
+        if (
+            self._current_window_members is not None
+            and self._current_window_versions is not None
+            and hasattr(self.optimizer, "set_partition_context_map")
+        ):
+            self._init_partition_maps()
+            window_ids = [int(x) for x in self._current_window_members.tolist()]
+            window_versions = [
+                int(x) for x in self._current_window_versions.tolist()
+            ]
+            version_map = dict(zip(window_ids, window_versions))
+            self.optimizer.set_partition_context_map(
+                version_map,
+                self._entity_partition_map,
+                self._relation_partition_map,
             )
         for embedder in (
             self.model.get_s_embedder(),
@@ -1583,6 +1641,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         finished = (self._current_partition_id, self._current_partition_version)
         if hasattr(self.optimizer, "finalize_partition_context"):
             self.optimizer.finalize_partition_context()
+        if hasattr(self.optimizer, "clear_partition_context_map"):
+            self.optimizer.clear_partition_context_map()
         for embedder in (
             self.model.get_s_embedder(),
             self.model.get_p_embedder(),
@@ -1592,6 +1652,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._last_finished_partition = finished
         self._current_window_members = None
         self._current_window_entities = None
+        self._current_window_versions = None
         return finished
 
     def run_epoch(self) -> Dict[str, Any]:
@@ -1741,6 +1802,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 current_partition_version,
                 window_members,
                 window_entities,
+                window_versions,
             ) = self.work_scheduler_client.get_work()
             if work_entities is not None:
                 work_entities = work_entities.long()
@@ -1759,8 +1821,19 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self._current_window_entities = torch.unique(window_entities.long())
             else:
                 self._current_window_entities = None
+            if window_versions is not None and len(window_versions) > 0:
+                self._current_window_versions = window_versions.long()
+            else:
+                self._current_window_versions = None
             if current_partition_id is not None and current_partition_id >= 0:
                 self._current_partition_id = int(current_partition_id)
+            elif (
+                window_members is not None
+                and len(window_members) > 0
+            ):
+                self._current_partition_id = tuple(
+                    int(x) for x in window_members.tolist()
+                )
             else:
                 self._current_partition_id = None
             if current_partition_version is not None and current_partition_version >= 0:
@@ -2232,12 +2305,25 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
             chunk_grad_summary = self._flush_partition_gradient_trace()
             finished_context = self._notify_partition_end()
-            status, replay_version = self.work_scheduler_client.register_partition_result(
-                partition_duration,
-                self._current_partition_version,
-                self._current_partition_size,
-            )
-            self._handle_partition_conflict(status, replay_version, finished_context)
+            if (
+                self._current_window_members is not None
+                and self._current_window_versions is not None
+                and hasattr(self.work_scheduler_client, "register_window_result")
+            ):
+                conflicts = self.work_scheduler_client.register_window_result(
+                    partition_duration,
+                    self._current_window_members,
+                    self._current_window_versions,
+                    self._current_partition_size,
+                )
+                self._handle_window_conflicts(conflicts)
+            else:
+                status, replay_version = self.work_scheduler_client.register_partition_result(
+                    partition_duration,
+                    self._current_partition_version,
+                    self._current_partition_size,
+                )
+                self._handle_partition_conflict(status, replay_version, finished_context)
             self._last_finished_partition = None
             self._current_partition_id = None
             self._current_partition_version = None
@@ -2536,15 +2622,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if status != 1:
             return
         if (
-            (
-                self.config.get("job.distributed.conflict_free_merge")
-                or self.config.get("job.distributed.causal_merge")
-            )
+            self.config.get("job.distributed.conflict_free_merge")
             and self.config.get("job.distributed.parameter_server") == "shared"
         ):
             self.config.log(
                 "Skipping replay for conflicting partition updates "
-                "because conflict_free_merge or causal_merge is enabled."
+                "because conflict_free_merge is enabled."
             )
             return
         partition_id = None
@@ -2571,3 +2654,35 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 f"(original version {partition_version}, "
                 f"replay version {replay_version})."
             )
+
+    def _handle_window_conflicts(self, conflicts):
+        if not conflicts:
+            return
+        if (
+            self.config.get("job.distributed.conflict_free_merge")
+            and self.config.get("job.distributed.parameter_server") == "shared"
+        ):
+            self.config.log(
+                "Skipping replay for conflicting window updates "
+                "because conflict_free_merge is enabled."
+            )
+            return
+        if not hasattr(self.optimizer, "replay_partition_updates"):
+            return
+        for partition_id, partition_version, replay_version in conflicts:
+            try:
+                replayed = self.optimizer.replay_partition_updates(
+                    partition_id, partition_version, replay_version
+                )
+            except Exception as exc:
+                self.config.log(
+                    f"Failed to replay updates for window partition {partition_id} "
+                    f"(version {partition_version}): {exc}"
+                )
+                continue
+            if replayed:
+                self.config.log(
+                    f"Replayed updates for window partition {partition_id} "
+                    f"(original version {partition_version}, "
+                    f"replay version {replay_version})."
+                )

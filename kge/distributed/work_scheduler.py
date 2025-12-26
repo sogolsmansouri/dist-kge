@@ -44,6 +44,7 @@ class SCHEDULER_CMDS(IntEnum):
     REGISTER_PARTITION_RESULT = 13
     REGISTER_PARTITION_GRADIENT = 14
     REGISTER_PARTITION_RELATION_GRADIENT = 15
+    REGISTER_WINDOW_RESULT = 16
 
 @dataclass
 class WorkPackage:
@@ -55,6 +56,7 @@ class WorkPackage:
     relations_in_partition = None
     window_members = None
     window_entities = None
+    window_versions = None
     wait = False
     reuse_partition_version = False
 
@@ -331,6 +333,8 @@ class WorkScheduler(mp.get_context("fork").Process):
                 self._handle_get_eval_result(rank)
             elif cmd == SCHEDULER_CMDS.REGISTER_PARTITION_RESULT:
                 self._handle_register_partition_result(rank)
+            elif cmd == SCHEDULER_CMDS.REGISTER_WINDOW_RESULT:
+                self._handle_register_window_result(rank)
             elif cmd == SCHEDULER_CMDS.REGISTER_PARTITION_GRADIENT:
                 self._handle_register_partition_gradient(rank)
             elif cmd == SCHEDULER_CMDS.REGISTER_PARTITION_RELATION_GRADIENT:
@@ -394,7 +398,23 @@ class WorkScheduler(mp.get_context("fork").Process):
             dist.send(version_tensor, dst=rank)
             if not pre_localize:
                 self.active_partition_per_worker[rank] = work_package.partition_id
-                self.active_partition_versions[rank] = work_package.partition_version
+                if (
+                    work_package.window_members is not None
+                    and work_package.window_versions is not None
+                ):
+                    members = [
+                        int(x) for x in work_package.window_members
+                    ]
+                    versions = [
+                        int(x) for x in work_package.window_versions
+                    ]
+                    self.active_partition_versions[rank] = dict(
+                        zip(members, versions)
+                    )
+                else:
+                    self.active_partition_versions[rank] = (
+                        work_package.partition_version
+                    )
                 self.active_partition_chunk_sizes[rank] = len(work_package.partition_data)
                 if hasattr(self, "previous_partition_per_worker"):
                     self.previous_partition_per_worker[rank] = work_package.partition_id
@@ -437,6 +457,23 @@ class WorkScheduler(mp.get_context("fork").Process):
                 cmd_buffer[1] = len(window_entities)
                 dist.send(cmd_buffer, dst=rank)
                 dist.send(window_entities, dst=rank)
+            window_versions_data = work_package.window_versions
+            if (
+                window_versions_data is None
+                or (isinstance(window_versions_data, torch.Tensor)
+                    and window_versions_data.numel() == 0)
+                or (not isinstance(window_versions_data, torch.Tensor)
+                    and len(window_versions_data) == 0)
+            ):
+                cmd_buffer[1] = 0
+                dist.send(cmd_buffer, dst=rank)
+            else:
+                window_versions = torch.as_tensor(
+                    window_versions_data, dtype=self.data_type
+                )
+                cmd_buffer[1] = len(window_versions)
+                dist.send(cmd_buffer, dst=rank)
+                dist.send(window_versions, dst=rank)
         elif work_package.wait:
             cmd_buffer[0] = SCHEDULER_CMDS.WAIT
             cmd_buffer[1] = self.wait_time
@@ -527,6 +564,41 @@ class WorkScheduler(mp.get_context("fork").Process):
         )
         ack = torch.tensor([status, aux], dtype=self.data_type)
         dist.send(ack, dst=rank)
+
+    def _handle_register_window_result(self, rank):
+        result_buffer = torch.zeros(1, dtype=torch.float32)
+        dist.recv(result_buffer, src=rank)
+        info_buffer = torch.zeros(1, dtype=self.data_type)
+        dist.recv(info_buffer, src=rank)
+        window_count = int(info_buffer[0].item())
+        if window_count <= 0:
+            ack = torch.tensor([0], dtype=self.data_type)
+            dist.send(ack, dst=rank)
+            return
+        members = torch.empty(window_count, dtype=self.data_type)
+        dist.recv(members, src=rank)
+        versions = torch.empty(window_count, dtype=self.data_type)
+        dist.recv(versions, src=rank)
+        chunk_buffer = torch.zeros(1, dtype=self.data_type)
+        dist.recv(chunk_buffer, src=rank)
+        reported_chunk = int(chunk_buffer[0].item())
+        conflicts = self._register_window_result(
+            rank,
+            float(result_buffer[0].item()),
+            members,
+            versions,
+            reported_chunk,
+        )
+        conflict_count = len(conflicts)
+        ack = torch.tensor([conflict_count], dtype=self.data_type)
+        dist.send(ack, dst=rank)
+        if conflict_count:
+            ids = torch.tensor([c[0] for c in conflicts], dtype=self.data_type)
+            orig = torch.tensor([c[1] for c in conflicts], dtype=self.data_type)
+            replay = torch.tensor([c[2] for c in conflicts], dtype=self.data_type)
+            dist.send(ids, dst=rank)
+            dist.send(orig, dst=rank)
+            dist.send(replay, dst=rank)
 
     def _handle_register_partition_gradient(self, rank):
         info_buffer = torch.zeros(2, dtype=self.data_type)
@@ -711,6 +783,55 @@ class WorkScheduler(mp.get_context("fork").Process):
                     committed, reported_version
                 )
         return status, aux_version
+
+    def _register_window_result(
+        self,
+        rank,
+        step_time,
+        window_members,
+        window_versions,
+        reported_chunk_size=0,
+    ):
+        if window_members is None or window_versions is None:
+            return []
+        members = [int(x) for x in window_members.tolist()]
+        versions = [int(x) for x in window_versions.tolist()]
+        expected_versions = self.active_partition_versions.get(rank)
+        if not isinstance(expected_versions, dict):
+            expected_versions = {}
+        chunk_size = self.active_partition_chunk_sizes.get(rank, 0)
+        if reported_chunk_size and reported_chunk_size > 0:
+            chunk_size = reported_chunk_size
+        per_chunk = 0
+        if members:
+            per_chunk = int(chunk_size / max(1, len(members)))
+        conflicts = []
+        for pid, reported_version in zip(members, versions):
+            expected = expected_versions.get(pid)
+            conflict = (
+                reported_version is not None
+                and expected is not None
+                and reported_version != expected
+            )
+            history = self.partition_stats.setdefault(pid, deque(maxlen=8))
+            history.append(step_time)
+            avg_time = sum(history) / len(history)
+            self._handle_partition_feedback(pid, avg_time)
+            self._after_partition_result(
+                pid, avg_time, conflict=conflict, chunk_size=per_chunk
+            )
+            if reported_version is None:
+                continue
+            committed = self.partition_committed_versions.get(pid, -1)
+            if reported_version < committed:
+                replay_version = self.partition_issue_versions[pid]
+                self.partition_issue_versions[pid] = replay_version + 1
+                conflicts.append((pid, reported_version, replay_version))
+            else:
+                self.partition_committed_versions[pid] = max(
+                    committed, reported_version
+                )
+        return conflicts
 
     def _after_partition_result(self, partition_id, avg_time, **kwargs):
         pass
@@ -1335,6 +1456,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.glow_window_overlap = max(0, min(self.glow_window_size - 1, overlap))
         self.glow_min_gradient = max(1, int(glow_cfg.get("min_gradient_count", 1)))
         self.glow_windows_enabled = bool(glow_cfg.get("enable_windows", True))
+        self.glow_window_work = bool(glow_cfg.get("window_work", False))
+        if self.glow_window_work and not self.glow_windows_enabled:
+            self.glow_windows_enabled = True
+            config.log("Enabled glow windows because window_work is active.")
         self.glow_concurrent_windows = bool(
             glow_cfg.get("concurrent_windows", False)
         )
@@ -1400,6 +1525,18 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     "Disabled scheduler feedback chunking because "
                     "causal_overlap requires stable partition versions."
                 )
+        if self.glow_window_work and getattr(self, "_adaptive_enabled", False):
+            self._adaptive_enabled = False
+            config.log(
+                "Disabled scheduler feedback chunking because "
+                "window_work uses multi-partition windows."
+            )
+        if self.glow_window_work and self._causal_overlap_enabled:
+            self._causal_overlap_enabled = False
+            config.log(
+                "Disabled causal_overlap because window_work already "
+                "issues multi-partition windows."
+            )
         self._glow_windows: deque = deque()
         self._current_window_entry = None
         self._max_window_entities = 0
@@ -1778,11 +1915,31 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             self._partition_to_window[pid] = entry["key"]
             return pid
 
+    def _pop_next_window(self):
+        if not self.glow_windows_enabled or not self._glow_windows:
+            return None
+        while True:
+            if not self._glow_windows:
+                return None
+            entry = self._glow_windows.popleft()
+            window_key = entry.get("key")
+            if not window_key:
+                continue
+            remaining = [pid for pid in window_key if pid not in self._served_partitions]
+            if not remaining:
+                continue
+            for pid in remaining:
+                self._served_partitions.add(pid)
+            return tuple(remaining)
+
     def _after_partition_result(self, partition_id, avg_time, **kwargs):
         super(GlowWorkScheduler, self)._after_partition_result(
             partition_id, avg_time, **kwargs
         )
-        window_key = self._partition_to_window.pop(partition_id, None)
+        if isinstance(partition_id, (list, tuple)):
+            window_key = tuple(int(x) for x in partition_id)
+        else:
+            window_key = self._partition_to_window.pop(partition_id, None)
         self._update_window_affinity(window_key)
         if (
             not self.glow_bandit_enabled
@@ -1959,6 +2116,27 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             return tensors[0]
         return torch.unique(torch.cat(tensors))
 
+    def _get_window_relations(self, window_key):
+        if (
+            window_key is None
+            or self.config.get("job.distributed.relation_sync_level")
+            != "partition"
+        ):
+            return None
+        if self._partition_relations_map is None:
+            return self._get_partition_relations(window_key[0])
+        tensors = []
+        for pid in window_key:
+            rels = self._partition_relations_map.get(pid)
+            if rels is None or rels.numel() == 0:
+                continue
+            tensors.append(rels)
+        if not tensors:
+            return None
+        if len(tensors) == 1:
+            return tensors[0]
+        return torch.unique(torch.cat(tensors))
+
     def _estimate_window_entity_count(self, window_key):
         if self._partition_entities_map is None or not window_key:
             return 0
@@ -2099,8 +2277,59 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                         work_package.window_entities = window_entities
             return work_package
 
+        def build_window_work(window_members):
+            window_members = [int(pid) for pid in window_members]
+            partition_slices = []
+            window_versions = []
+            for pid in window_members:
+                partition_tensor = self.partitions[pid]
+                if partition_tensor is None or len(partition_tensor) == 0:
+                    continue
+                partition_slices.append(partition_tensor)
+                version = self.partition_issue_versions[pid]
+                self.partition_issue_versions[pid] = version + 1
+                window_versions.append(int(version))
+            if not partition_slices:
+                return None
+            work_package = WorkPackage()
+            work_package.partition_id = tuple(window_members)
+            work_package.partition_data = torch.cat(partition_slices).contiguous()
+            if self.config.get("job.distributed.shuffle_partition_samples"):
+                perm = torch.randperm(
+                    work_package.partition_data.numel(), dtype=self.data_type
+                )
+                work_package.partition_data = work_package.partition_data[perm]
+            work_package.window_members = list(window_members)
+            work_package.window_versions = window_versions
+            entities = None
+            if self._partition_entities_map is not None:
+                entities = self._get_window_entities(tuple(window_members))
+            if entities is None:
+                entities = self.local_entities.get(rank)
+            work_package.entities_in_partition = entities
+            if (
+                self.config.get("job.distributed.relation_sync_level")
+                == "partition"
+            ):
+                work_package.relations_in_partition = self._get_window_relations(
+                    tuple(window_members)
+                )
+            if self._send_window_entities:
+                window_entities = self._get_window_entities(tuple(window_members))
+                if window_entities is not None:
+                    work_package.window_entities = window_entities
+            return work_package
+
         try:
             while True:
+                if self.glow_window_work:
+                    window_members = self._pop_next_window()
+                    if window_members is None:
+                        return WorkPackage()
+                    work_package = build_window_work(window_members)
+                    if work_package is None:
+                        continue
+                    return work_package
                 if self._causal_overlap_enabled and self._causal_overlap_queue:
                     partition_id = self._causal_overlap_queue.popleft()
                     version = self._causal_overlap_versions.get(partition_id)
@@ -2650,6 +2879,7 @@ class SchedulerClient:
         Optional[int],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
+        Optional[torch.Tensor],
     ]:
         """
 
@@ -2690,6 +2920,11 @@ class SchedulerClient:
         if cmd[1].item() > 0:
             window_entities = torch.empty((cmd[1].item(),), dtype=self.data_type)
             dist.recv(window_entities, src=self.scheduler_rank)
+        dist.recv(cmd, src=self.scheduler_rank)
+        window_versions = None
+        if cmd[1].item() > 0:
+            window_versions = torch.empty((cmd[1].item(),), dtype=self.data_type)
+            dist.recv(window_versions, src=self.scheduler_rank)
         return (
             work_buffer,
             entity_buffer,
@@ -2698,6 +2933,7 @@ class SchedulerClient:
             partition_version,
             window_members,
             window_entities,
+            window_versions,
         )
 
     def _request_single_work(
@@ -2708,6 +2944,7 @@ class SchedulerClient:
         Optional[torch.Tensor],
         Optional[int],
         Optional[int],
+        Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
@@ -2724,7 +2961,7 @@ class SchedulerClient:
                 if wait > 0:
                     time.sleep(wait)
             else:
-                return None, None, None, None, None, None, None
+                return None, None, None, None, None, None, None, None
 
     def _fill_prefetch_queue(self):
         target = self.prefetch_per_request
@@ -2737,6 +2974,7 @@ class SchedulerClient:
                 partition_version,
                 window_members,
                 window_entities,
+                window_versions,
             ) = self._request_single_work()
             if work is None:
                 break
@@ -2749,6 +2987,7 @@ class SchedulerClient:
                     partition_version,
                     window_members,
                     window_entities,
+                    window_versions,
                 )
             )
 
@@ -2760,6 +2999,7 @@ class SchedulerClient:
         Optional[torch.Tensor],
         Optional[int],
         Optional[int],
+        Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
@@ -2776,7 +3016,7 @@ class SchedulerClient:
             self._fill_prefetch_queue()
         if self._prefetched_work:
             return self._prefetched_work.popleft()
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     def get_pre_localize_work(self):
         """
@@ -2797,6 +3037,7 @@ class SchedulerClient:
                 relations,
                 partition_id,
                 partition_version,
+                _,
                 _,
                 _,
             ) = self._receive_work(cmd)
@@ -2878,6 +3119,39 @@ class SchedulerClient:
         dist.recv(ack, src=self.scheduler_rank)
         return int(ack[0].item()), int(ack[1].item())
 
+    def register_window_result(
+        self, step_time, window_members, window_versions, chunk_size=0
+    ):
+        cmd = torch.tensor([SCHEDULER_CMDS.REGISTER_WINDOW_RESULT, 0], dtype=self.data_type)
+        dist.send(cmd, dst=self.scheduler_rank)
+        payload = torch.tensor([step_time], dtype=torch.float32)
+        dist.send(payload, dst=self.scheduler_rank)
+        count = 0 if window_members is None else len(window_members)
+        info = torch.tensor([count], dtype=self.data_type)
+        dist.send(info, dst=self.scheduler_rank)
+        if count:
+            members = torch.as_tensor(window_members, dtype=self.data_type)
+            versions = torch.as_tensor(window_versions, dtype=self.data_type)
+            dist.send(members, dst=self.scheduler_rank)
+            dist.send(versions, dst=self.scheduler_rank)
+        chunk_tensor = torch.tensor([int(chunk_size)], dtype=self.data_type)
+        dist.send(chunk_tensor, dst=self.scheduler_rank)
+        ack = torch.full((1,), -1, dtype=self.data_type)
+        dist.recv(ack, src=self.scheduler_rank)
+        conflict_count = int(ack[0].item())
+        if conflict_count <= 0:
+            return []
+        ids = torch.empty((conflict_count,), dtype=self.data_type)
+        orig = torch.empty((conflict_count,), dtype=self.data_type)
+        replay = torch.empty((conflict_count,), dtype=self.data_type)
+        dist.recv(ids, src=self.scheduler_rank)
+        dist.recv(orig, src=self.scheduler_rank)
+        dist.recv(replay, src=self.scheduler_rank)
+        return [
+            (int(pid), int(ov), int(rv))
+            for pid, ov, rv in zip(ids.tolist(), orig.tolist(), replay.tolist())
+        ]
+
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None or partition_id < 0:
             return
@@ -2958,7 +3232,7 @@ class LocalSchedulerClient:
 
     def _prepare_work(self, work_package, pre_localize=False):
         if work_package is None or work_package.partition_data is None:
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
         if work_package.partition_id is not None:
             if work_package.reuse_partition_version:
                 if work_package.partition_version is None:
@@ -2979,9 +3253,19 @@ class LocalSchedulerClient:
             self.scheduler.active_partition_per_worker[self.rank] = (
                 work_package.partition_id
             )
-            self.scheduler.active_partition_versions[self.rank] = (
-                work_package.partition_version
-            )
+            if (
+                work_package.window_members is not None
+                and work_package.window_versions is not None
+            ):
+                members = [int(x) for x in work_package.window_members]
+                versions = [int(x) for x in work_package.window_versions]
+                self.scheduler.active_partition_versions[self.rank] = dict(
+                    zip(members, versions)
+                )
+            else:
+                self.scheduler.active_partition_versions[self.rank] = (
+                    work_package.partition_version
+                )
             self.scheduler.active_partition_chunk_sizes[self.rank] = len(
                 work_package.partition_data
             )
@@ -2995,6 +3279,9 @@ class LocalSchedulerClient:
         window_entities = work_package.window_entities
         if window_entities is not None and not isinstance(window_entities, torch.Tensor):
             window_entities = torch.as_tensor(window_entities, dtype=self.data_type)
+        window_versions = work_package.window_versions
+        if window_versions is not None and not isinstance(window_versions, torch.Tensor):
+            window_versions = torch.as_tensor(window_versions, dtype=self.data_type)
         return (
             work_package.partition_data,
             work_package.entities_in_partition,
@@ -3003,6 +3290,7 @@ class LocalSchedulerClient:
             work_package.partition_version,
             window_members,
             window_entities,
+            window_versions,
         )
 
     def _request_single_work(self):
@@ -3011,7 +3299,7 @@ class LocalSchedulerClient:
         while True:
             work_package = self.scheduler._next_work(self.rank, self.machine_id)
             if work_package is None:
-                return None, None, None, None, None, None, None
+                return None, None, None, None, None, None, None, None
             if work_package.wait:
                 if self.scheduler.wait_time > 0:
                     time.sleep(self.scheduler.wait_time)
@@ -3025,7 +3313,7 @@ class LocalSchedulerClient:
                 self.scheduler._refill_work()
                 self.scheduler._on_epoch_completed()
                 self._epoch_seen_partitions.clear()
-                return None, None, None, None, None, None, None
+                return None, None, None, None, None, None, None, None
             return self._prepare_work(work_package, pre_localize=False)
 
     def _next_work(self):
@@ -3035,7 +3323,7 @@ class LocalSchedulerClient:
             self._fill_prefetch_queue()
         if self._prefetched_work:
             return self._prefetched_work.popleft()
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
     def _fill_prefetch_queue(self):
         target = self.prefetch_per_request
@@ -3139,6 +3427,15 @@ class LocalSchedulerClient:
             self.rank,
             float(step_time),
             reported_version=partition_version,
+            reported_chunk_size=chunk_size,
+        )
+
+    def register_window_result(self, step_time, window_members, window_versions, chunk_size=0):
+        return self.scheduler._register_window_result(
+            self.rank,
+            float(step_time),
+            window_members,
+            window_versions,
             reported_chunk_size=chunk_size,
         )
 

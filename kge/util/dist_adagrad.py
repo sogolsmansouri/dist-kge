@@ -89,6 +89,10 @@ class DistAdagrad(Optimizer):
             "partition_id": None,
             "partition_version": None,
         }
+        self._partition_context_map = None
+        self._partition_context_offsets = {"entity": 0, "relation": 0}
+        self._partition_context_maps = {"entity": None, "relation": None}
+        self._window_replay_payloads = None
         self._current_replay_key = None
         self._current_replay_payloads = {"entity": [], "relation": []}
         self._replay_archive = {}
@@ -108,6 +112,10 @@ class DistAdagrad(Optimizer):
             if group["name"] != "default":
                 if parameter_client.get_lr(group["name"]) == 0:
                     self.parameter_client.set_lr(group["name"], group["lr"])
+            if "lapse_offset" in group:
+                self._partition_context_offsets[group["name"]] = int(
+                    group["lapse_offset"]
+                )
             group["prev_lr"] = group["lr"]
             for i, p in enumerate(group["params"]):
                 state = self.state[p]
@@ -206,6 +214,7 @@ class DistAdagrad(Optimizer):
                             payload, update_value, sum_update_values
                         )
                         wait_value = self._push_with_context(
+                            group["name"],
                             push_keys,
                             payload,
                             asynchronous=self._async_write_back_map[group["name"]],
@@ -232,7 +241,15 @@ class DistAdagrad(Optimizer):
 
         return loss
 
-    def _push_with_context(self, keys, payload, asynchronous=False):
+    def _push_with_context(self, group_name, keys, payload, asynchronous=False):
+        if (
+            self._partition_context_map is not None
+            and group_name in self._partition_context_maps
+            and hasattr(self.parameter_client, "push_versioned")
+        ):
+            return self._push_with_partition_map(
+                group_name, keys, payload, asynchronous=asynchronous
+            )
         if (
             (self.conflict_free_merge or self.causal_merge)
             and self._partition_context["partition_id"] is not None
@@ -249,6 +266,48 @@ class DistAdagrad(Optimizer):
         return self.parameter_client.push(
             keys, payload, asynchronous=asynchronous
         )
+
+    def _push_with_partition_map(self, group_name, keys, payload, asynchronous=False):
+        partition_map = self._partition_context_maps.get(group_name)
+        if partition_map is None or keys.numel() == 0:
+            return self.parameter_client.push(
+                keys, payload, asynchronous=asynchronous
+            )
+        offset = self._partition_context_offsets.get(group_name, 0)
+        raw_ids = keys - offset
+        valid_mask = (raw_ids >= 0) & (raw_ids < partition_map.numel())
+        if not torch.any(valid_mask):
+            return self.parameter_client.push(
+                keys, payload, asynchronous=asynchronous
+            )
+        raw_ids = raw_ids[valid_mask].long()
+        keys = keys[valid_mask]
+        payload = payload[valid_mask]
+        partition_ids = partition_map[raw_ids]
+        wait_value = None
+        for pid in torch.unique(partition_ids).tolist():
+            version = self._partition_context_map.get(pid)
+            pid_mask = partition_ids == pid
+            if not torch.any(pid_mask):
+                continue
+            keys_pid = keys[pid_mask]
+            payload_pid = payload[pid_mask]
+            self._record_window_push(
+                int(pid), self._partition_context_map.get(pid), group_name, keys_pid, payload_pid
+            )
+            if version is None:
+                wait_value = self.parameter_client.push(
+                    keys_pid, payload_pid, asynchronous=asynchronous
+                )
+            else:
+                wait_value = self.parameter_client.push_versioned(
+                    keys_pid,
+                    payload_pid,
+                    int(pid),
+                    int(version),
+                    asynchronous=asynchronous,
+                )
+        return wait_value
 
     def _acquire_push_buffer(self, group_name: str, rows: int) -> torch.Tensor:
         pool = self._push_buffer_pool[group_name]
@@ -367,6 +426,28 @@ class DistAdagrad(Optimizer):
         self._current_replay_key = (partition_id, partition_version)
         self._current_replay_payloads = {"entity": [], "relation": []}
 
+    def set_partition_context_map(
+        self,
+        partition_versions: dict,
+        entity_partition_map: torch.Tensor,
+        relation_partition_map: torch.Tensor,
+    ):
+        self._partition_context_map = {
+            int(pid): int(version) for pid, version in partition_versions.items()
+        }
+        self._partition_context_maps["entity"] = entity_partition_map
+        self._partition_context_maps["relation"] = relation_partition_map
+        self._window_replay_payloads = {}
+
+    def clear_partition_context_map(self):
+        if self._window_replay_payloads:
+            for key, payloads in self._window_replay_payloads.items():
+                self._store_replay_entry(key, payloads)
+        self._partition_context_map = None
+        self._partition_context_maps["entity"] = None
+        self._partition_context_maps["relation"] = None
+        self._window_replay_payloads = None
+
     def finalize_partition_context(self):
         if self._current_replay_key is not None:
             self._store_replay_entry(
@@ -406,6 +487,17 @@ class DistAdagrad(Optimizer):
         self._current_replay_payloads[group_name].append(
             (keys.cpu(), payload.cpu())
         )
+
+    def _record_window_push(self, partition_id, version, group_name, keys, payload):
+        if self._window_replay_payloads is None or version is None:
+            return
+        if keys.numel() == 0 or payload.numel() == 0:
+            return
+        key = (int(partition_id), int(version))
+        entry = self._window_replay_payloads.setdefault(
+            key, {"entity": [], "relation": []}
+        )
+        entry[group_name].append((keys.cpu(), payload.cpu()))
 
     def replay_partition_updates(
         self, partition_id: int, original_version: int, replay_version: int

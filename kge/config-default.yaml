@@ -135,6 +135,7 @@ job:
       window_overlap: 1
       min_gradient_count: 1
       enable_windows: True
+      window_work: False
       concurrent_windows: False
       prefetch_window_entities: True
       lookahead_negatives: True
