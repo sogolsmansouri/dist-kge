@@ -1394,6 +1394,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             self._causal_overlap_max_workers = min(
                 self._causal_overlap_max_workers, max(1, self.num_clients)
             )
+            if getattr(self, "_adaptive_enabled", False):
+                self._adaptive_enabled = False
+                config.log(
+                    "Disabled scheduler feedback chunking because "
+                    "causal_overlap requires stable partition versions."
+                )
         self._glow_windows: deque = deque()
         self._current_window_entry = None
         self._max_window_entities = 0
@@ -3054,13 +3060,28 @@ class LocalSchedulerClient:
             partition_id = work[3]
             if partition_id is None:
                 return work
-            partition_id = int(partition_id)
-            if partition_id in self._epoch_seen_partitions:
+            partition_key = partition_id
+            if isinstance(partition_key, torch.Tensor):
+                partition_key = partition_key.detach().cpu()
+                if partition_key.numel() == 1:
+                    partition_key = int(partition_key.item())
+                else:
+                    partition_key = tuple(
+                        int(x) for x in partition_key.view(-1).tolist()
+                    )
+            elif isinstance(partition_key, (list, tuple)):
+                partition_key = tuple(int(x) for x in partition_key)
+            else:
+                try:
+                    partition_key = int(partition_key)
+                except (TypeError, ValueError):
+                    pass
+            if partition_key in self._epoch_seen_partitions:
                 attempts += 1
                 if attempts >= max_attempts:
                     return work
                 continue
-            self._epoch_seen_partitions.add(partition_id)
+            self._epoch_seen_partitions.add(partition_key)
             return work
 
     def get_pre_localize_work(self):
