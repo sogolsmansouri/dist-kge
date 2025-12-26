@@ -1560,6 +1560,14 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
 
     def _init_in_started_process(self):
         super(GlowWorkScheduler, self)._init_in_started_process()
+        effective = getattr(self, "_glow_effective_partitions", None)
+        if effective is not None and effective != self.num_partitions:
+            self.config.log(
+                "Glow scheduler using stratification pair partitions: "
+                f"{self.num_partitions} -> {effective}."
+            )
+            self.num_partitions = int(effective)
+            self.work_to_do = deque(list(range(self.num_partitions)))
         self._load_existing_gradients()
         self._init_partition_entity_map()
         self._init_partition_relation_map()
@@ -1584,6 +1592,28 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             and partition_assignment.ndim == 2
             and partition_assignment.shape[1] == 2
         )
+        if self._glow_stratified_partitions:
+            use_pairs = bool(
+                self.config.get(
+                    "job.distributed.glow.stratification_pairs", True
+                )
+            )
+            if use_pairs:
+                pairs = np.unique(partition_assignment, axis=0)
+                partitions = []
+                for pair in pairs:
+                    mask = (
+                        (partition_assignment[:, 0] == pair[0])
+                        & (partition_assignment[:, 1] == pair[1])
+                    )
+                    idx = np.where(mask)[0].astype(np_type)
+                    if idx.size == 0:
+                        continue
+                    partitions.append(
+                        torch.from_numpy(idx).contiguous()
+                    )
+                self._glow_effective_partitions = len(partitions)
+                return partitions
         partition_indexes = np.unique(partition_assignment)
         partitions = [
             torch.from_numpy(
@@ -1635,22 +1665,22 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     "partitions": deque(window),
                 }
                 self._glow_windows.append(window_entry)
-                if (
-                    self.glow_overlap_sampling
-                    and self._partition_entities_map is not None
-                ):
-                    window_count = self._estimate_window_entity_count(window)
-                    if window_count > self._max_window_entities:
-                        self._max_window_entities = window_count
+            if (
+                (self.glow_overlap_sampling or self.glow_window_work)
+                and self._partition_entities_map is not None
+            ):
+                window_count = self._estimate_window_entity_count(window)
+                if window_count > self._max_window_entities:
+                    self._max_window_entities = window_count
         self._sort_glow_windows()
         self._served_partitions = set()
         if (
-            self.glow_overlap_sampling
+            (self.glow_overlap_sampling or self.glow_window_work)
             and self._max_window_entities > self._max_partition_entities
         ):
             self._max_partition_entities = self._max_window_entities
             self.config.log(
-                "Glow overlap sampling increased max partition entities to "
+                "Glow window sizing increased max partition entities to "
                 f"{self._max_partition_entities}."
             )
 
@@ -3153,7 +3183,15 @@ class SchedulerClient:
         ]
 
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
+            return
+        if isinstance(partition_id, (list, tuple)):
+            return
+        try:
+            partition_id = int(partition_id)
+        except (TypeError, ValueError):
+            return
+        if partition_id < 0:
             return
         cmd = torch.tensor(
             [SCHEDULER_CMDS.REGISTER_PARTITION_GRADIENT, self.machine_id],
@@ -3440,6 +3478,16 @@ class LocalSchedulerClient:
         )
 
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
+        if partition_id is None:
+            return
+        if isinstance(partition_id, (list, tuple)):
+            return
+        try:
+            partition_id = int(partition_id)
+        except (TypeError, ValueError):
+            return
+        if partition_id < 0:
+            return
         self.scheduler._register_partition_gradient(
             partition_id, float(grad_sum), int(sample_count)
         )

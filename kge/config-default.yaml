@@ -140,6 +140,8 @@ job:
       prefetch_window_entities: True
       lookahead_negatives: True
       overlap_negative_sampling: False
+      stratification_pairs: True
+      debug_window_versions: 0
       affinity_alpha: 0.3
       bandit:
         enable: True

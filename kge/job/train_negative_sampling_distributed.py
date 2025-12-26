@@ -544,6 +544,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._overlap_sampling_logged = False
         self._window_prefetch_key = None
         self._window_work = bool(glow_cfg.get("window_work", False))
+        try:
+            self._debug_window_versions_remaining = int(
+                glow_cfg.get("debug_window_versions", 0)
+            )
+        except (TypeError, ValueError):
+            self._debug_window_versions_remaining = 0
         self._partition_maps_ready = False
         self._entity_partition_map = None
         self._relation_partition_map = None
@@ -1436,19 +1442,36 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             "grad_count": count,
             "grad_avg": grad_sum / max(1, count),
         }
-        self.work_scheduler_client.register_partition_gradient(
-            self._current_partition_id, grad_sum, count
-        )
-        if self._relation_gradient_trace and self._relation_grad_sum is not None:
-            mask = self._relation_grad_count > 0
-            if mask.any():
-                rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
-                rel_sums = self._relation_grad_sum[mask]
-                rel_counts = self._relation_grad_count[mask]
-                summary["relation_grad_count"] = int(rel_ids.numel())
-                self.work_scheduler_client.register_partition_relation_gradient(
-                    self._current_partition_id, rel_ids, rel_sums, rel_counts
+        partition_id = self._current_partition_id
+        if isinstance(partition_id, (list, tuple)):
+            partition_ids = [
+                int(x)
+                for x in (
+                    self._current_window_members.tolist()
+                    if self._current_window_members is not None
+                    else partition_id
                 )
+            ]
+            per_sum = grad_sum / max(1, len(partition_ids))
+            per_count = max(1, int(round(count / max(1, len(partition_ids)))))
+            for pid in partition_ids:
+                self.work_scheduler_client.register_partition_gradient(
+                    pid, per_sum, per_count
+                )
+        else:
+            self.work_scheduler_client.register_partition_gradient(
+                partition_id, grad_sum, count
+            )
+            if self._relation_gradient_trace and self._relation_grad_sum is not None:
+                mask = self._relation_grad_count > 0
+                if mask.any():
+                    rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+                    rel_sums = self._relation_grad_sum[mask]
+                    rel_counts = self._relation_grad_count[mask]
+                    summary["relation_grad_count"] = int(rel_ids.numel())
+                    self.work_scheduler_client.register_partition_relation_gradient(
+                        partition_id, rel_ids, rel_sums, rel_counts
+                    )
         self._reset_partition_gradient_trace()
         self._last_partition_grad_summary = summary
         return summary
@@ -2304,17 +2327,35 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 else 0
             )
             chunk_grad_summary = self._flush_partition_gradient_trace()
+            window_members = self._current_window_members
+            window_versions = self._current_window_versions
             finished_context = self._notify_partition_end()
             if (
-                self._current_window_members is not None
-                and self._current_window_versions is not None
+                window_members is not None
+                and window_versions is not None
                 and hasattr(self.work_scheduler_client, "register_window_result")
             ):
+                if self._debug_window_versions_remaining > 0:
+                    try:
+                        members = [
+                            int(x) for x in window_members.tolist()
+                        ]
+                        versions = [
+                            int(x) for x in window_versions.tolist()
+                        ]
+                        self.config.log(
+                            f"Glow window versions {members} -> {versions}"
+                        )
+                    except Exception as exc:
+                        self.config.log(
+                            f"Glow window versions debug failed: {exc}"
+                        )
+                    self._debug_window_versions_remaining -= 1
                 conflicts = self.work_scheduler_client.register_window_result(
                     partition_duration,
-                    self._current_window_members,
-                    self._current_window_versions,
-                    self._current_partition_size,
+                    window_members,
+                    window_versions,
+                    chunk_partition_size,
                 )
                 self._handle_window_conflicts(conflicts)
             else:
