@@ -1,7 +1,12 @@
 import torch
 from kge import Config, Dataset
 from kge.model.kge_model import RelationalScorer, KgeModel
-from kge.util.triton_complex import fused_complex_requested, complex_matmul
+from kge.util.triton_complex import (
+    fused_complex_requested,
+    complex_matmul,
+    complex_score_spo_triton,
+    has_triton_complex,
+)
 
 
 class ComplExScorer(RelationalScorer):
@@ -10,6 +15,7 @@ class ComplExScorer(RelationalScorer):
     def __init__(self, config: Config, dataset: Dataset, configuration_key=None):
         super().__init__(config, dataset, configuration_key)
         self._use_fused = fused_complex_requested()
+        self._use_triton = has_triton_complex()
 
     def score_emb(self, s_emb, p_emb, o_emb, combine: str):
         if self._use_fused:
@@ -49,7 +55,10 @@ class ComplExScorer(RelationalScorer):
         o = self._as_complex(o_emb)
 
         if combine == "spo":
-            out = torch.real((s * p * o.conj()).sum(dim=-1, keepdim=True))
+            if self._use_triton and s_emb.is_cuda:
+                out = complex_score_spo_triton(s_emb, p_emb, o_emb).view(n, 1)
+            else:
+                out = torch.real((s * p * o.conj()).sum(dim=-1, keepdim=True))
         elif combine == "sp_":
             out = torch.real(complex_matmul(s * p, o, conj_right=True))
         elif combine == "_po":

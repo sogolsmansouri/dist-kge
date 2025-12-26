@@ -22,6 +22,7 @@ class KgeOptimizer:
                 conflict_free_merge=config.get(
                     "job.distributed.conflict_free_merge"
                 ),
+                causal_merge=config.get("job.distributed.causal_merge"),
                 **config.get("train.optimizer.default.args"),
             )
             return optimizer
@@ -54,6 +55,7 @@ class KgeOptimizer:
                 conflict_free_merge=config.get(
                     "job.distributed.conflict_free_merge"
                 ),
+                causal_merge=config.get("job.distributed.causal_merge"),
                 **config.get("train.optimizer.default.args"),
             )
             return optimizer

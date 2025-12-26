@@ -17,6 +17,7 @@ from kge.job.train import TrainingJob, _generate_worker_init_fn
 from kge.job.train_negative_sampling import TrainingJobNegativeSampling
 from kge.model import KgeModel
 from kge.util import KgeOptimizer
+from kge.util.dist_adagrad import DistAdagrad
 from kge.job.trace import format_trace_entry
 from kge.distributed.work_scheduler import SchedulerClient
 from kge.distributed.misc import get_min_rank
@@ -409,7 +410,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 )
 
         if work_scheduler_client is None:
-            self.work_scheduler_client = SchedulerClient(config)
+            if self.config.get("job.distributed.single_process"):
+                from kge.distributed.work_scheduler import LocalSchedulerClient
+
+                self.work_scheduler_client = LocalSchedulerClient(config, dataset)
+            else:
+                self.work_scheduler_client = SchedulerClient(config)
         else:
             self.work_scheduler_client = work_scheduler_client
         (
@@ -454,6 +460,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.config.get("job.distributed.map_ids_on_gpu")
         )
         self._map_ids_device = self._resolve_map_ids_device()
+        self._unique_on_gpu = bool(
+            self.config.get("job.distributed.unique_on_gpu")
+        )
         self._entity_partition_mapper_device = None
         self._relation_partition_mapper_device = None
         self._gpu_sampling_logged = False
@@ -472,6 +481,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.relation_sync_level = self.config.get(
             "job.distributed.relation_sync_level"
         )
+        # DistAdagrad already pushes sparse updates per step; avoid full set at partition end.
+        self._skip_partition_set = isinstance(self.optimizer, DistAdagrad)
         self._entity_vocab_size = self.dataset.num_entities()
         self._relation_vocab_size = self.dataset.num_relations()
         self._debug_id_bounds = bool(
@@ -484,6 +495,21 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._relation_gradient_trace = bool(
             self.config.get("job.distributed.relation_gradient_trace")
         )
+        self._gradient_log_interval = 0
+        self._gradient_log_top_relations = 0
+        try:
+            self._gradient_log_interval = int(
+                self.config.get("job.distributed.gradient_trace_log_interval")
+            )
+        except KeyError:
+            self._gradient_log_interval = 0
+        try:
+            self._gradient_log_top_relations = int(
+                self.config.get("job.distributed.gradient_trace_top_relations")
+            )
+        except KeyError:
+            self._gradient_log_top_relations = 0
+        self._last_partition_grad_summary = None
         self._relation_grad_sum = None
         self._relation_grad_count = None
         if self._relation_gradient_trace:
@@ -507,6 +533,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._overlap_negative_sampling = bool(
             glow_cfg.get("overlap_negative_sampling", False)
         )
+        self._force_overlap_pool = bool(
+            glow_cfg.get("force_pooled_negatives", False)
+        )
         self._overlap_sampling_logged = False
         self._window_prefetch_key = None
         self._materialize_partitions = False
@@ -516,6 +545,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._loader_debug_stats = defaultdict(int)
         self._need_unique_entities = self.entity_sync_level == "batch"
         self._need_unique_relations = self.relation_sync_level == "batch"
+        if (
+            self._overlap_negative_sampling
+            and self._force_overlap_pool
+            and self.config.get("negative_sampling.sampling_type") != "pooled"
+        ):
+            self.config.set(
+                "negative_sampling.sampling_type", "pooled", log=True
+            )
+            self._sampler = KgeSampler.create(
+                self.config, "negative_sampling", self.dataset
+            )
         self.entity_pre_pull = self.config.get("job.distributed.entity_pre_pull")
         self.relation_pre_pull = self.config.get("job.distributed.relation_pre_pull")
         self.pre_localize_batch = int(
@@ -781,16 +821,33 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             entity_embedder = self.model.get_s_embedder()
             relation_embedder = self.model.get_p_embedder()
             if self._need_unique_entities:
+                use_gpu_unique = (
+                    self._unique_on_gpu
+                    and sampler_triples.device.type == "cuda"
+                )
                 # Unique-id construction stays on CPU even if samplers produced
-                # device-resident buffers (e.g., when experimenting with GPU staging).
-                pos_entities = triples[:, [S, O]].view(-1)
-                if pos_entities.device.type != "cpu":
+                # device-resident buffers when configured.
+                pos_source = sampler_triples if use_gpu_unique else triples
+                pos_entities = pos_source[:, [S, O]].view(-1)
+                if not use_gpu_unique and pos_entities.device.type != "cpu":
                     pos_entities = pos_entities.cpu()
                 neg_s = negative_samples[S].unique_samples(remove_dropped=False)
-                if neg_s.device.type != "cpu":
+                if use_gpu_unique:
+                    if neg_s.device != sampler_triples.device:
+                        neg_s = neg_s.to(
+                            sampler_triples.device,
+                            non_blocking=self._non_blocking_transfer,
+                        )
+                elif neg_s.device.type != "cpu":
                     neg_s = neg_s.cpu()
                 neg_o = negative_samples[O].unique_samples(remove_dropped=False)
-                if neg_o.device.type != "cpu":
+                if use_gpu_unique:
+                    if neg_o.device != sampler_triples.device:
+                        neg_o = neg_o.to(
+                            sampler_triples.device,
+                            non_blocking=self._non_blocking_transfer,
+                        )
+                elif neg_o.device.type != "cpu":
                     neg_o = neg_o.cpu()
                 unique_entities = torch.unique(
                     torch.cat(
@@ -807,11 +864,22 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         unique_entities
                     )
             if self._need_unique_relations:
-                pos_relations = triples[:, [P]].view(-1)
-                if pos_relations.device.type != "cpu":
+                use_gpu_unique = (
+                    self._unique_on_gpu
+                    and sampler_triples.device.type == "cuda"
+                )
+                pos_source = sampler_triples if use_gpu_unique else triples
+                pos_relations = pos_source[:, [P]].view(-1)
+                if not use_gpu_unique and pos_relations.device.type != "cpu":
                     pos_relations = pos_relations.cpu()
                 neg_p = negative_samples[P].unique_samples(remove_dropped=False)
-                if neg_p.device.type != "cpu":
+                if use_gpu_unique:
+                    if neg_p.device != sampler_triples.device:
+                        neg_p = neg_p.to(
+                            sampler_triples.device,
+                            non_blocking=self._non_blocking_transfer,
+                        )
+                elif neg_p.device.type != "cpu":
                     neg_p = neg_p.cpu()
                 unique_relations = torch.unique(
                     torch.cat(
@@ -1261,6 +1329,37 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._partition_grad_sum += grad_norm
         self._partition_grad_samples += 1
         self._accumulate_partition_relation_gradients()
+        if (
+            self._gradient_log_interval > 0
+            and self._partition_grad_samples % self._gradient_log_interval == 0
+        ):
+            avg_grad = self._partition_grad_sum / max(1, self._partition_grad_samples)
+            message = (
+                f"Partition {self._current_partition_id} gradient norm avg="
+                f"{avg_grad:.6f} (samples={self._partition_grad_samples})."
+            )
+            if (
+                self._gradient_log_top_relations > 0
+                and self._relation_gradient_trace
+                and self._relation_grad_sum is not None
+            ):
+                mask = self._relation_grad_count > 0
+                if mask.any():
+                    rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+                    rel_avg = (
+                        self._relation_grad_sum[mask]
+                        / self._relation_grad_count[mask].to(self._relation_grad_sum.dtype)
+                    )
+                    top_k = min(self._gradient_log_top_relations, rel_avg.numel())
+                    vals, idx = torch.topk(rel_avg, k=top_k, largest=True)
+                    top_rel_ids = rel_ids[idx].tolist()
+                    top_rel_vals = vals.tolist()
+                    pairs = ", ".join(
+                        f"{rid}:{val:.4f}"
+                        for rid, val in zip(top_rel_ids, top_rel_vals)
+                    )
+                    message += f" Top relations: {pairs}."
+            self.config.log(message)
 
     def _compute_batch_gradient_norm(self):
         total = 0.0
@@ -1320,9 +1419,14 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._current_partition_id is None
             or self._partition_grad_samples <= 0
         ):
-            return
+            return None
         grad_sum = self._partition_grad_sum
         count = self._partition_grad_samples
+        summary = {
+            "grad_sum": grad_sum,
+            "grad_count": count,
+            "grad_avg": grad_sum / max(1, count),
+        }
         self.work_scheduler_client.register_partition_gradient(
             self._current_partition_id, grad_sum, count
         )
@@ -1332,10 +1436,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
                 rel_sums = self._relation_grad_sum[mask]
                 rel_counts = self._relation_grad_count[mask]
+                summary["relation_grad_count"] = int(rel_ids.numel())
                 self.work_scheduler_client.register_partition_relation_gradient(
                     self._current_partition_id, rel_ids, rel_sums, rel_counts
                 )
         self._reset_partition_gradient_trace()
+        self._last_partition_grad_summary = summary
+        return summary
 
     def _prefetch_glow_window_entities(self, work_entities: torch.Tensor):
         if (
@@ -1354,15 +1461,18 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             window_key = tuple(int(x) for x in self._current_window_members.tolist())
             if window_key == self._window_prefetch_key:
                 return
-        extras = self._current_window_entities.cpu()
+        extras = self._current_window_entities
+        if extras.device.type != "cpu":
+            extras = extras.cpu()
         if work_entities is not None and work_entities.numel() > 0:
+            work_cpu = work_entities
+            if work_cpu.device.type != "cpu":
+                work_cpu = work_cpu.cpu()
             try:
-                extras_np = np.setdiff1d(
-                    extras.numpy(), work_entities.cpu().numpy(), assume_unique=False
-                )
-                extras = torch.from_numpy(extras_np)
+                mask = ~torch.isin(extras, work_cpu)
+                extras = extras[mask]
             except Exception:
-                work_set = set(work_entities.cpu().tolist())
+                work_set = set(work_cpu.tolist())
                 extras = torch.tensor(
                     [idx for idx in extras.tolist() if idx not in work_set],
                     dtype=extras.dtype,
@@ -1506,6 +1616,33 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
         trace_entry = None
         local_partition_counter = -1
+        epoch_start_time = time.time()
+        chunk_count = 0
+        total_sum_loss = 0.0
+        total_sum_penalty = 0.0
+        total_sum_penalties = defaultdict(lambda: 0.0)
+        total_examples = 0
+        total_batches = 0
+        total_expected_batches = 0
+        total_prepare_time = 0.0
+        total_forward_time = 0.0
+        total_backward_time = 0.0
+        total_optimizer_time = 0.0
+        total_unique_time = 0.0
+        total_pull_and_map_time = 0.0
+        total_entity_pull_time = 0.0
+        total_relation_pull_time = 0.0
+        total_pre_pull_time = 0.0
+        total_cpu_gpu_time = 0.0
+        total_ps_wait_time = 0.0
+        total_ps_set_time = 0.0
+        total_dataloader_time = 0.0
+        total_scheduler_time = 0.0
+        total_chunk_time = 0.0
+        total_embedding_mapping_time = 0.0
+        total_grad_sum = 0.0
+        total_grad_samples = 0
+        total_relation_grad_samples = 0
         profile_interval_batches = self.config.get("train.profile_interval_batches")
         profile_stats = defaultdict(float)
         profile_batch_counter = 0
@@ -1579,7 +1716,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             sum_loss = 0.0
             sum_penalty = 0.0
             sum_penalties = defaultdict(lambda: 0.0)
-            epoch_time = -time.time()
+            chunk_time = -time.time()
             prepare_time = 0.0
             forward_time = 0.0
             backward_time = 0.0
@@ -1633,6 +1770,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._notify_partition_start()
             self._reset_partition_gradient_trace()
             local_partition_counter += 1
+            chunk_index = local_partition_counter
             self.work_pre_localized = False
             partition_start_time = time.time()
             entity_pull_ids = work_entities
@@ -1818,10 +1956,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             num_prepulls = max(self.entity_pre_pull, self.relation_pre_pull, self.pre_localize_batch, 1)
             use_materialized_iter = self._use_materialized_iterator() and self._materialized_iterator is not None
             materialized_iter = iter(self._materialized_iterator) if use_materialized_iter else None
+            chunk_examples = 0
+            chunk_batches = 0
             while batch_index < len(self.dataloader_dataset):
                 exhausted = False
                 while len(pre_load_batches) < num_prepulls + 1:
-                    prepare_time -= time.time()
+                    prepare_start = time.time()
                     load_start = time.time()
                     dataloader_time -= load_start
                     if use_materialized_iter:
@@ -1835,6 +1975,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         if profile_interval_batches > 0 and next_batch is not None:
                             profile_stats["dataloader"] += load_end - load_start
                         if next_batch is None:
+                            prepare_time += time.time() - prepare_start
                             break
                         if not self._stage_local_ids:
                             next_batch = self._map_ids_to_local(next_batch)
@@ -1850,6 +1991,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         if profile_interval_batches > 0:
                             profile_stats["dataloader"] += load_end - load_start
                     if exhausted:
+                        prepare_time += time.time() - prepare_start
                         break
                     if next_batch is not None and "triple_ids" in next_batch:
                         if next_batch.get("_gpu_triples") is not None:
@@ -1868,7 +2010,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     if next_batch is not None:
                         self._prepare_batch_ahead(pre_load_batches, new_batch=next_batch)
                     pre_pull_time += time.time()
-                    prepare_time += time.time()
+                    prepare_time += time.time() - prepare_start
                 if exhausted and not pre_load_batches:
                     break
                 self._prepare_batch_ahead(pre_load_batches)
@@ -1902,6 +2044,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     batch_index, batch
                 )
                 sum_loss += batch_result.avg_loss * batch_result.size
+                chunk_examples += batch_result.size
 
                 # determine penalty terms (forward pass)
                 batch_forward_time = batch_result.forward_time - time.time()
@@ -2021,6 +2164,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 ps_wait_time += batch_result.ps_wait_time
 
                 batch_index += 1
+                chunk_batches += 1
 
                 if profile_interval_batches > 0:
                     profile_batch_counter += 1
@@ -2039,11 +2183,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     maybe_log_profile()
 
             # all done; now trace and log
-            epoch_time += time.time()
+            chunk_time += time.time()
             self.config.print("\033[2K\r", end="", flush=True)  # clear line and go back
 
             other_time = (
-                epoch_time
+                chunk_time
                 - prepare_time
                 - forward_time
                 - backward_time
@@ -2053,19 +2197,40 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
             if self.entity_sync_level == "partition":
                 ps_set_time -= time.time()
-                self.model.get_s_embedder().set_embeddings()
+                if self._skip_partition_set:
+                    if hasattr(self.optimizer, "flush_pending_pushes"):
+                        self.optimizer.flush_pending_pushes()
+                else:
+                    self.model.get_s_embedder().set_embeddings()
                 ps_set_time += time.time()
                 # this is expensive and unnecessary
                 # self.model.get_s_embedder().global_to_local_mapper[:] = -1
                 self.model.get_s_embedder().push_back()
             if self.relation_sync_level == "partition":
                 ps_set_time -= time.time()
-                self.model.get_p_embedder().set_embeddings()
+                if self._skip_partition_set:
+                    if hasattr(self.optimizer, "flush_pending_pushes"):
+                        self.optimizer.flush_pending_pushes()
+                else:
+                    self.model.get_p_embedder().set_embeddings()
                 ps_set_time += time.time()
                 # self.model.get_p_embedder().global_to_local_mapper[:] = -1
                 self.model.get_p_embedder().push_back()
             partition_duration = time.time() - partition_start_time
-            self._flush_partition_gradient_trace()
+            chunk_partition_id = self._current_partition_id
+            chunk_partition_version = self._current_partition_version
+            chunk_partition_size = self._current_partition_size
+            chunk_window_members_count = (
+                len(self._current_window_members)
+                if self._current_window_members is not None
+                else 0
+            )
+            chunk_window_entities_count = (
+                len(self._current_window_entities)
+                if self._current_window_entities is not None
+                else 0
+            )
+            chunk_grad_summary = self._flush_partition_gradient_trace()
             finished_context = self._notify_partition_end()
             status, replay_version = self.work_scheduler_client.register_partition_result(
                 partition_duration,
@@ -2079,17 +2244,38 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._current_partition_size = 0
             self.work_scheduler_client.work_done()
 
-            # add results to trace entry
-            self.current_trace["epoch"].update(
+            chunk_batches_total = (
+                len(self.loader)
+                if self.loader is not None
+                else self.dataloader_dataset.get_real_len()
+            )
+            chunk_loss_divisor = max(1, chunk_examples)
+            chunk_penalty_divisor = max(1, chunk_batches)
+            chunk_trace = dict(self.current_trace["epoch"])
+            chunk_embedding_mapping_time = (
+                self.model.get_s_embedder().mapping_time
+                + self.model.get_p_embedder().mapping_time
+            )
+            chunk_trace.update(
                 dict(
-                    avg_loss=sum_loss / self.num_examples,
-                    avg_penalty=sum_penalty / self.dataloader_dataset.get_real_len(),
+                    scope="chunk",
+                    event="chunk_completed",
+                    chunk_index=chunk_index,
+                    partition_id=chunk_partition_id,
+                    partition_version=chunk_partition_version,
+                    partition_size=chunk_partition_size,
+                    window_members_count=chunk_window_members_count,
+                    window_entities_count=chunk_window_entities_count,
+                    processed_examples=chunk_examples,
+                    processed_batches=chunk_batches,
+                    avg_loss=sum_loss / chunk_loss_divisor,
+                    avg_penalty=sum_penalty / chunk_penalty_divisor,
                     avg_penalties={
-                        k: p / self.dataloader_dataset.get_real_len() for k, p in sum_penalties.items()
+                        k: p / chunk_penalty_divisor for k, p in sum_penalties.items()
                     },
-                    avg_cost=sum_loss / self.num_examples
-                    + sum_penalty / self.dataloader_dataset.get_real_len(),
-                    epoch_time=epoch_time,
+                    avg_cost=sum_loss / chunk_loss_divisor
+                    + sum_penalty / chunk_penalty_divisor,
+                    chunk_time=chunk_time,
                     prepare_time=prepare_time,
                     ps_wait_time=ps_wait_time,
                     unique_time=unique_time,
@@ -2104,17 +2290,54 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     optimizer_time=optimizer_time,
                     scheduler_time=scheduler_time,
                     other_time=other_time,
-                    embedding_mapping_time=self.model.get_s_embedder().mapping_time
-                    + self.model.get_p_embedder().mapping_time,
-                    event="epoch_completed",
-                    batches=(
-                        len(self.loader)
-                        if self.loader is not None
-                        else self.dataloader_dataset.get_real_len()
-                    ),
+                    embedding_mapping_time=chunk_embedding_mapping_time,
+                    batches=chunk_batches_total,
                     dataloader_time=dataloader_time,
                 )
             )
+            if chunk_grad_summary:
+                chunk_trace.update(
+                    dict(
+                        grad_sum=chunk_grad_summary["grad_sum"],
+                        grad_samples=chunk_grad_summary["grad_count"],
+                        grad_avg=chunk_grad_summary["grad_avg"],
+                        relation_grad_samples=chunk_grad_summary.get(
+                            "relation_grad_count", 0
+                        ),
+                    )
+                )
+            trace_entry = self.trace(**chunk_trace, echo=False, log=True)
+
+            total_sum_loss += sum_loss
+            total_sum_penalty += sum_penalty
+            for k, p in sum_penalties.items():
+                total_sum_penalties[k] += p
+            total_examples += chunk_examples
+            total_batches += chunk_batches
+            total_expected_batches += chunk_batches_total
+            total_prepare_time += prepare_time
+            total_forward_time += forward_time
+            total_backward_time += backward_time
+            total_optimizer_time += optimizer_time
+            total_unique_time += unique_time
+            total_pull_and_map_time += pull_and_map_time
+            total_entity_pull_time += entity_pull_time
+            total_relation_pull_time += relation_pull_time
+            total_pre_pull_time += pre_pull_time
+            total_cpu_gpu_time += cpu_gpu_time
+            total_ps_wait_time += ps_wait_time
+            total_ps_set_time += ps_set_time
+            total_dataloader_time += dataloader_time
+            total_scheduler_time += scheduler_time
+            total_chunk_time += chunk_time
+            total_embedding_mapping_time += chunk_embedding_mapping_time
+            if chunk_grad_summary:
+                total_grad_sum += chunk_grad_summary["grad_sum"]
+                total_grad_samples += chunk_grad_summary["grad_count"]
+                total_relation_grad_samples += chunk_grad_summary.get(
+                    "relation_grad_count", 0
+                )
+            chunk_count += 1
             self.model.get_p_embedder().mapping_time = 0.0
             self.model.get_s_embedder().mapping_time = 0.0
 
@@ -2122,10 +2345,63 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             for f in self.post_epoch_hooks:
                 f(self)
 
-            # output the trace, then clear it
-            trace_entry = self.trace(
-                **self.current_trace["epoch"], echo=False, log=True
+        epoch_time = time.time() - epoch_start_time
+        epoch_loss_divisor = max(1, total_examples)
+        epoch_penalty_divisor = max(1, total_batches)
+        duplication_factor = (
+            (total_examples / self.num_examples) if self.num_examples > 0 else 0.0
+        )
+        self.current_trace["epoch"].update(
+            dict(
+                scope="epoch",
+                event="epoch_completed",
+                processed_examples=total_examples,
+                processed_batches=total_batches,
+                expected_batches=total_expected_batches,
+                chunk_count=chunk_count,
+                duplication_factor=duplication_factor,
+                avg_loss=total_sum_loss / epoch_loss_divisor,
+                avg_penalty=total_sum_penalty / epoch_penalty_divisor,
+                avg_penalties={
+                    k: p / epoch_penalty_divisor for k, p in total_sum_penalties.items()
+                },
+                avg_cost=total_sum_loss / epoch_loss_divisor
+                + total_sum_penalty / epoch_penalty_divisor,
+                epoch_time=epoch_time,
+                chunk_time=total_chunk_time,
+                prepare_time=total_prepare_time,
+                ps_wait_time=total_ps_wait_time,
+                unique_time=total_unique_time,
+                pull_and_map_time=total_pull_and_map_time,
+                pre_pull_time=total_pre_pull_time,
+                entity_pull_time=total_entity_pull_time,
+                relation_pull_time=total_relation_pull_time,
+                ps_set_time=total_ps_set_time,
+                cpu_gpu_time=total_cpu_gpu_time,
+                forward_time=total_forward_time,
+                backward_time=total_backward_time,
+                optimizer_time=total_optimizer_time,
+                scheduler_time=total_scheduler_time,
+                other_time=epoch_time
+                - total_prepare_time
+                - total_forward_time
+                - total_backward_time
+                - total_optimizer_time
+                - total_scheduler_time,
+                embedding_mapping_time=total_embedding_mapping_time,
+                batches=total_expected_batches,
+                dataloader_time=total_dataloader_time,
+                grad_sum=total_grad_sum,
+                grad_samples=total_grad_samples,
+                grad_avg=(
+                    total_grad_sum / max(1, total_grad_samples)
+                    if total_grad_samples > 0
+                    else 0.0
+                ),
+                relation_grad_samples=total_relation_grad_samples,
             )
+        )
+        trace_entry = self.trace(**self.current_trace["epoch"], echo=False, log=True)
         self.config.log(
             format_trace_entry("train_epoch", trace_entry, self.config), prefix="  "
         )
@@ -2260,12 +2536,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if status != 1:
             return
         if (
-            self.config.get("job.distributed.conflict_free_merge")
+            (
+                self.config.get("job.distributed.conflict_free_merge")
+                or self.config.get("job.distributed.causal_merge")
+            )
             and self.config.get("job.distributed.parameter_server") == "shared"
         ):
             self.config.log(
                 "Skipping replay for conflicting partition updates "
-                "because conflict_free_merge is enabled."
+                "because conflict_free_merge or causal_merge is enabled."
             )
             return
         partition_id = None

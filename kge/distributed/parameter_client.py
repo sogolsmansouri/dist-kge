@@ -25,7 +25,14 @@ class KgeParameterClient:
         optimizer_dim = get_optimizer_dim(config, embedding_dim)
         self.dim = embedding_dim + optimizer_dim
         self.num_meta_keys: int = get_num_meta_keys(config)
-        self.worker_group, self.eval_worker_group = initialize_worker_groups(config, self.rank)
+        self._single_process = bool(config.get("job.distributed.single_process"))
+        if self._single_process:
+            self.worker_group = None
+            self.eval_worker_group = None
+        else:
+            self.worker_group, self.eval_worker_group = initialize_worker_groups(
+                config, self.rank
+            )
 
     def pull(self, keys, pull_tensor=None, asynchronous=False):
         raise NotImplementedError()
@@ -149,9 +156,13 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
         super(LapseParameterClient, self).localize(keys, asynchronous)
 
     def barrier(self):
+        if self.worker_group is None or not dist.is_initialized():
+            return
         dist.barrier(group=self.worker_group)
 
     def barrier_eval(self):
+        if self.eval_worker_group is None or not dist.is_initialized():
+            return
         dist.barrier(group=self.eval_worker_group)
 
     def wait(self, wait_value):
@@ -229,9 +240,13 @@ class TorchParameterClient(KgeParameterClient):
         pass
 
     def barrier(self):
+        if self.worker_group is None or not dist.is_initialized():
+            return
         dist.barrier(group=self.worker_group)
 
     def barrier_eval(self):
+        if self.eval_worker_group is None or not dist.is_initialized():
+            return
         dist.barrier(group=self.eval_worker_group)
 
     def stop(self):
@@ -293,6 +308,7 @@ class SharedParameterClient(KgeParameterClient):
         self._conflict_free_merge = bool(
             config.get("job.distributed.conflict_free_merge")
         )
+        self._causal_merge = bool(config.get("job.distributed.causal_merge"))
         self._partition_version_state = {}
         self.data_type = torch.float32
         self.lr_buffer = torch.zeros(1, dtype=torch.float32)
@@ -337,7 +353,7 @@ class SharedParameterClient(KgeParameterClient):
         asynchronous=False,
     ):
         if (
-            not self._conflict_free_merge
+            not (self._conflict_free_merge or self._causal_merge)
             or partition_id is None
             or partition_version is None
         ):
@@ -358,9 +374,13 @@ class SharedParameterClient(KgeParameterClient):
         pass
 
     def barrier(self):
+        if self.worker_group is None or not dist.is_initialized():
+            return
         dist.barrier(group=self.worker_group)
 
     def barrier_eval(self):
+        if self.eval_worker_group is None or not dist.is_initialized():
+            return
         dist.barrier(group=self.eval_worker_group)
 
     def stop(self):

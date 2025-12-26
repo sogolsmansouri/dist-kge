@@ -44,6 +44,7 @@ class DistAdagrad(Optimizer):
         min_rank=-1,
         max_pending_pushes=2,
         conflict_free_merge=False,
+        causal_merge=False,
     ):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -83,6 +84,7 @@ class DistAdagrad(Optimizer):
         }
         self.max_pending_pushes = max(1, int(max_pending_pushes))
         self.conflict_free_merge = bool(conflict_free_merge)
+        self.causal_merge = bool(causal_merge)
         self._partition_context = {
             "partition_id": None,
             "partition_version": None,
@@ -232,7 +234,7 @@ class DistAdagrad(Optimizer):
 
     def _push_with_context(self, keys, payload, asynchronous=False):
         if (
-            self.conflict_free_merge
+            (self.conflict_free_merge or self.causal_merge)
             and self._partition_context["partition_id"] is not None
             and self._partition_context["partition_version"] is not None
             and hasattr(self.parameter_client, "push_versioned")

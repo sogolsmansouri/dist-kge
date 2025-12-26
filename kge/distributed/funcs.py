@@ -8,10 +8,13 @@ from signal import signal, SIGINT
 from typing import Dict, Optional
 import threading
 from kge import Config, Dataset
+from kge.job import Job
 from kge.distributed.parameter_server import init_torch_server, init_lapse_scheduler
+from kge.distributed.parameter_client import KgeParameterClient
 from kge.distributed.worker_process import WorkerProcessPool
 from kge.distributed.work_scheduler import WorkScheduler
-from kge.distributed.misc import get_num_keys
+from kge.distributed.work_scheduler import LocalSchedulerClient
+from kge.distributed.misc import get_num_keys, get_optimizer_dim, get_min_rank
 
 import torch
 from torch import multiprocessing as mp
@@ -133,6 +136,9 @@ def create_and_run_distributed(
 ):
     config = update_config_for_distributed(config)
 
+    if _should_run_single_process(config):
+        return _run_single_process_distributed(config, dataset, checkpoint)
+
     os.environ["OMP_NUM_THREADS"] = str(
         config.get("job.distributed.num_threads_per_process")
     )
@@ -250,6 +256,87 @@ def create_and_run_distributed(
         monitor_process.terminate()
         monitor_process.join(timeout=1.0)
         if use_gpu:
+            gpu_monitor_process.terminate()
+            gpu_monitor_process.join(timeout=1.0)
+    return valid_trace
+
+
+def _should_run_single_process(config: Config) -> bool:
+    if not config.get("job.distributed.single_process"):
+        return False
+    try:
+        num_workers = int(config.get("job.distributed.num_workers"))
+    except (TypeError, ValueError):
+        return False
+    if num_workers != 1:
+        return False
+    try:
+        num_machines = int(config.get("job.distributed.num_machines"))
+    except (TypeError, ValueError):
+        return False
+    if num_machines != 1:
+        return False
+    if str(config.get("job.distributed.parameter_server")) != "shared":
+        return False
+    return True
+
+
+def _run_single_process_distributed(
+    config: Config, dataset: Optional[Dataset], checkpoint: Optional[Dict]
+):
+    if dataset is None:
+        raise ValueError("Dataset must be provided for single-process mode.")
+    job_device = str(config.get("job.device"))
+    use_gpu = job_device.startswith("cuda")
+    if config.get("job.type") == "train":
+        monitor_process = mp.Process(
+            target=monitor_hardware, args=(config.folder, 0.5), daemon=True
+        )
+        monitor_process.start()
+        gpu_monitor_process = None
+        if use_gpu:
+            gpu_monitor_process = mp.Process(
+                target=monitor_gpus, args=(config.folder, 1), daemon=True
+            )
+            gpu_monitor_process.start()
+    num_keys = get_num_keys(config, dataset)
+    embedding_dim = config.get("lookup_embedder.dim")
+    optimizer_dim = get_optimizer_dim(config, embedding_dim)
+    parameters = torch.empty(
+        (num_keys, embedding_dim + optimizer_dim),
+        dtype=torch.float32,
+        requires_grad=False,
+    )
+    device_pool = list(config.get("job.device_pool") or [])
+    if device_pool:
+        config.set("job.device", device_pool[0])
+    parameter_client = KgeParameterClient.create(
+        config=config,
+        server_id=0,
+        client_id=get_min_rank(config),
+        server=parameters,
+        num_keys=num_keys,
+    )
+    scheduler_client = LocalSchedulerClient(config=config, dataset=dataset)
+    init_for_load_only = checkpoint is not None
+    job = Job.create(
+        config=config,
+        dataset=dataset,
+        parameter_client=parameter_client,
+        work_scheduler_client=scheduler_client,
+        init_for_load_only=init_for_load_only,
+    )
+    if checkpoint is not None:
+        job.load_distributed(checkpoint_name=checkpoint)
+    job.run()
+    if hasattr(job, "work_scheduler_client"):
+        job.work_scheduler_client.shutdown()
+    parameter_client.shutdown()
+    valid_trace = getattr(job, "valid_trace", None)
+    if config.get("job.type") == "train":
+        monitor_process.terminate()
+        monitor_process.join(timeout=1.0)
+        if use_gpu and gpu_monitor_process is not None:
             gpu_monitor_process.terminate()
             gpu_monitor_process.join(timeout=1.0)
     return valid_trace

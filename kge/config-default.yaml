@@ -46,6 +46,10 @@ job:
     num_eval_workers: 1
     num_machines: 1
     machine_id: 0
+    # run distributed training in a single process (single-GPU fast path)
+    single_process: False
+    # build unique entity/relation sets on GPU when possible
+    unique_on_gpu: False
     num_threads_per_process: 2  # omp threads per process
 
     # parameter server to use for multi-machine or multi-machine training
@@ -83,6 +87,7 @@ job:
     sample_on_gpu: False  # sample negatives on GPU when device-resident triples are available
     debug_id_bounds: False  # log/raise when triples/negatives exceed vocab bounds
     conflict_free_merge: False
+    causal_merge: False
     optimizer:
       max_pending_pushes: 2
     hot_entity_cache:
@@ -103,6 +108,8 @@ job:
       ema_decay: 0.5
     gradient_snapshot_interval: 0
     relation_gradient_trace: False
+    gradient_trace_log_interval: 0
+    gradient_trace_top_relations: 0
     graph_cut:
       cost_aware_schedule: False
       max_chunk_size: 0
@@ -138,6 +145,18 @@ job:
         reward_alpha: 0.3
         reward_scale: 0.001
         conflict_penalty: 0.5
+        queue_penalty_scale: 0.0
+        overlap_penalty: 0.0
+      gradient_clustering:
+        enable: False
+        top_relations: 32
+        max_partitions_per_relation: 4
+        affinity_alpha: 0.3
+        min_shared_relations: 1
+      causal_overlap:
+        enable: False
+        max_workers_per_partition: 2
+      force_pooled_negatives: False
       reshape:
         enable: False
         check_interval: 200

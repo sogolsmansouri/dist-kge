@@ -56,6 +56,7 @@ class WorkPackage:
     window_members = None
     window_entities = None
     wait = False
+    reuse_partition_version = False
 
 
 class WorkScheduler(mp.get_context("fork").Process):
@@ -355,13 +356,19 @@ class WorkScheduler(mp.get_context("fork").Process):
     ):
         if work_package.partition_data is not None:
             if work_package.partition_id is not None:
-                current_version = self.partition_issue_versions[
-                    work_package.partition_id
-                ]
-                work_package.partition_version = current_version
-                self.partition_issue_versions[work_package.partition_id] = (
-                    current_version + 1
-                )
+                if work_package.reuse_partition_version:
+                    if work_package.partition_version is None:
+                        work_package.partition_version = self.partition_issue_versions[
+                            work_package.partition_id
+                        ]
+                else:
+                    current_version = self.partition_issue_versions[
+                        work_package.partition_id
+                    ]
+                    work_package.partition_version = current_version
+                    self.partition_issue_versions[work_package.partition_id] = (
+                        current_version + 1
+                    )
             cmd_buffer[0] = SCHEDULER_CMDS.WORK
             cmd_buffer[1] = len(work_package.partition_data)
             dist.send(cmd_buffer, dst=rank)
@@ -1334,6 +1341,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.glow_overlap_sampling = bool(
             glow_cfg.get("overlap_negative_sampling", False)
         )
+        ns_sampling_type = config.get("negative_sampling.sampling_type")
+        entity_sync_level = config.get("job.distributed.entity_sync_level")
+        self._send_window_entities = bool(
+            glow_cfg.get("prefetch_window_entities", False)
+            or self.glow_overlap_sampling
+            or (ns_sampling_type == "pooled" and entity_sync_level != "partition")
+        )
         self.glow_affinity_alpha = float(glow_cfg.get("affinity_alpha", 0.3))
         self.glow_affinity_alpha = min(0.999, max(0.0, self.glow_affinity_alpha))
         bandit_cfg = glow_cfg.get("bandit") or {}
@@ -1342,12 +1356,44 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.glow_reward_alpha = min(0.999, max(0.0, self.glow_reward_alpha))
         self.glow_reward_scale = float(bandit_cfg.get("reward_scale", 1.0))
         self.glow_conflict_penalty = float(bandit_cfg.get("conflict_penalty", 0.0))
+        self.glow_queue_penalty_scale = float(
+            bandit_cfg.get("queue_penalty_scale", 0.0)
+        )
+        self.glow_overlap_penalty = float(
+            bandit_cfg.get("overlap_penalty", 0.0)
+        )
         reshape_cfg = glow_cfg.get("reshape") or {}
         self.reshape_enabled = bool(reshape_cfg.get("enable", False))
         self.reshape_interval = max(1, int(reshape_cfg.get("check_interval", 200)))
         self.reshape_hot_splits = max(0, int(reshape_cfg.get("hot_splits", 1)))
         self.reshape_cold_merges = max(0, int(reshape_cfg.get("cold_merges", 1)))
         self.reshape_min_size = max(1, int(reshape_cfg.get("min_partition_size", 1024)))
+        gradient_cfg = glow_cfg.get("gradient_clustering") or {}
+        self._gradient_cluster_enabled = bool(gradient_cfg.get("enable", False))
+        self._gradient_cluster_top_relations = max(
+            1, int(gradient_cfg.get("top_relations", 32))
+        )
+        self._gradient_cluster_max_partitions_per_relation = max(
+            1, int(gradient_cfg.get("max_partitions_per_relation", 4))
+        )
+        self._gradient_cluster_affinity_alpha = float(
+            gradient_cfg.get("affinity_alpha", self.glow_affinity_alpha)
+        )
+        self._gradient_cluster_affinity_alpha = min(
+            0.999, max(0.0, self._gradient_cluster_affinity_alpha)
+        )
+        self._gradient_cluster_min_shared = max(
+            1, int(gradient_cfg.get("min_shared_relations", 1))
+        )
+        overlap_cfg = glow_cfg.get("causal_overlap") or {}
+        self._causal_overlap_enabled = bool(overlap_cfg.get("enable", False))
+        self._causal_overlap_max_workers = max(
+            1, int(overlap_cfg.get("max_workers_per_partition", 1))
+        )
+        if self._causal_overlap_enabled:
+            self._causal_overlap_max_workers = min(
+                self._causal_overlap_max_workers, max(1, self.num_clients)
+            )
         self._glow_windows: deque = deque()
         self._current_window_entry = None
         self._max_window_entities = 0
@@ -1363,6 +1409,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._reshape_counter = 0
         self._co_gradient_scores = defaultdict(float)
         self._co_gradient_counts = defaultdict(int)
+        self._relation_to_partitions = defaultdict(dict)
+        self._partition_relation_topk = {}
+        self._causal_overlap_queue = deque()
+        self._causal_overlap_versions = {}
+        self._causal_overlap_active = defaultdict(int)
 
     def _init_in_started_process(self):
         super(GlowWorkScheduler, self)._init_in_started_process()
@@ -1477,12 +1528,23 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         ordered = self._order_by_gradient(list(self.work_to_do))
         self.work_to_do = deque(ordered)
         self._rebuild_glow_windows(ordered)
+        self._reset_overlap_state()
+
+    def _reset_overlap_state(self):
+        self._causal_overlap_queue.clear()
+        self._causal_overlap_versions.clear()
+        self._causal_overlap_active.clear()
 
     def _cluster_partitions_by_affinity(self, ordered_partitions):
         if not self._co_gradient_scores or len(ordered_partitions) < 2:
             return ordered_partitions
         remaining = set(ordered_partitions)
         sequence = []
+        min_shared = (
+            self._gradient_cluster_min_shared
+            if self._gradient_cluster_enabled
+            else 0
+        )
         while remaining:
             seed = None
             for pid in ordered_partitions:
@@ -1501,10 +1563,14 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 best_score = float("-inf")
                 for candidate in remaining:
                     total = 0.0
+                    used = 0
                     for member in window_group:
                         key = tuple(sorted((candidate, member)))
+                        if min_shared and self._co_gradient_counts.get(key, 0) < min_shared:
+                            continue
                         total += self._co_gradient_scores.get(key, 0.0)
-                    avg_score = total / len(window_group)
+                        used += 1
+                    avg_score = total / max(1, used)
                     if avg_score > best_score:
                         best_score = avg_score
                         best = candidate
@@ -1558,7 +1624,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
     def _init_partition_entity_map(self):
         # For stratification, the per-partition entity set is not derived directly
         # from entity_to_partitions; compute it from the actual triples.
-        if self._glow_base_partition_type == "stratification" or self._glow_stratified_partitions:
+        def compute_from_triples(reason):
             triples = self.dataset.split("train")
             mapping = {}
             max_entities = 0
@@ -1575,16 +1641,23 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             self._max_partition_entities = max_entities
             self.config.log(
                 f"Glow scheduler computed entity sets for {len(mapping)} partitions "
-                "from train triples."
+                f"from train triples ({reason})."
             )
+
+        if (
+            self._glow_base_partition_type == "stratification"
+            or self._glow_stratified_partitions
+        ):
+            compute_from_triples("stratification")
             return
         try:
             assignments = self.dataset.load_entities_to_partitions(self.num_partitions)
         except Exception as exc:
             self.config.log(
-                f"Glow scheduler: could not load entity partition map ({exc})."
+                f"Glow scheduler: could not load entity partition map ({exc}); "
+                "computing from train triples."
             )
-            self._partition_entities_map = None
+            compute_from_triples("fallback")
             return
         np_type = TORCH_TO_NP_DTYPE[self.data_type]
         mapping = {}
@@ -1720,6 +1793,14 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             reward = throughput * self.glow_reward_scale
         if kwargs.get("conflict"):
             reward -= self.glow_conflict_penalty
+        if self.glow_queue_penalty_scale > 0:
+            pending = len(self.work_to_do) if hasattr(self, "work_to_do") else 0
+            queue_ratio = pending / max(1, self.num_partitions)
+            reward -= self.glow_queue_penalty_scale * queue_ratio
+        if self.glow_overlap_penalty > 0 and self._causal_overlap_enabled:
+            active = self._causal_overlap_active.get(partition_id, 0)
+            if active > 1:
+                reward -= self.glow_overlap_penalty * (active - 1)
         prev = self._window_scores.get(window_key, 0.0)
         alpha = self.glow_reward_alpha
         self._window_scores[window_key] = (1.0 - alpha) * prev + alpha * reward
@@ -1780,6 +1861,78 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             prev = self._co_gradient_scores.get(pair, 0.0)
             self._co_gradient_scores[pair] = (1.0 - alpha) * prev + alpha * affinity
             self._co_gradient_counts[pair] = self._co_gradient_counts.get(pair, 0) + 1
+
+    def _register_partition_relation_gradient(
+        self, partition_id, relation_ids, grad_sums, grad_counts
+    ):
+        super(GlowWorkScheduler, self)._register_partition_relation_gradient(
+            partition_id, relation_ids, grad_sums, grad_counts
+        )
+        if not self._gradient_cluster_enabled or partition_id is None:
+            return
+        self._update_relation_affinity(
+            int(partition_id), relation_ids, grad_sums, grad_counts
+        )
+
+    def _update_relation_affinity(
+        self, partition_id: int, relation_ids, grad_sums, grad_counts
+    ):
+        if relation_ids is None:
+            return
+        rel_ids = relation_ids
+        rel_sums = grad_sums
+        rel_counts = grad_counts
+        if not isinstance(rel_ids, torch.Tensor):
+            rel_ids = torch.as_tensor(rel_ids, dtype=torch.long)
+        if not isinstance(rel_sums, torch.Tensor):
+            rel_sums = torch.as_tensor(rel_sums, dtype=torch.float32)
+        if not isinstance(rel_counts, torch.Tensor):
+            rel_counts = torch.as_tensor(rel_counts, dtype=torch.float32)
+        rel_ids = rel_ids.to(device="cpu")
+        rel_sums = rel_sums.to(device="cpu", dtype=torch.float32)
+        rel_counts = rel_counts.to(device="cpu", dtype=torch.float32)
+        if rel_ids.numel() == 0:
+            return
+        rel_counts = torch.clamp(rel_counts, min=1.0)
+        rel_avg = rel_sums / rel_counts
+        top_k = min(self._gradient_cluster_top_relations, rel_avg.numel())
+        vals, idx = torch.topk(rel_avg, k=top_k, largest=True)
+        top_rel_ids = rel_ids[idx].tolist()
+        top_rel_vals = vals.tolist()
+        previous = self._partition_relation_topk.get(partition_id)
+        if previous:
+            for rel in previous:
+                rel_map = self._relation_to_partitions.get(rel)
+                if rel_map is not None:
+                    rel_map.pop(partition_id, None)
+                    if not rel_map:
+                        self._relation_to_partitions.pop(rel, None)
+        self._partition_relation_topk[partition_id] = top_rel_ids
+        alpha = self._gradient_cluster_affinity_alpha
+        for rel_id, rel_val in zip(top_rel_ids, top_rel_vals):
+            rel_map = self._relation_to_partitions.setdefault(rel_id, {})
+            rel_map[partition_id] = rel_val
+            if (
+                len(rel_map) > self._gradient_cluster_max_partitions_per_relation
+            ):
+                drop = min(rel_map.items(), key=lambda item: item[1])
+                rel_map.pop(drop[0], None)
+            for other_pid, other_val in rel_map.items():
+                if other_pid == partition_id:
+                    continue
+                denom = rel_val + other_val
+                if denom <= 0:
+                    affinity = 0.0
+                else:
+                    affinity = 1.0 - abs(rel_val - other_val) / denom
+                pair = tuple(sorted((partition_id, other_pid)))
+                prev = self._co_gradient_scores.get(pair, 0.0)
+                self._co_gradient_scores[pair] = (
+                    (1.0 - alpha) * prev + alpha * affinity
+                )
+                self._co_gradient_counts[pair] = (
+                    self._co_gradient_counts.get(pair, 0) + 1
+                )
 
     def _get_window_entities(self, window_key):
         if (
@@ -1903,46 +2056,96 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._partition_entities_map[partition_id] = entities.cpu().long()
 
     def _next_work(self, rank, machine_id) -> WorkPackage:
-        try:
+        def build_work(partition_id, reuse_version=False, version=None):
+            partition_tensor = self.partitions[partition_id]
+            if partition_tensor is None or len(partition_tensor) == 0:
+                return None
+            partition_slice = self._adaptive_maybe_slice(
+                partition_id, partition_tensor
+            )
+            if partition_slice is None or len(partition_slice) == 0:
+                return None
             work_package = WorkPackage()
+            work_package.partition_id = partition_id
+            work_package.partition_data = partition_slice
+            work_package.reuse_partition_version = reuse_version
+            if reuse_version and version is not None:
+                work_package.partition_version = version
+            entities = None
+            if self._partition_entities_map is not None:
+                entities = self._partition_entities_map.get(partition_id)
+            if entities is None:
+                entities = self.local_entities.get(rank)
+            work_package.entities_in_partition = entities
+            if (
+                self.config.get("job.distributed.relation_sync_level")
+                == "partition"
+            ):
+                work_package.relations_in_partition = self._get_partition_relations(
+                    partition_id
+                )
+            window_key = self._partition_to_window.get(partition_id)
+            if window_key is not None:
+                work_package.window_members = list(window_key)
+                if self._send_window_entities:
+                    window_entities = self._get_window_entities(window_key)
+                    if window_entities is not None:
+                        work_package.window_entities = window_entities
+            return work_package
+
+        try:
             while True:
+                if self._causal_overlap_enabled and self._causal_overlap_queue:
+                    partition_id = self._causal_overlap_queue.popleft()
+                    version = self._causal_overlap_versions.get(partition_id)
+                    if version is None:
+                        continue
+                    if (
+                        self._causal_overlap_active.get(partition_id, 0)
+                        >= self._causal_overlap_max_workers
+                    ):
+                        continue
+                    work_package = build_work(
+                        partition_id, reuse_version=True, version=version
+                    )
+                    if work_package is None:
+                        continue
+                    self._causal_overlap_active[partition_id] += 1
+                    return work_package
                 partition_id = self._pop_next_partition()
                 if partition_id is None:
                     return WorkPackage()
                 if partition_id < 0 or partition_id >= len(self.partitions):
                     continue
-                partition_tensor = self.partitions[partition_id]
-                if partition_tensor is None or len(partition_tensor) == 0:
+                work_package = build_work(partition_id)
+                if work_package is None:
                     continue
-                work_package.partition_id = partition_id
-                partition_slice = self._adaptive_maybe_slice(
-                    partition_id, partition_tensor
-                )
-                if partition_slice is None or len(partition_slice) == 0:
-                    continue
-                work_package.partition_data = partition_slice
-                entities = None
-                if self._partition_entities_map is not None:
-                    entities = self._partition_entities_map.get(partition_id)
-                if entities is None:
-                    entities = self.local_entities.get(rank)
-                work_package.entities_in_partition = entities
                 if (
-                    self.config.get("job.distributed.relation_sync_level")
-                    == "partition"
+                    self._causal_overlap_enabled
+                    and self._causal_overlap_max_workers > 1
+                    and partition_id not in self._causal_overlap_versions
                 ):
-                    work_package.relations_in_partition = self._get_partition_relations(
-                        partition_id
+                    self._causal_overlap_versions[partition_id] = (
+                        self.partition_issue_versions[partition_id]
                     )
-                window_key = self._partition_to_window.get(partition_id)
-                if window_key is not None:
-                    work_package.window_members = list(window_key)
-                    window_entities = self._get_window_entities(window_key)
-                    if window_entities is not None:
-                        work_package.window_entities = window_entities
+                    for _ in range(self._causal_overlap_max_workers - 1):
+                        self._causal_overlap_queue.append(partition_id)
+                if self._causal_overlap_enabled:
+                    self._causal_overlap_active[partition_id] += 1
                 return work_package
         except IndexError:
             return WorkPackage()
+
+    def _handle_work_done(self, rank):
+        if self._causal_overlap_enabled:
+            partition_id = self.active_partition_per_worker.get(rank)
+            if partition_id is not None:
+                current = self._causal_overlap_active.get(partition_id, 0)
+                if current <= 1:
+                    self._causal_overlap_active.pop(partition_id, None)
+                else:
+                    self._causal_overlap_active[partition_id] = current - 1
+        super(GlowWorkScheduler, self)._handle_work_done(rank)
 
 class StratificationWorkScheduler(AdaptiveWorkScheduler):
 
@@ -2706,3 +2909,232 @@ class SchedulerClient:
         dist.send(relation_ids, dst=self.scheduler_rank)
         dist.send(grad_counts, dst=self.scheduler_rank)
         dist.send(grad_sums, dst=self.scheduler_rank)
+
+
+class LocalSchedulerClient:
+    """Single-process scheduler client that bypasses torch.distributed."""
+
+    def __init__(self, config, dataset):
+        self.scheduler = WorkScheduler.create(config=config, dataset=dataset)
+        self.scheduler._init_in_started_process()
+        self.rank = get_min_rank(config)
+        self.machine_id = config.get("job.distributed.machine_id")
+        if config.get("job.distributed.scheduler_data_type") not in [
+            "int",
+            "int32",
+            "int64",
+            "long",
+        ]:
+            raise ValueError(
+                "Only long and int is supported as dtype for the scheduler communication"
+            )
+        self.data_type = getattr(torch, config.get("job.distributed.scheduler_data_type"))
+        try:
+            prefetch = int(config.get("job.distributed.scheduler_prefetch"))
+        except KeyError:
+            prefetch = 1
+        self.prefetch_per_request = max(1, prefetch)
+        self._prefetched_work = deque()
+        self._epoch_start = None
+        self._epoch_seen_partitions = set()
+        try:
+            self._skip_duplicate_partitions = bool(
+                config.get("job.distributed.skip_duplicate_partitions")
+            )
+        except KeyError:
+            self._skip_duplicate_partitions = True
+        overlap_cfg = (config.get("job.distributed.glow") or {}).get(
+            "causal_overlap"
+        ) or {}
+        self._causal_overlap_enabled = bool(overlap_cfg.get("enable", False))
+        if self._causal_overlap_enabled:
+            self._skip_duplicate_partitions = False
+
+    def _prepare_work(self, work_package, pre_localize=False):
+        if work_package is None or work_package.partition_data is None:
+            return None, None, None, None, None, None, None
+        if work_package.partition_id is not None:
+            if work_package.reuse_partition_version:
+                if work_package.partition_version is None:
+                    work_package.partition_version = (
+                        self.scheduler.partition_issue_versions[
+                            work_package.partition_id
+                        ]
+                    )
+            else:
+                current_version = self.scheduler.partition_issue_versions[
+                    work_package.partition_id
+                ]
+                work_package.partition_version = current_version
+                self.scheduler.partition_issue_versions[work_package.partition_id] = (
+                    current_version + 1
+                )
+        if not pre_localize:
+            self.scheduler.active_partition_per_worker[self.rank] = (
+                work_package.partition_id
+            )
+            self.scheduler.active_partition_versions[self.rank] = (
+                work_package.partition_version
+            )
+            self.scheduler.active_partition_chunk_sizes[self.rank] = len(
+                work_package.partition_data
+            )
+            if hasattr(self.scheduler, "previous_partition_per_worker"):
+                self.scheduler.previous_partition_per_worker[self.rank] = (
+                    work_package.partition_id
+                )
+        window_members = work_package.window_members
+        if window_members is not None and not isinstance(window_members, torch.Tensor):
+            window_members = torch.as_tensor(window_members, dtype=self.data_type)
+        window_entities = work_package.window_entities
+        if window_entities is not None and not isinstance(window_entities, torch.Tensor):
+            window_entities = torch.as_tensor(window_entities, dtype=self.data_type)
+        return (
+            work_package.partition_data,
+            work_package.entities_in_partition,
+            work_package.relations_in_partition,
+            work_package.partition_id,
+            work_package.partition_version,
+            window_members,
+            window_entities,
+        )
+
+    def _request_single_work(self):
+        if self._epoch_start is None:
+            self._epoch_start = time.time()
+        while True:
+            work_package = self.scheduler._next_work(self.rank, self.machine_id)
+            if work_package is None:
+                return None, None, None, None, None, None, None
+            if work_package.wait:
+                if self.scheduler.wait_time > 0:
+                    time.sleep(self.scheduler.wait_time)
+                continue
+            if work_package.partition_data is None:
+                if self._epoch_start is not None:
+                    elapsed = time.time() - self._epoch_start
+                    self.scheduler.config.log(f"complete_epoch_time: {elapsed}")
+                    self._epoch_start = None
+                self.scheduler.num_processed_partitions = 0
+                self.scheduler._refill_work()
+                self.scheduler._on_epoch_completed()
+                self._epoch_seen_partitions.clear()
+                return None, None, None, None, None, None, None
+            return self._prepare_work(work_package, pre_localize=False)
+
+    def _next_work(self):
+        if self.prefetch_per_request <= 1:
+            return self._request_single_work()
+        if not self._prefetched_work:
+            self._fill_prefetch_queue()
+        if self._prefetched_work:
+            return self._prefetched_work.popleft()
+        return None, None, None, None, None, None, None
+
+    def _fill_prefetch_queue(self):
+        target = self.prefetch_per_request
+        while len(self._prefetched_work) < target:
+            work = self._request_single_work()
+            if work[0] is None:
+                break
+            self._prefetched_work.append(work)
+
+    def get_work(self):
+        if (
+            not self._skip_duplicate_partitions
+            or getattr(self.scheduler, "_adaptive_enabled", False)
+        ):
+            return self._next_work()
+        max_attempts = max(8, self.scheduler.num_partitions * 2)
+        attempts = 0
+        while True:
+            work = self._next_work()
+            if work[0] is None:
+                return work
+            partition_id = work[3]
+            if partition_id is None:
+                return work
+            partition_id = int(partition_id)
+            if partition_id in self._epoch_seen_partitions:
+                attempts += 1
+                if attempts >= max_attempts:
+                    return work
+                continue
+            self._epoch_seen_partitions.add(partition_id)
+            return work
+
+    def get_pre_localize_work(self):
+        try:
+            work_package = self.scheduler._handle_pre_localize_work(
+                rank=self.rank, machine_id=self.machine_id
+            )
+        except ValueError:
+            return None, None, None, None, None, True
+        work = self._prepare_work(work_package, pre_localize=True)
+        if work[0] is None:
+            return None, None, None, None, None, False
+        return (
+            work[0],
+            work[1],
+            work[2],
+            work[3],
+            work[4],
+            False,
+        )
+
+    def get_init_info(self):
+        return self.scheduler._get_max_entities(), self.scheduler._get_max_relations()
+
+    def get_init_work(self, entity_embedder_size):
+        if self.scheduler.init_up_to_entity == -1:
+            self.scheduler.config.log("initialize parameter server")
+        self.scheduler.init_up_to_entity += 1
+        if self.scheduler.init_up_to_entity >= self.scheduler.dataset.num_entities():
+            return None
+        start = self.scheduler.init_up_to_entity
+        end = min(
+            self.scheduler.dataset.num_entities(),
+            self.scheduler.init_up_to_entity + entity_embedder_size,
+        )
+        if end == self.scheduler.dataset.num_entities():
+            self.scheduler.config.log("parameter server initialized")
+        self.scheduler.init_up_to_entity += entity_embedder_size
+        return torch.arange(start, end, dtype=self.data_type)
+
+    def get_local_entities(self):
+        entities = self.scheduler.local_entities.get(self.rank)
+        if entities is None:
+            return None
+        return entities.long()
+
+    def work_done(self):
+        self.scheduler._handle_work_done(self.rank)
+
+    def shutdown(self):
+        self.scheduler._on_scheduler_shutdown()
+
+    def register_partition_result(self, step_time, partition_version=None, chunk_size=0):
+        return self.scheduler._register_partition_result(
+            self.rank,
+            float(step_time),
+            reported_version=partition_version,
+            reported_chunk_size=chunk_size,
+        )
+
+    def register_partition_gradient(self, partition_id, grad_sum, sample_count):
+        self.scheduler._register_partition_gradient(
+            partition_id, float(grad_sum), int(sample_count)
+        )
+
+    def register_partition_relation_gradient(
+        self, partition_id, relation_ids, grad_sums, grad_counts
+    ):
+        self.scheduler._register_partition_relation_gradient(
+            partition_id, relation_ids, grad_sums, grad_counts
+        )
+
+    def register_eval_result(self, hist: dict, hist_filt: dict, hist_filt_test: dict):
+        self._eval_hists = [hist, hist_filt, hist_filt_test]
+
+    def get_eval_result(self, hist: dict, hist_filt: dict, hist_filt_test: dict):
+        return hist, hist_filt, hist_filt_test

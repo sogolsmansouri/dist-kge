@@ -1,6 +1,5 @@
 import warnings
 from kge import Config, Configurable, Dataset
-from kge.indexing import where_in
 
 import random
 import torch
@@ -191,12 +190,30 @@ class KgeSampler(Configurable):
         )
         cols = [[P, O], [S, O], [S, P]][slot]
         pairs = positive_triples[:, cols]
+        if pairs.device.type != "cpu":
+            pairs = pairs.cpu()
+        target_device = negative_samples.device
         for i in range(positive_triples.size(0)):
-            positives = index.get((pairs[i][0].item(), pairs[i][1].item())).numpy()
+            positives = index.get((pairs[i][0].item(), pairs[i][1].item()))
+            if isinstance(positives, list):
+                if not positives:
+                    continue
+                positives = torch.tensor(positives, device=target_device)
+            else:
+                if positives.numel() == 0:
+                    continue
+                if positives.device != target_device:
+                    positives = positives.to(target_device)
+            if positives.dtype != torch.long:
+                positives = positives.long()
+            row = negative_samples[i]
             # indices of samples that have to be sampled again
-            resample_idx = where_in(negative_samples[i].numpy(), positives)
+            resample_mask = torch.isin(row, positives)
+            if not resample_mask.any():
+                continue
+            resample_idx = resample_mask.nonzero(as_tuple=False).view(-1)
             # number of new samples needed
-            num_new = len(resample_idx)
+            num_new = resample_idx.numel()
             # number already found of the new samples needed
             num_found = 0
             num_remaining = num_new - num_found
@@ -204,14 +221,18 @@ class KgeSampler(Configurable):
                 new_samples = self._sample(
                     positive_triples[i, None], slot, num_remaining
                 ).view(-1)
+                if new_samples.device != target_device:
+                    new_samples = new_samples.to(target_device)
+                if new_samples.dtype != positives.dtype:
+                    new_samples = new_samples.to(positives.dtype)
                 # indices of the true negatives
-                tn_idx = where_in(new_samples.numpy(), positives, not_in=True)
+                tn_mask = ~torch.isin(new_samples, positives)
                 # write the true negatives found
-                if len(tn_idx):
-                    negative_samples[
-                        i, resample_idx[num_found : num_found + len(tn_idx)]
-                    ] = new_samples[tn_idx]
-                    num_found += len(tn_idx)
+                if tn_mask.any():
+                    tn = new_samples[tn_mask]
+                    take = min(tn.numel(), num_remaining)
+                    row[resample_idx[num_found : num_found + take]] = tn[:take]
+                    num_found += take
                     num_remaining = num_new - num_found
         return negative_samples
 
@@ -1013,7 +1034,7 @@ class KgeUniformSampler(KgeSampler):
             )
 
         positives = positive_triples[:, slot].to("cpu").long()
-        drop_index = self._create_shared_drop_index(
+        drop_index = KgeUniformSampler._create_shared_drop_index(
             positives, unique_samples.long(), num_unique
         )
 
@@ -1054,57 +1075,7 @@ class KgeUniformSampler(KgeSampler):
     def _filter_and_resample_fast(
         self, negative_samples: torch.Tensor, slot: int, positive_triples: torch.Tensor
     ):
-        pair_str = ["po", "so", "sp"][slot]
-        # holding the positive indices for the respective pair
-        index = self.dataset.index(
-            f"{self.filtering_split}_{pair_str}_to_{SLOT_STR[slot]}"
-        )
-        cols = [[P, O], [S, O], [S, P]][slot]
-        pairs = positive_triples[:, cols].numpy().astype(np.int32)
-        batch_size = positive_triples.size(0)
-        voc_size = self.vocabulary_size[slot]
-        # filling a numba-dict here and then call the function was faster than 1. Using
-        # numba lists 2. Using a python list and convert it to an np.array and use
-        # offsets 3. Growing a np.array with np.append 4. leaving the loop in python and
-        # calling a numba function within the loop
-        positives_index = numba.typed.Dict()
-        for i in range(batch_size):
-            pair = (pairs[i][0], pairs[i][1])
-            positives_index[pair] = index.get(pair).numpy()
-        negative_samples = negative_samples.numpy()
-        KgeUniformSampler._filter_and_resample_numba(
-            negative_samples, pairs, positives_index, batch_size, int(voc_size),
-        )
-        return torch.tensor(negative_samples, dtype=torch.int64)
-
-    @numba.njit
-    def _filter_and_resample_numba(
-        negative_samples, pairs, positives_index, batch_size, voc_size
-    ):
-        for i in range(batch_size):
-            positives = positives_index[(pairs[i][0], pairs[i][1])]
-            # inlining the where_in function here results in an internal numba
-            # error which asks to file a bug report
-            resample_idx = where_in(negative_samples[i], positives)
-            # number of new samples needed
-            num_new = len(resample_idx)
-            # number already found of the new samples needed
-            num_found = 0
-            num_remaining = num_new - num_found
-            while num_remaining:
-                new_samples = np.random.randint(0, voc_size, num_remaining)
-                idx = where_in(new_samples, positives, not_in=True)
-                # write the true negatives found
-                if len(idx):
-                    ctr = 0
-                    # numba does not support advanced indexing but the loop
-                    # is optimized so it's faster than numpy anyway
-                    for j in resample_idx[num_found : num_found + len(idx)]:
-                        negative_samples[i, j] = new_samples[ctr]
-                        ctr += 1
-                    num_found += len(idx)
-                    num_remaining = num_new - num_found
-
+        return super()._filter_and_resample(negative_samples, slot, positive_triples)
 
 class KgeFrequencySampler(KgeSampler):
     """
@@ -1118,23 +1089,20 @@ class KgeFrequencySampler(KgeSampler):
         self._multinomials = []
         alpha = self.get_option("frequency.smoothing")
         for slot in SLOTS:
-            smoothed_counts = (
-                np.bincount(
-                    dataset.split(config.get("train.split"))[:, slot],
-                    minlength=self.vocabulary_size[slot].item(),
-                )
-                + alpha
-            )
+            counts = torch.bincount(
+                dataset.split(config.get("train.split"))[:, slot].long(),
+                minlength=self.vocabulary_size[slot].item(),
+            ).float()
+            smoothed_counts = counts + float(alpha)
+            probs = smoothed_counts / smoothed_counts.sum()
             if self.with_replacement:
                 self._multinomials.append(
                     torch._multinomial_alias_setup(
-                        torch.from_numpy(smoothed_counts / np.sum(smoothed_counts))
+                        probs
                     )
                 )
             else:
-                self._multinomials.append(
-                    torch.from_numpy(smoothed_counts / np.sum(smoothed_counts))
-                )
+                self._multinomials.append(probs)
 
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
         if num_samples is None:
@@ -1188,16 +1156,11 @@ class KgeFrequencySampler(KgeSampler):
         # example, drop that positive. For all other rows, drop a random position. Here
         # we start with random drop position for each row and then update the ones that
         # contain its positive in the negative samples
-        positives = positive_triples[:, slot].numpy()
-        drop_index = np.random.choice(num_samples + 1, batch_size, replace=True)
-        # TODO can we do the following quicker?
-        unique_samples_index = {s: j for j, s in enumerate(unique_samples.tolist())}
-        for i, v in [
-            (i, unique_samples_index.get(positives[i]))
-            for i in range(batch_size)
-            if positives[i] in unique_samples_index
-        ]:
-            drop_index[i] = v
+        positives = positive_triples[:, slot].long()
+        num_unique = unique_samples.numel()
+        drop_index = self._create_shared_drop_index(
+            positives, unique_samples.long(), num_unique
+        )
 
         # now we are done for default
         return DefaultSharedNegativeSample(
@@ -1206,8 +1169,8 @@ class KgeFrequencySampler(KgeSampler):
             positive_triples,
             slot,
             num_samples,
-            torch.tensor(unique_samples, dtype=torch.long),
-            torch.tensor(drop_index),
+            unique_samples.long(),
+            drop_index,
             repeat_indexes,
         )
 
@@ -1222,20 +1185,31 @@ class KgeHierarchicalFrequencySampler(KgeSampler):
         super().__init__(config, configuration_key, dataset)
         self._multinomials = []
         self._h2_multinomials = []
+        self._h2_sorted_indices = []
+        self._h2_group_offsets = []
+        self._h2_group_counts = []
         alpha = self.get_option("frequency.smoothing")
         for slot in SLOTS:
-            self.smoothed_counts = (
-                    np.bincount(
-                        dataset.split(config.get("train.split"))[:, slot],
-                        minlength=self.vocabulary_size[slot].item(),
-                    )
-                    + alpha
+            counts = torch.bincount(
+                dataset.split(config.get("train.split"))[:, slot].long(),
+                minlength=self.vocabulary_size[slot].item(),
+            ).float()
+            smoothed_counts = counts + float(alpha)
+            sorted_counts, sorted_indices = torch.sort(smoothed_counts)
+            h2_unique_counts, h2_counts_counts = torch.unique_consecutive(
+                sorted_counts, return_counts=True
             )
-            self.h2_unique_counts, h2_counts_counts= np.unique(self.smoothed_counts, return_counts=True)
+            h2_group_offsets = torch.cumsum(h2_counts_counts, dim=0) - h2_counts_counts
+            self._h2_sorted_indices.append(sorted_indices)
+            self._h2_group_offsets.append(h2_group_offsets)
+            self._h2_group_counts.append(h2_counts_counts)
             if self.with_replacement:
-                raise NotImplementedError("with replacement sampling not yet supported with hierarchical frequency sampling")
+                raise NotImplementedError(
+                    "with replacement sampling not yet supported with hierarchical frequency sampling"
+                )
             else:
-                self._h2_multinomials.append(torch.from_numpy(h2_counts_counts / np.sum(h2_counts_counts)))
+                probs = h2_counts_counts.float() / h2_counts_counts.sum()
+                self._h2_multinomials.append(probs)
 
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
         if num_samples is None:
@@ -1249,27 +1223,18 @@ class KgeHierarchicalFrequencySampler(KgeSampler):
             else:
                 result_1 = torch.multinomial(
                     self._h2_multinomials[slot],
-                    #self.h2_unique_counts,
                     positive_triples.size(0) * num_samples,
-                    #replacement=False,
-                    replacement=True,  # todo: here we need to sample with replacement, in the next hierarchy replacement should be taken into account...
-                    ).view(positive_triples.size(0), num_samples)
-                result = self._sample_second_hierarchy(self.h2_unique_counts, self.smoothed_counts, result_1.view(-1).numpy())
-                result = torch.from_numpy(result)
+                    replacement=True,
+                ).view(positive_triples.size(0), num_samples)
+                flat_groups = result_1.view(-1)
+                group_counts = self._h2_group_counts[slot][flat_groups]
+                group_offsets = self._h2_group_offsets[slot][flat_groups]
+                rand = torch.rand(group_counts.numel()) * group_counts.float()
+                within = rand.to(torch.long)
+                flat_result = self._h2_sorted_indices[slot][group_offsets + within]
+                result = flat_result.view(positive_triples.size(0), num_samples)
 
         return result
-
-    @staticmethod
-    @numba.njit
-    def _sample_second_hierarchy(h2_unique_counts, smoothed_counts, result_1):
-        return_vector = np.empty(int(len(result_1)), dtype=np.int64)
-        for i, sample_index in enumerate(result_1):
-            unique_count = h2_unique_counts[sample_index]
-            mask = smoothed_counts == unique_count
-            index = np.flatnonzero(mask)
-            s = np.random.randint(0, len(index))
-            return_vector[i] = index[s]
-        return return_vector
 
     def _sample_shared(
             self, positive_triples: torch.Tensor, slot: int, num_samples: int
@@ -1567,18 +1532,11 @@ class KgePooledSampler(KgeSampler):
             # Simple way to get a sample from the distribution of number of distinct
             # values in the negative sample (for "default" type: WR sampling except the
             # positive, hence the - 1)
-            num_unique = len(
-                np.unique(
-                    np.random.choice(
-                        pool_size
-                        # if self.shared_type == "naive"
-                        # else self.vocabulary_size[slot] - 1,
-                        ,
-                        num_samples,
-                        replace=True,
-                    )
-                )
-            )
+            if pool_size > 0 and num_samples > 0:
+                draws = torch.randint(pool_size, (num_samples,), dtype=torch.long)
+                num_unique = int(torch.unique(draws, sorted=False).numel())
+            else:
+                num_unique = 0
         else:  # WOR -> all samples distinct
             num_unique = num_samples
 
@@ -1603,33 +1561,23 @@ class KgePooledSampler(KgeSampler):
 
         # set pool size to ensure it does not fail in P-slot
         pool_size = max(1, pool_size)
-        if not num_unique + 1 > pool_size:
-            unique_samples = self.sample_pools[slot][torch.tensor(
-                random.sample(
-                    range(pool_size),
-                    num_unique if self.shared_type == "naive" else num_unique + 1,
-                ),
+        sample_count = num_unique if self.shared_type == "naive" else num_unique + 1
+        if sample_count <= pool_size:
+            sample_index = torch.tensor(
+                random.sample(range(pool_size), sample_count),
                 dtype=torch.long,
-            )]
+            )
         else:
-            unique_samples = self.sample_pools[slot][torch.tensor(
-                np.random.randint(
-                    0,
-                    pool_size,
-                    [
-                        num_unique
-                        if self.shared_type == "naive"
-                        else num_unique + 1,
-                    ],
-                ),
-                dtype=torch.long,
-            )]
+            sample_index = torch.randint(
+                0, pool_size, (sample_count,), dtype=torch.long
+            )
+        unique_samples = self.sample_pools[slot][sample_index]
 
         # For WR, we need to upsample. To do so, we compute the set of additional
         # (repeated) sample indexes.
         if num_unique != num_samples:  # only happens with WR
-            repeat_indexes = torch.tensor(
-                np.random.choice(num_unique, num_samples - num_unique, replace=True)
+            repeat_indexes = torch.randint(
+                0, num_unique, (num_samples - num_unique,), dtype=torch.long
             )
         else:
             repeat_indexes = torch.empty(0)  # WOR or WR when all samples unique
@@ -1651,18 +1599,10 @@ class KgePooledSampler(KgeSampler):
         # example, drop that positive. For all other rows, drop a random position. Here
         # we start with random drop position for each row and then update the ones that
         # contain its positive in the negative samples
-        positives = positive_triples[:, slot].numpy()
-        drop_index = np.random.choice(num_unique + 1, batch_size, replace=True)
-        # convert back to python list, so that dictionary creation is faster
-        unique_samples_list = unique_samples.tolist()
-        # TODO can we do the following quicker?
-        unique_samples_index = {s: j for j, s in enumerate(unique_samples_list)}
-        for i, v in [
-            (i, unique_samples_index.get(positives[i]))
-            for i in range(batch_size)
-            if positives[i] in unique_samples_index
-        ]:
-            drop_index[i] = v
+        positives = positive_triples[:, slot].to("cpu").long()
+        drop_index = KgeUniformSampler._create_shared_drop_index(
+            positives, unique_samples.long(), unique_samples.numel()
+        )
 
         # now we are done for default
         return DefaultSharedNegativeSample(
@@ -1673,7 +1613,7 @@ class KgePooledSampler(KgeSampler):
             num_samples,
             unique_samples,
             # torch.tensor(unique_samples, dtype=torch.long),
-            torch.tensor(drop_index),
+            drop_index,
             repeat_indexes,
         )
 
