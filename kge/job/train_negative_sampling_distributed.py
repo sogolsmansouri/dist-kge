@@ -1386,7 +1386,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 continue
             has_grad = True
             grad = param.grad.detach()
-            total += grad.pow(2).sum().item()
+            if grad.is_sparse:
+                grad = grad.coalesce()
+                values = grad.values()
+                total += values.pow(2).sum().item()
+            elif grad.layout != torch.strided:
+                values = grad.values() if hasattr(grad, "values") else grad._values()
+                total += values.pow(2).sum().item()
+            else:
+                total += grad.pow(2).sum().item()
         if not has_grad:
             return 0.0
         return math.sqrt(total)
