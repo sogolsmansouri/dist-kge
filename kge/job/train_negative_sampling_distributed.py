@@ -989,6 +989,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             for idx, ns in enumerate(batch["negative_samples"]):
                 if ns.positive_triples.device.type != "cpu":
                     batch["negative_samples"][idx] = ns.to("cpu")
+        if batch["triples"].dtype != torch.long:
+            batch["triples"] = batch["triples"].to(dtype=torch.long)
         if self._debug_id_bounds:
             self._debug_validate_batch_ids(batch)
         # map ids to local ids
