@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 import datetime
 import argparse
+import getpass
 import os
+import shlex
+import socket
 import sys
 import traceback
 import yaml
@@ -35,6 +38,43 @@ def argparse_bool_type(v):
         return False
     else:
         raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+def _format_invocation():
+    env_name = os.environ.get("CONDA_DEFAULT_ENV")
+    if not env_name:
+        venv = os.environ.get("VIRTUAL_ENV")
+        if venv:
+            env_name = os.path.basename(venv)
+
+    prompt = ""
+    if env_name:
+        prompt = f"({env_name}) "
+    user = getpass.getuser()
+    host = socket.gethostname()
+    cwd = os.getcwd()
+    home = os.path.expanduser("~")
+    if cwd == home:
+        cwd = "~"
+    elif cwd.startswith(home + os.sep):
+        cwd = "~" + cwd[len(home):]
+    prompt += f"{user}@{host}:{cwd}$"
+
+    main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    if main_spec and main_spec.name == "kge":
+        program = [os.path.basename(sys.executable), "-m", "kge"]
+    else:
+        program = [os.path.basename(sys.argv[0]) or os.path.basename(sys.executable)]
+
+    env_prefix = []
+    for key in ("CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        if key in os.environ:
+            env_prefix.append(f"{key}={os.environ[key]}")
+
+    cmd = " ".join(
+        shlex.quote(part) for part in (env_prefix + program + sys.argv[1:])
+    )
+    return f"{prompt} {cmd}".strip()
 
 
 def process_meta_command(args, meta_command, fixed_args):
@@ -270,6 +310,11 @@ def main():
     try:
         if args.command == "start" and not config.init_folder():
             raise ValueError("output folder {} exists already".format(config.folder))
+        invocation = _format_invocation()
+        config.invocation = invocation
+        config.log(invocation, echo=False)
+        if getattr(args, "config", None):
+            config.log("Loading configuration {}...".format(args.config), echo=False)
         config.log("Using folder: {}".format(config.folder))
 
         # determine checkpoint to resume (if any)

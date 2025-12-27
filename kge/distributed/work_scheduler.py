@@ -2764,7 +2764,7 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
 
     def _handle_work_done(self, rank):
         super(StratificationWorkScheduler, self)._handle_work_done(rank)
-        del self.running_blocks[rank]
+        self.running_blocks.pop(rank, None)
 
     def _repartition_in_background(self):
         self.repartition_future = self.repartition_worker_pool.apply_async(

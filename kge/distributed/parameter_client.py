@@ -25,6 +25,8 @@ class KgeParameterClient:
         optimizer_dim = get_optimizer_dim(config, embedding_dim)
         self.dim = embedding_dim + optimizer_dim
         self.num_meta_keys: int = get_num_meta_keys(config)
+        self._pull_stats = {"calls": 0, "keys": 0, "bytes": 0}
+        self._push_stats = {"calls": 0, "keys": 0, "bytes": 0}
         self._single_process = bool(config.get("job.distributed.single_process"))
         if self._single_process:
             self.worker_group = None
@@ -70,6 +72,72 @@ class KgeParameterClient:
 
     def is_stopped(self):
         return False
+
+    def _track_pull(self, keys, pull_tensor):
+        try:
+            if keys is None:
+                return
+            if isinstance(keys, torch.Tensor):
+                num_keys = int(keys.numel())
+            else:
+                num_keys = int(len(keys))
+        except Exception:
+            return
+        if num_keys <= 0:
+            return
+        width = self.dim
+        elem_size = 4
+        if isinstance(pull_tensor, torch.Tensor):
+            if pull_tensor.dim() >= 2:
+                width = int(pull_tensor.shape[1])
+            elem_size = pull_tensor.element_size()
+        self._pull_stats["calls"] += 1
+        self._pull_stats["keys"] += num_keys
+        self._pull_stats["bytes"] += num_keys * width * elem_size
+
+    def _track_push(self, keys, push_tensor):
+        try:
+            if keys is None:
+                return
+            if isinstance(keys, torch.Tensor):
+                num_keys = int(keys.numel())
+            else:
+                num_keys = int(len(keys))
+        except Exception:
+            return
+        if num_keys <= 0:
+            return
+        width = self.dim
+        elem_size = 4
+        if isinstance(push_tensor, torch.Tensor):
+            if push_tensor.dim() >= 2:
+                width = int(push_tensor.shape[1])
+            elem_size = push_tensor.element_size()
+        self._push_stats["calls"] += 1
+        self._push_stats["keys"] += num_keys
+        self._push_stats["bytes"] += num_keys * width * elem_size
+
+    def get_pull_stats(self):
+        return dict(self._pull_stats)
+
+    def reset_pull_stats(self):
+        self._pull_stats = {"calls": 0, "keys": 0, "bytes": 0}
+
+    def get_and_reset_pull_stats(self):
+        stats = self.get_pull_stats()
+        self.reset_pull_stats()
+        return stats
+
+    def get_push_stats(self):
+        return dict(self._push_stats)
+
+    def reset_push_stats(self):
+        self._push_stats = {"calls": 0, "keys": 0, "bytes": 0}
+
+    def get_and_reset_push_stats(self):
+        stats = self.get_push_stats()
+        self.reset_push_stats()
+        return stats
 
     @staticmethod
     def create(
@@ -142,6 +210,13 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
         self._partition_version_state = {}
 
+    def pull(self, keys, pull_tensor=None, asynchronous=False):
+        result = super(LapseParameterClient, self).pull(
+            keys, pull_tensor, asynchronous
+        )
+        self._track_pull(keys, pull_tensor)
+        return result
+
     def pull(
         self, keys, pull_tensor: Optional[torch.Tensor] = None, asynchronous=False
     ):
@@ -149,10 +224,16 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
         #     keys = keys.numpy.astype(np.unint64)
         if pull_tensor is None:
             pull_tensor = torch.empty([len(keys), self.key_size], dtype=torch.float32)
-        return super(LapseParameterClient, self).pull(keys, pull_tensor, asynchronous)
+        result = super(LapseParameterClient, self).pull(keys, pull_tensor, asynchronous)
+        self._track_pull(keys, pull_tensor)
+        return result
 
     def push(self, keys, push_tensor: torch.Tensor, asynchronous=False):
-        return super(LapseParameterClient, self).push(keys, push_tensor, asynchronous)
+        result = super(LapseParameterClient, self).push(
+            keys, push_tensor, asynchronous
+        )
+        self._track_push(keys, push_tensor)
+        return result
 
     def push_versioned(
         self,
@@ -255,12 +336,14 @@ class TorchParameterClient(KgeParameterClient):
         if pull_tensor is None:
             pull_tensor = torch.zeros((len(keys), self.dim), dtype=self.data_type)
         dist.recv(pull_tensor, src=self.server_rank)
+        self._track_pull(keys, pull_tensor)
 
     def push(self, keys, push_tensor, asynchronous=False):
         cmd = torch.LongTensor([TORCH_PARAMETER_SERVER_CMDS.PUSH_CMD, len(keys)])
         dist.send(cmd, dst=self.server_rank)
         dist.send(keys, dst=self.server_rank)
         dist.send(push_tensor, dst=self.server_rank)
+        self._track_push(keys, push_tensor)
 
     def push_versioned(
         self,
@@ -391,11 +474,13 @@ class SharedParameterClient(KgeParameterClient):
     @torch.no_grad()
     def pull(self, keys, pull_tensor, asynchronous=False):
         pull_tensor[:, :] = self.parameters[keys, :]#.index_select(0, keys)
+        self._track_pull(keys, pull_tensor)
 
     @torch.no_grad()
     def push(self, keys, push_tensor, asynchronous=False):
         self.parameters[keys, :] += push_tensor
         #self.parameters.index_add_(0, keys, push_tensor)
+        self._track_push(keys, push_tensor)
 
     @torch.no_grad()
     def push_versioned(

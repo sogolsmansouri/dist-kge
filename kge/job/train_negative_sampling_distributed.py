@@ -1848,12 +1848,19 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self._current_window_versions = window_versions.long()
             else:
                 self._current_window_versions = None
-            if current_partition_id is not None and current_partition_id >= 0:
-                self._current_partition_id = int(current_partition_id)
-            elif (
-                window_members is not None
-                and len(window_members) > 0
-            ):
+            if current_partition_id is not None:
+                if isinstance(current_partition_id, (int, np.integer)):
+                    if current_partition_id >= 0:
+                        self._current_partition_id = int(current_partition_id)
+                    else:
+                        self._current_partition_id = None
+                else:
+                    if isinstance(current_partition_id, torch.Tensor):
+                        current_partition_id = current_partition_id.tolist()
+                    self._current_partition_id = tuple(
+                        int(x) for x in current_partition_id
+                    )
+            elif window_members is not None and len(window_members) > 0:
                 self._current_partition_id = tuple(
                     int(x) for x in window_members.tolist()
                 )
@@ -2478,6 +2485,18 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         duplication_factor = (
             (total_examples / self.num_examples) if self.num_examples > 0 else 0.0
         )
+        pull_stats = None
+        push_stats = None
+        if hasattr(self.parameter_client, "get_and_reset_pull_stats"):
+            try:
+                pull_stats = self.parameter_client.get_and_reset_pull_stats()
+            except Exception:
+                pull_stats = None
+        if hasattr(self.parameter_client, "get_and_reset_push_stats"):
+            try:
+                push_stats = self.parameter_client.get_and_reset_push_stats()
+            except Exception:
+                push_stats = None
         self.current_trace["epoch"].update(
             dict(
                 scope="epoch",
@@ -2528,6 +2547,22 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 relation_grad_samples=total_relation_grad_samples,
             )
         )
+        if pull_stats:
+            self.current_trace["epoch"].update(
+                dict(
+                    ps_pull_calls=pull_stats.get("calls", 0),
+                    ps_pull_keys=pull_stats.get("keys", 0),
+                    ps_pull_bytes=pull_stats.get("bytes", 0),
+                )
+            )
+        if push_stats:
+            self.current_trace["epoch"].update(
+                dict(
+                    ps_push_calls=push_stats.get("calls", 0),
+                    ps_push_keys=push_stats.get("keys", 0),
+                    ps_push_bytes=push_stats.get("bytes", 0),
+                )
+            )
         trace_entry = self.trace(**self.current_trace["epoch"], echo=False, log=True)
         self.config.log(
             format_trace_entry("train_epoch", trace_entry, self.config), prefix="  "

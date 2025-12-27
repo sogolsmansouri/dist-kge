@@ -163,6 +163,8 @@ class WorkerProcess(mp.get_context("spawn").Process):
         config.set("job.device", device_pool[self.rank % len(device_pool)])
         config.folder = os.path.join(self.config.folder, f"worker-{self.rank}")
         config.init_folder()
+        if getattr(config, "invocation", None):
+            config.log(config.invocation, echo=False)
 
         parameter_client = KgeParameterClient.create(
             config=config,

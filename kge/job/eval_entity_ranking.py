@@ -18,8 +18,12 @@ class EntityRankingJob(EvaluationJob):
     def __init__(self, config: Config, dataset: Dataset, parent_job, model, parameter_client=None, work_scheduler_client=None):
         super().__init__(config, dataset, parent_job, model, parameter_client=parameter_client)
         if work_scheduler_client is None:
-            from kge.distributed.work_scheduler import SchedulerClient
-            self.work_scheduler_client = SchedulerClient(config)
+            if config.get("job.distributed.single_process"):
+                from kge.distributed.work_scheduler import LocalSchedulerClient
+                self.work_scheduler_client = LocalSchedulerClient(config, dataset)
+            else:
+                from kge.distributed.work_scheduler import SchedulerClient
+                self.work_scheduler_client = SchedulerClient(config)
         else:
             self.work_scheduler_client = work_scheduler_client
         self.config.check(
