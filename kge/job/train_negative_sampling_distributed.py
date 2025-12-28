@@ -129,7 +129,7 @@ class BatchDataset(torch.utils.data.Dataset):
             print(idx, self.num_samples.item(), start, stop, len(self))
             return None
         return (
-            self.samples[start:stop],
+            self.samples[start:stop].clone().long(),
             self.epoch.item(),
             self.partition_id.item(),
         )
