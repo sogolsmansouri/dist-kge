@@ -715,7 +715,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             ),
             dim=1,
         )
-        self.parameter_client.push(
+        # Use set to avoid accumulating into non-zero parameter server memory.
+        self.parameter_client.set(
             entity_ids + self.model.get_s_embedder().lapse_offset, push_tensor.cpu(),
         )
 

@@ -302,7 +302,8 @@ def _run_single_process_distributed(
     num_keys = get_num_keys(config, dataset)
     embedding_dim = config.get("lookup_embedder.dim")
     optimizer_dim = get_optimizer_dim(config, embedding_dim)
-    parameters = torch.empty(
+    # Zero-init shared parameters to avoid adding into uninitialized memory
+    parameters = torch.zeros(
         (num_keys, embedding_dim + optimizer_dim),
         dtype=torch.float32,
         requires_grad=False,
