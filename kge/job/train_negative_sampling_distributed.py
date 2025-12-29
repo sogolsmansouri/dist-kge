@@ -374,33 +374,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         enable_prefetch = (
             isinstance(job_device, str) and job_device.startswith("cuda")
         )
-        if enable_prefetch:
-            if config.get("job.distributed.entity_sync_level") == "batch":
-                current = int(config.get("job.distributed.entity_pre_pull"))
-                if current < 2:
-                    config.set("job.distributed.entity_pre_pull", 2)
-                    config.log(
-                        "Auto-enabled entity prefetching (job.distributed.entity_pre_pull=2)"
-                    )
-            if config.get("job.distributed.relation_sync_level") == "batch":
-                current = int(config.get("job.distributed.relation_pre_pull"))
-                if current < 1:
-                    config.set("job.distributed.relation_pre_pull", 1)
-                    config.log(
-                        "Auto-enabled relation prefetching (job.distributed.relation_pre_pull=1)"
-                    )
-
+        # NOTE: Auto-prefetch/auto-num_workers disabled for correctness.
+        # Set job.distributed.entity_pre_pull / relation_pre_pull / train.num_workers explicitly if needed.
         configured_workers = int(self.config.get("train.num_workers"))
-        if (
-            isinstance(job_device, str)
-            and job_device.startswith("cuda")
-            and configured_workers == 0
-        ):
-            configured_workers = 2
-            self.config.set("train.num_workers", configured_workers)
-            self.config.log(
-                "Auto-enabled train.num_workers=2 to better overlap parameter transfers."
-            )
         self._effective_num_workers = configured_workers
         if self.config.get("job.distributed.materialize_partition_batches"):
             if self._effective_num_workers != 0:
