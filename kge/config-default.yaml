@@ -88,6 +88,7 @@ job:
     debug_id_bounds: False  # log/raise when triples/negatives exceed vocab bounds
     conflict_free_merge: False
     causal_merge: False
+    causal_merge_row: False
     optimizer:
       max_pending_pushes: 2
     hot_entity_cache:
@@ -110,6 +111,24 @@ job:
     relation_gradient_trace: False
     gradient_trace_log_interval: 0
     gradient_trace_top_relations: 0
+    gradient_graph:
+      enable: False
+      top_relations: 0   # 0 keeps all relations per partition
+      export_interval: 0 # 0 uses gradient_snapshot_interval, else every N updates
+      clustering:
+        enable: False
+        update_interval: 0 # 0 uses export_interval/gradient_snapshot_interval
+        min_affinity: 0.1
+        min_shared_relations: 1
+        max_cluster_size: 0
+        top_relations: 64
+        max_partitions_per_relation: 8
+      repartition:
+        enable: False
+        max_moves_per_partition: 0
+        min_partition_size: 2048
+        max_partition_size: 0
+        max_relations: 0
     graph_cut:
       cost_aware_schedule: False
       max_chunk_size: 0

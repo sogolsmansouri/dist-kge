@@ -461,6 +461,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._skip_partition_set = (
             isinstance(self.optimizer, DistAdagrad)
             or bool(self.config.get("job.distributed.causal_merge"))
+            or bool(self.config.get("job.distributed.causal_merge_row"))
             or bool(self._window_work)
         )
         self._entity_vocab_size = self.dataset.num_entities()

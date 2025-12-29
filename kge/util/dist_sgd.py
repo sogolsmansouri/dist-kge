@@ -67,6 +67,7 @@ class DistSGD(Optimizer):
         local_index_mappers=None,
         conflict_free_merge=False,
         causal_merge=False,
+        row_causal_merge=False,
     ):
         params = [p for p in model.parameters() if p.requires_grad]
         if lr is not required and lr < 0.0:
@@ -100,6 +101,7 @@ class DistSGD(Optimizer):
         self.parameter_client = parameter_client
         self.conflict_free_merge = bool(conflict_free_merge)
         self.causal_merge = bool(causal_merge)
+        self.row_causal_merge = bool(row_causal_merge)
         self._partition_context = {
             "partition_id": None,
             "partition_version": None,
@@ -193,7 +195,7 @@ class DistSGD(Optimizer):
             self._record_partition_push(keys, payload)
             return result
         if (
-            (self.conflict_free_merge or self.causal_merge)
+            (self.conflict_free_merge or self.causal_merge or self.row_causal_merge)
             and self._partition_context["partition_id"] is not None
             and self._partition_context["partition_version"] is not None
             and hasattr(self.parameter_client, "push_versioned")

@@ -208,6 +208,7 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
             config.get("job.distributed.conflict_free_merge")
         )
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
+        self._row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
         self._partition_version_state = {}
 
     def pull(self, keys, pull_tensor=None, asynchronous=False):
@@ -243,6 +244,21 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
         partition_version: Optional[int],
         asynchronous=False,
     ):
+        if (
+            self._row_causal_merge
+            and partition_id is not None
+            and partition_version is not None
+        ):
+            cmd = torch.LongTensor(
+                [TORCH_PARAMETER_SERVER_CMDS.PUSH_VERSIONED_CMD, len(keys)]
+            )
+            dist.send(cmd, dst=self.server_rank)
+            meta = torch.LongTensor([int(partition_id), int(partition_version)])
+            dist.send(meta, dst=self.server_rank)
+            dist.send(keys, dst=self.server_rank)
+            dist.send(push_tensor, dst=self.server_rank)
+            self._track_push(keys, push_tensor)
+            return
         if (
             not (self._conflict_free_merge or self._causal_merge)
             or partition_id is None
@@ -327,6 +343,7 @@ class TorchParameterClient(KgeParameterClient):
             config.get("job.distributed.conflict_free_merge")
         )
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
+        self._row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
         self._partition_version_state = {}
 
     def pull(self, keys, pull_tensor=None, asynchronous=False):
@@ -446,9 +463,20 @@ class SharedParameterClient(KgeParameterClient):
             config.get("job.distributed.conflict_free_merge")
         )
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
+        self._row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
         self._partition_version_state = {}
         self.data_type = torch.float32
         self.lr_buffer = torch.zeros(1, dtype=torch.float32)
+        self._row_last_partition = None
+        self._row_last_version = None
+        if self._row_causal_merge:
+            data_limit = max(0, self.num_keys - self.num_meta_keys)
+            self._row_last_partition = torch.full(
+                (data_limit,), -1, dtype=torch.long
+            )
+            self._row_last_version = torch.full(
+                (data_limit,), -1, dtype=torch.long
+            )
         self._stop_key = torch.LongTensor([self.num_keys - self.num_meta_keys])
         self._optim_entity_step_key = torch.LongTensor(
             [self.num_keys - self.num_meta_keys + 1]
@@ -491,6 +519,37 @@ class SharedParameterClient(KgeParameterClient):
         partition_version: Optional[int],
         asynchronous=False,
     ):
+        if (
+            self._row_causal_merge
+            and partition_id is not None
+            and partition_version is not None
+        ):
+            if not isinstance(keys, torch.Tensor):
+                keys = torch.as_tensor(keys, dtype=torch.long)
+            if not isinstance(push_tensor, torch.Tensor):
+                push_tensor = torch.as_tensor(push_tensor)
+            data_limit = self.num_keys - self.num_meta_keys
+            data_mask = keys < data_limit
+            if torch.any(data_mask):
+                data_keys = keys[data_mask]
+                data_payload = push_tensor[data_mask]
+                last_pid = self._row_last_partition[data_keys]
+                last_ver = self._row_last_version[data_keys]
+                apply_mask = (last_pid != int(partition_id)) | (
+                    int(partition_version) >= last_ver
+                )
+                if torch.any(apply_mask):
+                    apply_keys = data_keys[apply_mask]
+                    apply_payload = data_payload[apply_mask]
+                    self.parameters[apply_keys, :] += apply_payload
+                    self._row_last_partition[apply_keys] = int(partition_id)
+                    self._row_last_version[apply_keys] = int(partition_version)
+            if torch.any(~data_mask):
+                meta_keys = keys[~data_mask]
+                meta_payload = push_tensor[~data_mask]
+                self.parameters[meta_keys, :] += meta_payload
+            self._track_push(keys, push_tensor)
+            return
         if (
             not (self._conflict_free_merge or self._causal_merge)
             or partition_id is None

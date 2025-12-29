@@ -94,6 +94,47 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.gradient_snapshot_interval = max(
             0, int(config.get("job.distributed.gradient_snapshot_interval") or 0)
         )
+        graph_cfg = config.get("job.distributed.gradient_graph") or {}
+        self._gradient_graph_enabled = bool(graph_cfg.get("enable", False))
+        self._gradient_graph_top_relations = max(
+            0, int(graph_cfg.get("top_relations", 0))
+        )
+        self._gradient_graph_export_interval = max(
+            0, int(graph_cfg.get("export_interval", 0))
+        )
+        self._gradient_graph_last_export = 0
+        self._gradient_graph_partitions = (
+            defaultdict(dict) if self._gradient_graph_enabled else None
+        )
+        self._gradient_graph_relations = (
+            defaultdict(dict) if self._gradient_graph_enabled else None
+        )
+        cluster_cfg = graph_cfg.get("clustering") or {}
+        self._gradient_graph_cluster_enabled = bool(cluster_cfg.get("enable", False))
+        self._gradient_graph_cluster_update_interval = max(
+            0, int(cluster_cfg.get("update_interval", 0))
+        )
+        self._gradient_graph_cluster_min_affinity = float(
+            cluster_cfg.get("min_affinity", 0.1)
+        )
+        self._gradient_graph_cluster_min_affinity = min(
+            1.0, max(0.0, self._gradient_graph_cluster_min_affinity)
+        )
+        self._gradient_graph_cluster_min_shared = max(
+            1, int(cluster_cfg.get("min_shared_relations", 1))
+        )
+        self._gradient_graph_cluster_max_size = max(
+            0, int(cluster_cfg.get("max_cluster_size", 0))
+        )
+        self._gradient_graph_cluster_top_relations = max(
+            0, int(cluster_cfg.get("top_relations", 0))
+        )
+        self._gradient_graph_cluster_max_partitions_per_relation = max(
+            0, int(cluster_cfg.get("max_partitions_per_relation", 0))
+        )
+        self._gradient_graph_cluster_last_update = 0
+        self._gradient_graph_clusters = {}
+        self._gradient_graph_cluster_members = {}
         self._gradient_updates = 0
         self._last_gradient_snapshot = 0
         self.partition_issue_versions = defaultdict(int)
@@ -643,6 +684,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         ):
             self._export_gradient_statistics()
             self._last_gradient_snapshot = self._gradient_updates
+        self._maybe_export_gradient_graph()
 
     def _register_partition_relation_gradient(
         self, partition_id, rel_ids, rel_sums, rel_counts
@@ -662,6 +704,9 @@ class WorkScheduler(mp.get_context("fork").Process):
             stats = rel_stats[rel_id]
             stats["sum"] += float(rel_sum)
             stats["count"] += int(rel_count)
+        self._update_gradient_graph(
+            partition_id, rel_ids_list, rel_sums_list, rel_counts_list
+        )
 
     def _export_gradient_statistics(self, final: bool = False):
         if not self.partition_gradient_stats:
@@ -698,6 +743,311 @@ class WorkScheduler(mp.get_context("fork").Process):
         except Exception as exc:
             self.config.log(f"Failed to export gradient snapshot: {exc}")
         self._export_relation_gradient_statistics(output_folder, final=final)
+        self._export_gradient_graph(final=final)
+
+    def _maybe_export_gradient_graph(self):
+        if not self._gradient_graph_enabled:
+            return
+        interval = self._gradient_graph_export_interval
+        if interval <= 0:
+            interval = self.gradient_snapshot_interval
+        if interval <= 0:
+            return
+        if self._gradient_updates < self._gradient_graph_last_export + interval:
+            return
+        self._export_gradient_graph()
+        self._gradient_graph_last_export = self._gradient_updates
+
+    def _maybe_update_gradient_graph_clusters(self, force: bool = False):
+        if (
+            not self._gradient_graph_cluster_enabled
+            or not self._gradient_graph_enabled
+            or self._gradient_graph_relations is None
+        ):
+            return
+        interval = self._gradient_graph_cluster_update_interval
+        if interval <= 0:
+            interval = self._gradient_graph_export_interval
+        if interval <= 0:
+            interval = self.gradient_snapshot_interval
+        if interval <= 0 and not force:
+            return
+        if (
+            not force
+            and self._gradient_updates
+            < self._gradient_graph_cluster_last_update + interval
+        ):
+            return
+        self._recompute_gradient_graph_clusters()
+        self._gradient_graph_cluster_last_update = self._gradient_updates
+
+    def _recompute_gradient_graph_clusters(self):
+        if (
+            not self._gradient_graph_cluster_enabled
+            or self._gradient_graph_relations is None
+        ):
+            return
+        if not self._gradient_graph_relations:
+            self._gradient_graph_clusters = {}
+            self._gradient_graph_cluster_members = {}
+            return
+        allowed_relations = None
+        top_relations = self._gradient_graph_cluster_top_relations
+        if (
+            top_relations > 0
+            and self._gradient_graph_partitions is not None
+            and self._gradient_graph_partitions
+        ):
+            allowed_relations = {}
+            for pid, rels in self._gradient_graph_partitions.items():
+                if not rels:
+                    continue
+                ordered = sorted(
+                    rels.items(),
+                    key=lambda item: item[1].get("avg", 0.0),
+                    reverse=True,
+                )
+                keep = {rel_id for rel_id, _ in ordered[:top_relations]}
+                allowed_relations[pid] = keep
+        pair_scores = defaultdict(float)
+        pair_counts = defaultdict(int)
+        max_parts = self._gradient_graph_cluster_max_partitions_per_relation
+        for rel_id, part_map in self._gradient_graph_relations.items():
+            if not part_map:
+                continue
+            items = []
+            for pid, stats in part_map.items():
+                if allowed_relations is not None:
+                    rel_set = allowed_relations.get(pid)
+                    if rel_set is None or rel_id not in rel_set:
+                        continue
+                avg = stats.get("avg")
+                if avg is None:
+                    count = max(1, stats.get("count", 0))
+                    avg = stats.get("sum", 0.0) / count
+                items.append((pid, float(avg)))
+            if len(items) < 2:
+                continue
+            if max_parts > 0 and len(items) > max_parts:
+                items = sorted(
+                    items, key=lambda item: item[1], reverse=True
+                )[:max_parts]
+            for (pid_i, val_i), (pid_j, val_j) in itertools.combinations(
+                items, 2
+            ):
+                denom = val_i + val_j
+                if denom <= 0:
+                    continue
+                affinity = 1.0 - abs(val_i - val_j) / denom
+                pair = tuple(sorted((int(pid_i), int(pid_j))))
+                pair_scores[pair] += affinity
+                pair_counts[pair] += 1
+        all_partitions = list(range(self.num_partitions))
+        parent = {pid: pid for pid in all_partitions}
+        sizes = {pid: 1 for pid in all_partitions}
+
+        def find(pid):
+            root = pid
+            while parent[root] != root:
+                root = parent[root]
+            while parent[pid] != pid:
+                nxt = parent[pid]
+                parent[pid] = root
+                pid = nxt
+            return root
+
+        def union(pid_i, pid_j):
+            root_i = find(pid_i)
+            root_j = find(pid_j)
+            if root_i == root_j:
+                return False
+            max_size = self._gradient_graph_cluster_max_size
+            if max_size > 0 and sizes[root_i] + sizes[root_j] > max_size:
+                return False
+            if sizes[root_i] < sizes[root_j]:
+                root_i, root_j = root_j, root_i
+            parent[root_j] = root_i
+            sizes[root_i] += sizes[root_j]
+            return True
+
+        min_affinity = self._gradient_graph_cluster_min_affinity
+        min_shared = self._gradient_graph_cluster_min_shared
+        pairs = []
+        for pair, score in pair_scores.items():
+            count = pair_counts.get(pair, 0)
+            if count <= 0:
+                continue
+            avg = score / count
+            pairs.append((avg, count, pair))
+        pairs.sort(key=lambda item: item[0], reverse=True)
+        for avg, count, (pid_i, pid_j) in pairs:
+            if count < min_shared:
+                continue
+            if avg < min_affinity:
+                continue
+            if avg <= 0.0 and min_affinity <= 0.0:
+                continue
+            union(pid_i, pid_j)
+        cluster_members = defaultdict(list)
+        for pid in all_partitions:
+            cluster_members[find(pid)].append(pid)
+        clusters = {}
+        for root, members in cluster_members.items():
+            members_sorted = sorted(members)
+            for pid in members_sorted:
+                clusters[pid] = root
+            cluster_members[root] = members_sorted
+        self._gradient_graph_clusters = clusters
+        self._gradient_graph_cluster_members = dict(cluster_members)
+
+    def _update_gradient_graph(
+        self, partition_id, rel_ids_list, rel_sums_list, rel_counts_list
+    ):
+        if not self._gradient_graph_enabled or self._gradient_graph_partitions is None:
+            return
+        part_edges = self._gradient_graph_partitions[partition_id]
+        rel_edges = self._gradient_graph_relations
+        for rel_id, rel_sum, rel_count in zip(
+            rel_ids_list, rel_sums_list, rel_counts_list
+        ):
+            if rel_count <= 0:
+                continue
+            rel_id = int(rel_id)
+            edge = part_edges.setdefault(rel_id, {"sum": 0.0, "count": 0})
+            edge["sum"] += float(rel_sum)
+            edge["count"] += int(rel_count)
+            edge["avg"] = edge["sum"] / max(1, edge["count"])
+            if rel_edges is not None:
+                rel_edge = rel_edges[rel_id].setdefault(
+                    partition_id, {"sum": 0.0, "count": 0}
+                )
+                rel_edge["sum"] += float(rel_sum)
+                rel_edge["count"] += int(rel_count)
+                rel_edge["avg"] = rel_edge["sum"] / max(1, rel_edge["count"])
+        if self._gradient_graph_top_relations > 0:
+            self._prune_gradient_graph_partition(partition_id)
+        self._maybe_update_gradient_graph_clusters()
+
+    def _prune_gradient_graph_partition(self, partition_id):
+        if (
+            not self._gradient_graph_enabled
+            or self._gradient_graph_partitions is None
+            or self._gradient_graph_relations is None
+        ):
+            return
+        part_edges = self._gradient_graph_partitions.get(partition_id)
+        if not part_edges:
+            return
+        max_edges = self._gradient_graph_top_relations
+        if max_edges <= 0 or len(part_edges) <= max_edges:
+            return
+        ordered = sorted(
+            part_edges.items(),
+            key=lambda item: item[1].get("avg", 0.0),
+            reverse=True,
+        )
+        keep_ids = {rel_id for rel_id, _ in ordered[:max_edges]}
+        for rel_id in list(part_edges.keys()):
+            if rel_id in keep_ids:
+                continue
+            part_edges.pop(rel_id, None)
+            rel_map = self._gradient_graph_relations.get(rel_id)
+            if rel_map is None:
+                continue
+            rel_map.pop(partition_id, None)
+            if not rel_map:
+                self._gradient_graph_relations.pop(rel_id, None)
+
+    def _export_gradient_graph(self, final: bool = False):
+        if (
+            not self._gradient_graph_enabled
+            or self._gradient_graph_partitions is None
+            or not self._gradient_graph_partitions
+        ):
+            return
+        if self._gradient_graph_cluster_enabled:
+            self._maybe_update_gradient_graph_clusters(force=final)
+        output_folder = Path(self.config.folder) / "gradient_graph"
+        output_folder.mkdir(parents=True, exist_ok=True)
+        if final:
+            graph_path = output_folder / "gradient_graph_final.json"
+        else:
+            graph_path = output_folder / f"gradient_graph_{self._gradient_updates}.json"
+        edges = []
+        for pid, rels in self._gradient_graph_partitions.items():
+            for rel_id, stats in rels.items():
+                count = max(1, int(stats.get("count", 0)))
+                edges.append(
+                    {
+                        "partition": self._serialize_partition_key(pid),
+                        "relation": int(rel_id),
+                        "sum": float(stats.get("sum", 0.0)),
+                        "count": int(stats.get("count", 0)),
+                        "avg": float(stats.get("sum", 0.0)) / count,
+                    }
+                )
+        clusters_payload = None
+        if self._gradient_graph_clusters:
+            cluster_members = defaultdict(list)
+            for pid, cid in self._gradient_graph_clusters.items():
+                cluster_members[cid].append(pid)
+            clusters_payload = []
+            for cid, members in sorted(
+                cluster_members.items(), key=lambda item: len(item[1]), reverse=True
+            ):
+                clusters_payload.append(
+                    {
+                        "id": self._serialize_partition_key(cid),
+                        "partitions": [
+                            self._serialize_partition_key(pid)
+                            for pid in sorted(members)
+                        ],
+                    }
+                )
+        try:
+            with open(graph_path, "w") as fp:
+                json.dump(
+                    {
+                        "num_partitions": int(self.num_partitions),
+                        "num_relations": int(self.dataset.num_relations()),
+                        "snapshot_index": int(self._gradient_updates),
+                        "final": bool(final),
+                        "top_relations": int(self._gradient_graph_top_relations),
+                        "cluster_snapshot_index": int(
+                            self._gradient_graph_cluster_last_update
+                        ),
+                        "cluster_config": {
+                            "enabled": bool(self._gradient_graph_cluster_enabled),
+                            "update_interval": int(
+                                self._gradient_graph_cluster_update_interval
+                            ),
+                            "min_affinity": float(
+                                self._gradient_graph_cluster_min_affinity
+                            ),
+                            "min_shared_relations": int(
+                                self._gradient_graph_cluster_min_shared
+                            ),
+                            "max_cluster_size": int(
+                                self._gradient_graph_cluster_max_size
+                            ),
+                            "top_relations": int(
+                                self._gradient_graph_cluster_top_relations
+                            ),
+                            "max_partitions_per_relation": int(
+                                self._gradient_graph_cluster_max_partitions_per_relation
+                            ),
+                        },
+                        "clusters": clusters_payload,
+                        "edges": edges,
+                    },
+                    fp,
+                    indent=2,
+                )
+            self.config.log(
+                f"Exported gradient bipartite graph with {len(edges)} edges to {graph_path}."
+            )
+        except Exception as exc:
+            self.config.log(f"Failed to export gradient graph: {exc}")
 
     def _export_relation_gradient_statistics(self, output_folder, final: bool = False):
         if not self.partition_relation_gradient_stats:
@@ -1557,6 +1907,22 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._causal_overlap_queue = deque()
         self._causal_overlap_versions = {}
         self._causal_overlap_active = defaultdict(int)
+        graph_cfg = config.get("job.distributed.gradient_graph") or {}
+        repartition_cfg = graph_cfg.get("repartition") or {}
+        self._gradient_repartition_enabled = bool(repartition_cfg.get("enable", False))
+        self._gradient_repartition_max_moves = max(
+            0, int(repartition_cfg.get("max_moves_per_partition", 0))
+        )
+        self._gradient_repartition_min_size = max(
+            1, int(repartition_cfg.get("min_partition_size", 2048))
+        )
+        self._gradient_repartition_max_size = max(
+            0, int(repartition_cfg.get("max_partition_size", 0))
+        )
+        self._gradient_repartition_max_relations = max(
+            0, int(repartition_cfg.get("max_relations", 0))
+        )
+        self._train_triples_cache = None
 
     def _init_in_started_process(self):
         super(GlowWorkScheduler, self)._init_in_started_process()
@@ -1643,11 +2009,50 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         scored.sort()
         return [pid for _, pid in scored]
 
+    def _order_partitions_by_gradient_graph_clusters(self, partitions):
+        clusters = getattr(self, "_gradient_graph_clusters", None)
+        if not clusters:
+            return partitions
+        cluster_members = defaultdict(list)
+        for pid in partitions:
+            cluster_id = clusters.get(pid, pid)
+            cluster_members[cluster_id].append(pid)
+        gradients = self.partition_gradient_stats or self._latest_gradients
+        cluster_scores = []
+        for cluster_id, members in cluster_members.items():
+            total = 0.0
+            count = 0
+            for pid in members:
+                stats = gradients.get(pid)
+                if not stats or stats["count"] < self.glow_min_gradient:
+                    continue
+                total += stats["sum"] / max(1, stats["count"])
+                count += 1
+            avg = total / max(1, count)
+            cluster_scores.append((-avg, cluster_id))
+        cluster_scores.sort()
+        ordered = []
+        seen = set()
+        for _, cluster_id in cluster_scores:
+            members = cluster_members[cluster_id]
+            for pid in self._order_by_gradient(members):
+                if pid not in seen:
+                    ordered.append(pid)
+                    seen.add(pid)
+        for pid in partitions:
+            if pid not in seen:
+                ordered.append(pid)
+                seen.add(pid)
+        return ordered
+
     def _rebuild_glow_windows(self, ordered_partitions):
         self._glow_windows = deque()
         self._max_window_entities = 0
         if not ordered_partitions or not self.glow_windows_enabled:
             return
+        ordered_partitions = self._order_partitions_by_gradient_graph_clusters(
+            list(ordered_partitions)
+        )
         if self._co_gradient_scores:
             ordered_partitions = self._cluster_partitions_by_affinity(
                 list(ordered_partitions)
@@ -2228,6 +2633,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 )
             )
             self._rebuild_glow_windows(list(range(self.num_partitions)))
+        moved = self._maybe_repartition_from_gradient_graph()
+        if moved > 0:
+            self.config.log(
+                f"Glow gradient repartition moved {moved} triples across partitions."
+            )
+            self._rebuild_glow_windows(list(range(self.num_partitions)))
 
     def _move_triples_from_hot_to_cold(self, hot_id, cold_id):
         hot_tensor = self.partitions[hot_id]
@@ -2268,6 +2679,149 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         triples_subset = triples[tensor_ids.long()]
         entities = torch.unique(triples_subset[:, [0, 2]].reshape(-1))
         self._partition_entities_map[partition_id] = entities.cpu().long()
+
+    def _recompute_partition_relations(self, partition_id):
+        if self._partition_relations_map is None:
+            return
+        triples = self._get_train_triples()
+        tensor_ids = self.partitions[partition_id]
+        if tensor_ids is None or len(tensor_ids) == 0:
+            self._partition_relations_map[partition_id] = torch.empty(
+                (0,), dtype=self.data_type
+            )
+            return
+        triples_subset = triples[tensor_ids.long()]
+        rels = torch.unique(triples_subset[:, 1].reshape(-1))
+        self._partition_relations_map[partition_id] = rels.cpu().long()
+
+    def _get_train_triples(self):
+        if self._train_triples_cache is None:
+            self._train_triples_cache = self.dataset.split("train")
+        return self._train_triples_cache
+
+    def _maybe_repartition_from_gradient_graph(self):
+        if (
+            not self._gradient_repartition_enabled
+            or self._gradient_repartition_max_moves <= 0
+            or not self._gradient_graph_enabled
+            or self._gradient_graph_relations is None
+        ):
+            return 0
+        if not self._gradient_graph_relations:
+            return 0
+        num_relations = self.dataset.num_relations()
+        if num_relations is None or num_relations <= 0:
+            return 0
+        relation_owner = torch.full(
+            (num_relations,), -1, dtype=torch.long
+        )
+        relation_score = torch.zeros((num_relations,), dtype=torch.float32)
+        for rel_id, part_map in self._gradient_graph_relations.items():
+            if not part_map:
+                continue
+            best_pid = None
+            best_score = -1.0
+            for pid, stats in part_map.items():
+                score = stats.get("avg", 0.0)
+                if score > best_score:
+                    best_score = score
+                    best_pid = pid
+            if best_pid is None:
+                continue
+            rid = int(rel_id)
+            if 0 <= rid < num_relations:
+                relation_owner[rid] = int(best_pid)
+                relation_score[rid] = float(best_score)
+        if self._gradient_repartition_max_relations > 0:
+            max_rel = min(self._gradient_repartition_max_relations, num_relations)
+            if max_rel > 0:
+                _, idx = torch.topk(
+                    relation_score, k=max_rel, largest=True
+                )
+                mask = torch.zeros_like(relation_owner, dtype=torch.bool)
+                mask[idx] = True
+                relation_owner = torch.where(
+                    mask, relation_owner, torch.full_like(relation_owner, -1)
+                )
+        triples = self._get_train_triples()
+        moved_total = 0
+        changed_partitions = set()
+        max_size = self._gradient_repartition_max_size
+        min_size = self._gradient_repartition_min_size
+        for pid, part in enumerate(self.partitions):
+            if part is None or len(part) == 0:
+                continue
+            if len(part) <= min_size:
+                continue
+            rels = triples[part.long(), 1]
+            targets = relation_owner[rels]
+            move_mask = (targets >= 0) & (targets != pid)
+            if not move_mask.any():
+                continue
+            move_idx = move_mask.nonzero(as_tuple=False).view(-1)
+            if move_idx.numel() > self._gradient_repartition_max_moves:
+                move_idx = move_idx[: self._gradient_repartition_max_moves]
+            if move_idx.numel() == 0:
+                continue
+            move_targets = targets[move_idx]
+            keep_mask = torch.ones(len(part), dtype=torch.bool)
+            keep_mask[move_idx] = False
+            keep_part = part[keep_mask].contiguous()
+            if len(keep_part) < min_size:
+                continue
+            moved_any = False
+            for target_pid in torch.unique(move_targets).tolist():
+                target_pid = int(target_pid)
+                if target_pid < 0 or target_pid >= len(self.partitions):
+                    continue
+                target_part = self.partitions[target_pid]
+                if target_part is None:
+                    target_part = torch.empty((0,), dtype=part.dtype)
+                target_mask = move_targets == target_pid
+                move_local = move_idx[target_mask]
+                if move_local.numel() == 0:
+                    continue
+                if max_size > 0 and len(target_part) + len(move_local) > max_size:
+                    allowed = max_size - len(target_part)
+                    if allowed <= 0:
+                        continue
+                    move_local = move_local[:allowed]
+                if move_local.numel() == 0:
+                    continue
+                moved_triples = part[move_local].contiguous()
+                self.partitions[target_pid] = torch.cat(
+                    [target_part, moved_triples], dim=0
+                ).contiguous()
+                moved_total += moved_triples.numel()
+                moved_any = True
+                changed_partitions.add(target_pid)
+            if moved_any:
+                self.partitions[pid] = keep_part
+                changed_partitions.add(pid)
+        for pid in changed_partitions:
+            self.partition_gradient_stats[pid] = {"sum": 0.0, "count": 0}
+            if pid in self.partition_relation_gradient_stats:
+                self.partition_relation_gradient_stats.pop(pid, None)
+            if self._gradient_graph_partitions is not None:
+                rels = self._gradient_graph_partitions.pop(pid, None)
+                if rels and self._gradient_graph_relations is not None:
+                    for rel_id in list(rels.keys()):
+                        rel_map = self._gradient_graph_relations.get(rel_id)
+                        if rel_map is None:
+                            continue
+                        rel_map.pop(pid, None)
+                        if not rel_map:
+                            self._gradient_graph_relations.pop(rel_id, None)
+            if pid in self.partition_committed_versions:
+                self.partition_committed_versions[pid] = -1
+            self.partition_issue_versions[pid] += 1
+            if self._partition_entities_map is not None:
+                self._recompute_partition_entities(pid)
+            if self._partition_relations_map is not None:
+                self._recompute_partition_relations(pid)
+        if moved_total > 0 and self._gradient_graph_cluster_enabled:
+            self._maybe_update_gradient_graph_clusters(force=True)
+        return moved_total
 
     def _next_work(self, rank, machine_id) -> WorkPackage:
         def build_work(partition_id, reuse_version=False, version=None):

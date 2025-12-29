@@ -6,8 +6,8 @@ except ImportError:
 from enum import IntEnum
 from torch import distributed as dist
 
-from kge.distributed.misc import get_min_rank, get_optimizer_dim, initialize_worker_groups, set_dmlc_environment, \
-    set_master_environment
+from kge.distributed.misc import get_min_rank, get_optimizer_dim, get_num_meta_keys, initialize_worker_groups, \
+    set_dmlc_environment, set_master_environment
 
 
 class TORCH_PARAMETER_SERVER_CMDS(IntEnum):
@@ -22,6 +22,7 @@ class TORCH_PARAMETER_SERVER_CMDS(IntEnum):
     STEP_OPTIM_CMD = 8
     BARRIER_CMD = 9
     SHUTDOWN_CMD = 10
+    PUSH_VERSIONED_CMD = 11
 
 
 class KgeParameterServer:
@@ -44,12 +45,30 @@ class LapseParameterServer:
 
 
 class TorchParameterServer:
-    def __init__(self, world_size: int, num_keys: int, dim: int):
+    def __init__(
+        self,
+        world_size: int,
+        num_keys: int,
+        dim: int,
+        num_meta_keys: int = 0,
+        row_causal_merge: bool = False,
+    ):
         self.rank = 0
         self.num_clients = world_size - 2
         self.dim = dim
         self.data_type = torch.float32
         self.data = torch.zeros((num_keys, dim), dtype=self.data_type)
+        self._row_causal_merge = bool(row_causal_merge)
+        self._data_key_limit = max(0, int(num_keys) - int(num_meta_keys))
+        self._row_last_partition = None
+        self._row_last_version = None
+        if self._row_causal_merge and self._data_key_limit > 0:
+            self._row_last_partition = torch.full(
+                (self._data_key_limit,), -1, dtype=torch.long
+            )
+            self._row_last_version = torch.full(
+                (self._data_key_limit,), -1, dtype=torch.long
+            )
         self.entity_lr = 0
         self.relation_lr = 0
         self.entity_optim_step = 0
@@ -74,6 +93,16 @@ class TorchParameterServer:
                 key_len = cmd_buffer[1].item()
                 keys = self._receive_keys(rank, key_len)
                 self._handle_push(rank, keys)
+            if cmd == TORCH_PARAMETER_SERVER_CMDS.PUSH_VERSIONED_CMD:
+                key_len = cmd_buffer[1].item()
+                meta = torch.empty((2,), dtype=torch.long)
+                dist.recv(meta, src=rank)
+                partition_id = int(meta[0].item())
+                partition_version = int(meta[1].item())
+                keys = self._receive_keys(rank, key_len)
+                self._handle_push_versioned(
+                    rank, keys, partition_id, partition_version
+                )
             if cmd == TORCH_PARAMETER_SERVER_CMDS.SET_CMD:
                 key_len = cmd_buffer[1].item()
                 keys = self._receive_keys(rank, key_len)
@@ -125,6 +154,37 @@ class TorchParameterServer:
         dist.recv(push_data, src=rank)
         self.data[keys, :] += push_data
 
+    def _handle_push_versioned(self, rank, keys, partition_id, partition_version):
+        push_data = torch.empty((len(keys), self.dim), dtype=self.data_type)
+        dist.recv(push_data, src=rank)
+        if (
+            not self._row_causal_merge
+            or partition_id is None
+            or partition_version is None
+            or self._data_key_limit <= 0
+        ):
+            self.data[keys, :] += push_data
+            return
+        data_mask = keys < self._data_key_limit
+        if torch.any(data_mask):
+            data_keys = keys[data_mask]
+            data_payload = push_data[data_mask]
+            last_pid = self._row_last_partition[data_keys]
+            last_ver = self._row_last_version[data_keys]
+            apply_mask = (last_pid != int(partition_id)) | (
+                int(partition_version) >= last_ver
+            )
+            if torch.any(apply_mask):
+                apply_keys = data_keys[apply_mask]
+                apply_payload = data_payload[apply_mask]
+                self.data[apply_keys, :] += apply_payload
+                self._row_last_partition[apply_keys] = int(partition_id)
+                self._row_last_version[apply_keys] = int(partition_version)
+        if torch.any(~data_mask):
+            meta_keys = keys[~data_mask]
+            meta_payload = push_data[~data_mask]
+            self.data[meta_keys, :] += meta_payload
+
     def _handle_set(self, rank, keys):
         set_data = torch.empty((len(keys), self.dim), dtype=self.data_type)
         dist.recv(set_data, src=rank)
@@ -145,8 +205,15 @@ def init_torch_server(config, num_keys):
     world_size = num_clients + min_rank
     dim = config.get("lookup_embedder.dim")
     optimizer_dim = get_optimizer_dim(config, dim)
+    num_meta_keys = get_num_meta_keys(config)
     set_master_environment(config)
     # process groups need to be initialized in every process
     initialize_worker_groups(config, 0)
 
-    TorchParameterServer(world_size, num_keys, dim + optimizer_dim)
+    TorchParameterServer(
+        world_size,
+        num_keys,
+        dim + optimizer_dim,
+        num_meta_keys=num_meta_keys,
+        row_causal_merge=config.get("job.distributed.causal_merge_row"),
+    )
