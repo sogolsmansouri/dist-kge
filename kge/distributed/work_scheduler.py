@@ -318,8 +318,9 @@ class WorkScheduler(mp.get_context("fork").Process):
                 self.num_processed_partitions = 0
                 self._refill_work()
                 self._on_epoch_completed()
-                for worker in self.asking_workers:
-                    self._send_work(worker, cmd_buffer)
+                for worker, machine_id in self.asking_workers:
+                    work_package = self._next_work(worker, machine_id)
+                    self._send_work(worker, cmd_buffer, work_package)
                 self.done_workers = []
                 self.asking_workers = []
                 continue
@@ -329,10 +330,10 @@ class WorkScheduler(mp.get_context("fork").Process):
             if cmd == SCHEDULER_CMDS.GET_WORK:
                 if epoch_time is None:
                     epoch_time = -time.time()
-                if rank in self.done_workers:
-                    self.asking_workers.append(rank)
-                    continue
                 machine_id = cmd_buffer[1].item()
+                if rank in self.done_workers:
+                    self.asking_workers.append((rank, machine_id))
+                    continue
                 work_package = self._next_work(rank, machine_id)
                 self._send_work(rank, cmd_buffer, work_package)
             elif cmd == SCHEDULER_CMDS.WORK_DONE:
