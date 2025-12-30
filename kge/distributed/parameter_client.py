@@ -545,6 +545,31 @@ class SharedParameterClient(KgeParameterClient):
         self.meta_key_tensor = torch.zeros(
             (self.num_meta_keys, self.dim), dtype=torch.float32
         )
+        self._invalid_push_logged = False
+
+    def _filter_invalid_push(
+        self,
+        keys: torch.Tensor,
+        payload: torch.Tensor,
+        context: str,
+    ):
+        if keys.numel() == 0:
+            return keys, payload
+        num_keys = int(self.parameters.size(0))
+        valid_mask = (keys >= 0) & (keys < num_keys)
+        if torch.all(valid_mask):
+            return keys, payload
+        invalid_count = int((~valid_mask).sum().item())
+        if invalid_count > 0 and not self._invalid_push_logged:
+            self.config.log(
+                f"Skipping invalid parameter server keys in {context} "
+                f"(count={invalid_count})."
+            )
+            self._invalid_push_logged = True
+        if not valid_mask.any():
+            return None, None
+        valid_idx = valid_mask.nonzero(as_tuple=False).view(-1)
+        return keys[valid_idx], payload[valid_idx]
 
     @staticmethod
     def _to_cpu_keys(keys) -> torch.Tensor:
@@ -569,6 +594,11 @@ class SharedParameterClient(KgeParameterClient):
             push_tensor = torch.as_tensor(push_tensor)
         if push_tensor.device.type != "cpu":
             push_tensor = push_tensor.cpu()
+        keys, push_tensor = self._filter_invalid_push(
+            keys, push_tensor, context="push"
+        )
+        if keys is None:
+            return
         self.parameters.index_add_(0, keys, push_tensor)
         self._track_push(keys, push_tensor)
 
@@ -591,6 +621,11 @@ class SharedParameterClient(KgeParameterClient):
                 push_tensor = torch.as_tensor(push_tensor)
             if push_tensor.device.type != "cpu":
                 push_tensor = push_tensor.cpu()
+            keys, push_tensor = self._filter_invalid_push(
+                keys, push_tensor, context="push_versioned"
+            )
+            if keys is None:
+                return
             data_limit = self._row_last_partition.numel()
             data_mask = keys < data_limit
             pid = int(partition_id)

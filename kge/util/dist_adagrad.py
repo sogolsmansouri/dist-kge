@@ -210,6 +210,38 @@ class DistAdagrad(Optimizer):
                     if group["sync_level"] == "batch":
                         update_indexes = grad_indices.cpu()
                         push_keys = group["local_to_lapse_mapper"][update_indexes]
+                        num_keys = getattr(self.parameter_client, "num_keys", None)
+                        if num_keys is None and hasattr(self.parameter_client, "parameters"):
+                            try:
+                                num_keys = int(self.parameter_client.parameters.size(0))
+                            except Exception:
+                                num_keys = None
+                        if num_keys is not None:
+                            valid_mask = (push_keys >= 0) & (push_keys < num_keys)
+                        else:
+                            valid_mask = push_keys >= 0
+                        if not torch.all(valid_mask):
+                            invalid_count = int((~valid_mask).sum().item())
+                            if invalid_count > 0 and not getattr(self, "_invalid_push_logged", False):
+                                msg = (
+                                    "Skipping optimizer updates with invalid PS keys "
+                                    f"(count={invalid_count})."
+                                )
+                                if hasattr(self.parameter_client, "config"):
+                                    self.parameter_client.config.log(msg)
+                                else:
+                                    print(msg)
+                                self._invalid_push_logged = True
+                            if not valid_mask.any():
+                                continue
+                            valid_idx = valid_mask.nonzero(as_tuple=False).view(-1)
+                            if update_value.is_cuda:
+                                valid_idx_dev = valid_idx.to(update_value.device)
+                            else:
+                                valid_idx_dev = valid_idx
+                            push_keys = push_keys[valid_idx]
+                            update_value = update_value[valid_idx_dev]
+                            sum_update_values = sum_update_values[valid_idx_dev]
                         payload_buffer = self._acquire_push_buffer(
                             group["name"], len(update_value)
                         )
