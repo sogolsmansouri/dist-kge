@@ -500,27 +500,41 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._relation_grad_count = torch.zeros(
                 self._relation_vocab_size, dtype=torch.long, device="cpu"
             )
+        partition_type = str(self.config.get("job.distributed.partition_type") or "")
+        self._use_glow_features = partition_type == "glow"
+        self._track_partition_gradients = bool(
+            self._use_glow_features
+            or self._relation_gradient_trace
+            or self._gradient_log_interval > 0
+            or self._gradient_log_top_relations > 0
+        )
         self._last_finished_partition = None
         self._current_window_members = None
         self._current_window_entities = None
         self._current_window_versions = None
         self._current_partition_size = 0
         glow_cfg = self.config.get("job.distributed.glow") or {}
-        self._prefetch_window_entities = bool(
-            glow_cfg.get("prefetch_window_entities", False)
-        )
-        self._lookahead_negatives = bool(
-            glow_cfg.get("lookahead_negatives", False)
-        )
-        self._overlap_negative_sampling = bool(
-            glow_cfg.get("overlap_negative_sampling", False)
-        )
-        self._force_overlap_pool = bool(
-            glow_cfg.get("force_pooled_negatives", False)
-        )
+        if self._use_glow_features:
+            self._prefetch_window_entities = bool(
+                glow_cfg.get("prefetch_window_entities", False)
+            )
+            self._lookahead_negatives = bool(
+                glow_cfg.get("lookahead_negatives", False)
+            )
+            self._overlap_negative_sampling = bool(
+                glow_cfg.get("overlap_negative_sampling", False)
+            )
+            self._force_overlap_pool = bool(
+                glow_cfg.get("force_pooled_negatives", False)
+            )
+        else:
+            self._prefetch_window_entities = False
+            self._lookahead_negatives = False
+            self._overlap_negative_sampling = False
+            self._force_overlap_pool = False
         self._overlap_sampling_logged = False
         self._window_prefetch_key = None
-        self._window_work = bool(glow_cfg.get("window_work", False))
+        self._window_work = bool(glow_cfg.get("window_work", False)) if self._use_glow_features else False
         try:
             self._debug_window_versions_remaining = int(
                 glow_cfg.get("debug_window_versions", 0)
@@ -1316,6 +1330,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._relation_grad_count.zero_()
 
     def _accumulate_partition_gradient(self):
+        if not self._track_partition_gradients:
+            return
         if self.is_forward_only or self._current_partition_id is None:
             return
         grad_norm = self._compute_batch_gradient_norm()
@@ -1418,6 +1434,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._relation_grad_count.index_add_(0, rel_ids, ones)
 
     def _flush_partition_gradient_trace(self):
+        if not self._track_partition_gradients:
+            return None
         if (
             self._current_partition_id is None
             or self._partition_grad_samples <= 0
@@ -2049,7 +2067,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             # process each batch
             pre_load_batches = deque()
             batch_index = 0
-            num_prepulls = max(self.entity_pre_pull, self.relation_pre_pull, self.pre_localize_batch, 1)
+            prefetch_enabled = bool(
+                self._lookahead_negatives
+                or self.entity_pre_pull > 0
+                or self.relation_pre_pull > 0
+                or self.pre_localize_batch > 0
+            )
+            num_prepulls = (
+                max(self.entity_pre_pull, self.relation_pre_pull, self.pre_localize_batch, 1)
+                if prefetch_enabled
+                else 0
+            )
             use_materialized_iter = self._use_materialized_iterator() and self._materialized_iterator is not None
             materialized_iter = iter(self._materialized_iterator) if use_materialized_iter else None
             chunk_examples = 0
@@ -2103,13 +2131,14 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                                 self._loader_debug_stats["cpu_triple_batches"] += 1
                     pre_load_batches.append(next_batch)
                     pre_pull_time -= time.time()
-                    if next_batch is not None:
+                    if prefetch_enabled and next_batch is not None:
                         self._prepare_batch_ahead(pre_load_batches, new_batch=next_batch)
                     pre_pull_time += time.time()
                     prepare_time += time.time() - prepare_start
                 if exhausted and not pre_load_batches:
                     break
-                self._prepare_batch_ahead(pre_load_batches)
+                if prefetch_enabled:
+                    self._prepare_batch_ahead(pre_load_batches)
                 batch = pre_load_batches.popleft()
 
                 # create initial batch trace (yet incomplete)
