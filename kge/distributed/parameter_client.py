@@ -546,15 +546,30 @@ class SharedParameterClient(KgeParameterClient):
             (self.num_meta_keys, self.dim), dtype=torch.float32
         )
 
+    @staticmethod
+    def _to_cpu_keys(keys) -> torch.Tensor:
+        if isinstance(keys, torch.Tensor):
+            if keys.dtype != torch.long:
+                keys = keys.long()
+            if keys.device.type != "cpu":
+                keys = keys.cpu()
+            return keys
+        return torch.as_tensor(keys, dtype=torch.long)
+
     @torch.no_grad()
     def pull(self, keys, pull_tensor, asynchronous=False):
-        pull_tensor[:, :] = self.parameters[keys, :]#.index_select(0, keys)
+        keys = self._to_cpu_keys(keys)
+        torch.index_select(self.parameters, 0, keys, out=pull_tensor)
         self._track_pull(keys, pull_tensor)
 
     @torch.no_grad()
     def push(self, keys, push_tensor, asynchronous=False):
-        self.parameters[keys, :] += push_tensor
-        #self.parameters.index_add_(0, keys, push_tensor)
+        keys = self._to_cpu_keys(keys)
+        if not isinstance(push_tensor, torch.Tensor):
+            push_tensor = torch.as_tensor(push_tensor)
+        if push_tensor.device.type != "cpu":
+            push_tensor = push_tensor.cpu()
+        self.parameters.index_add_(0, keys, push_tensor)
         self._track_push(keys, push_tensor)
 
     @torch.no_grad()
@@ -571,10 +586,11 @@ class SharedParameterClient(KgeParameterClient):
             and partition_id is not None
             and partition_version is not None
         ):
-            if not isinstance(keys, torch.Tensor):
-                keys = torch.as_tensor(keys, dtype=torch.long)
+            keys = self._to_cpu_keys(keys)
             if not isinstance(push_tensor, torch.Tensor):
                 push_tensor = torch.as_tensor(push_tensor)
+            if push_tensor.device.type != "cpu":
+                push_tensor = push_tensor.cpu()
             data_limit = self._row_last_partition.numel()
             data_mask = keys < data_limit
             pid = int(partition_id)
@@ -599,7 +615,7 @@ class SharedParameterClient(KgeParameterClient):
                 if torch.any(apply_mask):
                     apply_keys = data_keys[apply_mask]
                     apply_payload = data_payload[apply_mask]
-                    self.parameters[apply_keys, :] += apply_payload
+                    self.parameters.index_add_(0, apply_keys, apply_payload)
                     self._row_last_partition[apply_keys] = pid
                     self._row_last_version[apply_keys] = pver
                 rows = int(data_keys.numel())
@@ -617,7 +633,7 @@ class SharedParameterClient(KgeParameterClient):
             if torch.any(~data_mask):
                 meta_keys = keys[~data_mask]
                 meta_payload = push_tensor[~data_mask]
-                self.parameters[meta_keys, :] += meta_payload
+                self.parameters.index_add_(0, meta_keys, meta_payload)
             self._track_push(keys, push_tensor)
             return
         if (
@@ -633,7 +649,12 @@ class SharedParameterClient(KgeParameterClient):
                 return
         if partition_version > current:
             self._partition_version_state[partition_id] = partition_version
-        self.parameters[keys, :] += push_tensor
+        keys = self._to_cpu_keys(keys)
+        if not isinstance(push_tensor, torch.Tensor):
+            push_tensor = torch.as_tensor(push_tensor)
+        if push_tensor.device.type != "cpu":
+            push_tensor = push_tensor.cpu()
+        self.parameters.index_add_(0, keys, push_tensor)
 
     @torch.no_grad()
     def set(self, keys, set_tensor, asynchronous=False):
