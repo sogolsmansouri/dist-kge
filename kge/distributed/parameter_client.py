@@ -20,6 +20,7 @@ class KgeParameterClient:
             config,
             rank,
     ):
+        self.config = config
         self.rank = rank
         embedding_dim = config.get("lookup_embedder.dim")
         optimizer_dim = get_optimizer_dim(config, embedding_dim)
@@ -172,6 +173,18 @@ class KgeParameterClient:
             raise ValueError(client_type)
 
 
+def _normalize_row_merge_policy(config):
+    policy = str(
+        config.get("job.distributed.causal_merge_row_policy") or "optimistic"
+    ).lower()
+    if policy not in ("optimistic", "strict"):
+        config.log(
+            f"Unknown causal_merge_row_policy '{policy}', falling back to 'optimistic'."
+        )
+        policy = "optimistic"
+    return policy
+
+
 class LapseParameterClient(LapseWorker, KgeParameterClient):
     def __init__(
         self,
@@ -209,7 +222,19 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
         )
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
         self._row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
+        self._row_merge_policy = _normalize_row_merge_policy(config)
+        self._row_merge_max_staleness = max(
+            0, int(config.get("job.distributed.causal_merge_row_max_staleness") or 0)
+        )
+        self._row_merge_log_interval = max(
+            0, int(config.get("job.distributed.causal_merge_row_log_interval") or 0)
+        )
         self._partition_version_state = {}
+        if self._row_causal_merge:
+            config.log(
+                "Row-level causal merge is not supported for Lapse parameter server; "
+                "falling back to standard versioned merge."
+            )
 
     def pull(self, keys, pull_tensor=None, asynchronous=False):
         result = super(LapseParameterClient, self).pull(
@@ -344,6 +369,13 @@ class TorchParameterClient(KgeParameterClient):
         )
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
         self._row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
+        self._row_merge_policy = _normalize_row_merge_policy(config)
+        self._row_merge_max_staleness = max(
+            0, int(config.get("job.distributed.causal_merge_row_max_staleness") or 0)
+        )
+        self._row_merge_log_interval = max(
+            0, int(config.get("job.distributed.causal_merge_row_log_interval") or 0)
+        )
         self._partition_version_state = {}
 
     def pull(self, keys, pull_tensor=None, asynchronous=False):
@@ -464,11 +496,26 @@ class SharedParameterClient(KgeParameterClient):
         )
         self._causal_merge = bool(config.get("job.distributed.causal_merge"))
         self._row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
+        self._row_merge_policy = _normalize_row_merge_policy(config)
+        self._row_merge_max_staleness = max(
+            0, int(config.get("job.distributed.causal_merge_row_max_staleness") or 0)
+        )
+        self._row_merge_log_interval = max(
+            0, int(config.get("job.distributed.causal_merge_row_log_interval") or 0)
+        )
         self._partition_version_state = {}
         self.data_type = torch.float32
         self.lr_buffer = torch.zeros(1, dtype=torch.float32)
         self._row_last_partition = None
         self._row_last_version = None
+        self._row_merge_stats = {
+            "rows": 0,
+            "applied": 0,
+            "dropped": 0,
+            "stale": 0,
+            "owner_mismatch": 0,
+        }
+        self._row_merge_updates = 0
         if self._row_causal_merge:
             data_limit = max(0, self.num_keys - self.num_meta_keys)
             self._row_last_partition = torch.full(
@@ -528,22 +575,45 @@ class SharedParameterClient(KgeParameterClient):
                 keys = torch.as_tensor(keys, dtype=torch.long)
             if not isinstance(push_tensor, torch.Tensor):
                 push_tensor = torch.as_tensor(push_tensor)
-            data_limit = self.num_keys - self.num_meta_keys
+            data_limit = self._row_last_partition.numel()
             data_mask = keys < data_limit
+            pid = int(partition_id)
+            pver = int(partition_version)
             if torch.any(data_mask):
                 data_keys = keys[data_mask]
                 data_payload = push_tensor[data_mask]
                 last_pid = self._row_last_partition[data_keys]
                 last_ver = self._row_last_version[data_keys]
-                apply_mask = (last_pid != int(partition_id)) | (
-                    int(partition_version) >= last_ver
+                owner_mismatch = torch.zeros_like(last_pid, dtype=torch.bool)
+                if self._row_merge_policy == "strict":
+                    owner_mismatch = (last_pid != -1) & (last_pid != pid)
+                    same_owner = ~owner_mismatch
+                else:
+                    same_owner = last_pid == pid
+                stale_mask = same_owner & (
+                    pver + self._row_merge_max_staleness < last_ver
                 )
+                apply_mask = ~stale_mask
+                if self._row_merge_policy == "strict":
+                    apply_mask = apply_mask & ~owner_mismatch
                 if torch.any(apply_mask):
                     apply_keys = data_keys[apply_mask]
                     apply_payload = data_payload[apply_mask]
                     self.parameters[apply_keys, :] += apply_payload
-                    self._row_last_partition[apply_keys] = int(partition_id)
-                    self._row_last_version[apply_keys] = int(partition_version)
+                    self._row_last_partition[apply_keys] = pid
+                    self._row_last_version[apply_keys] = pver
+                rows = int(data_keys.numel())
+                applied = int(apply_mask.sum().item())
+                dropped = rows - applied
+                self._row_merge_stats["rows"] += rows
+                self._row_merge_stats["applied"] += applied
+                self._row_merge_stats["dropped"] += dropped
+                self._row_merge_stats["stale"] += int(stale_mask.sum().item())
+                self._row_merge_stats["owner_mismatch"] += int(
+                    owner_mismatch.sum().item()
+                )
+                self._row_merge_updates += rows
+                self._maybe_log_row_merge_stats()
             if torch.any(~data_mask):
                 meta_keys = keys[~data_mask]
                 meta_payload = push_tensor[~data_mask]
@@ -581,6 +651,35 @@ class SharedParameterClient(KgeParameterClient):
         if self.eval_worker_group is None or not dist.is_initialized():
             return
         dist.barrier(group=self.eval_worker_group)
+
+    def _maybe_log_row_merge_stats(self, final: bool = False):
+        if not self._row_causal_merge:
+            return
+        interval = self._row_merge_log_interval
+        if not final and interval <= 0:
+            return
+        if not final and self._row_merge_updates < interval:
+            return
+        if not final:
+            self._row_merge_updates = 0
+        stats = dict(self._row_merge_stats)
+        if stats.get("rows", 0) <= 0:
+            return
+        dropped = stats["dropped"]
+        rate = dropped / max(1, stats["rows"])
+        self.config.log(
+            "Row-merge stats (shared PS): "
+            f"rows={stats['rows']}, applied={stats['applied']}, "
+            f"dropped={dropped} (rate={rate:.4f}), "
+            f"stale={stats['stale']}, owner_mismatch={stats['owner_mismatch']}."
+        )
+        if final:
+            return
+        for key in self._row_merge_stats:
+            self._row_merge_stats[key] = 0
+
+    def shutdown(self):
+        self._maybe_log_row_merge_stats(final=True)
 
     def stop(self):
         self.push(

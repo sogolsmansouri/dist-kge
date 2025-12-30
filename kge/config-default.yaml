@@ -89,6 +89,9 @@ job:
     conflict_free_merge: False
     causal_merge: False
     causal_merge_row: False
+    causal_merge_row_policy: strict  # optimistic|strict
+    causal_merge_row_max_staleness: 0
+    causal_merge_row_log_interval: 0
     optimizer:
       max_pending_pushes: 2
     hot_entity_cache:

@@ -1004,8 +1004,14 @@ class KgeUniformSampler(KgeSampler):
                 "Requested more unique negative samples than vocabulary size."
             )
         if samples_needed > 0:
-            # torch.randperm with a large vocab is more reliable on CPU; slice and move.
-            unique_samples = torch.randperm(vocab_size, device="cpu")[:samples_needed]
+            # Avoid large randperm allocations on huge vocabularies.
+            if vocab_size > 1_000_000:
+                unique_samples = torch.tensor(
+                    random.sample(range(vocab_size), samples_needed),
+                    dtype=torch.long,
+                )
+            else:
+                unique_samples = torch.randperm(vocab_size, device="cpu")[:samples_needed]
             if target_device.type == "cuda":
                 unique_samples = unique_samples.to(target_device)
         else:

@@ -289,8 +289,8 @@ class WorkScheduler(mp.get_context("fork").Process):
             raise NotImplementedError()
 
     def run(self):
-        self._init_in_started_process()
         set_seeds(config=self.config)
+        self._init_in_started_process()
         set_master_environment(self.config)
         # we have to have a huge timeout here, since it is only called after a complete
         #  epoch on a partition
@@ -1895,6 +1895,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._window_scores = defaultdict(float)
         self._window_counts = defaultdict(int)
         self._partition_to_window = {}
+        self._window_work_key_map = {}
         self._partition_entities_map = None
         self._max_partition_entities = 0
         self._partition_relations_map = None
@@ -2048,6 +2049,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
     def _rebuild_glow_windows(self, ordered_partitions):
         self._glow_windows = deque()
         self._max_window_entities = 0
+        self._window_work_key_map.clear()
         if not ordered_partitions or not self.glow_windows_enabled:
             return
         ordered_partitions = self._order_partitions_by_gradient_graph_clusters(
@@ -2112,6 +2114,43 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._causal_overlap_queue.clear()
         self._causal_overlap_versions.clear()
         self._causal_overlap_active.clear()
+
+    def _register_window_result(
+        self,
+        rank,
+        step_time,
+        window_members,
+        window_versions,
+        reported_chunk_size=0,
+    ):
+        conflicts = super(GlowWorkScheduler, self)._register_window_result(
+            rank,
+            step_time,
+            window_members,
+            window_versions,
+            reported_chunk_size=reported_chunk_size,
+        )
+        if not self.glow_window_work or window_members is None:
+            return conflicts
+        try:
+            if isinstance(window_members, torch.Tensor):
+                members = [int(x) for x in window_members.tolist()]
+            else:
+                members = [int(x) for x in window_members]
+        except Exception:
+            return conflicts
+        if not members:
+            return conflicts
+        window_key = tuple(members)
+        full_key = self._window_work_key_map.pop(window_key, window_key)
+        conflict_flag = bool(conflicts)
+        self._after_partition_result(
+            full_key,
+            float(step_time),
+            conflict=conflict_flag,
+            chunk_size=reported_chunk_size or 0,
+        )
+        return conflicts
 
     def _cluster_partitions_by_affinity(self, ordered_partitions):
         if not self._co_gradient_scores or len(ordered_partitions) < 2:
@@ -2365,6 +2404,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 continue
             for pid in remaining:
                 self._served_partitions.add(pid)
+            if self.glow_window_work:
+                remaining_key = tuple(int(pid) for pid in remaining)
+                full_key = tuple(int(pid) for pid in window_key)
+                self._window_work_key_map[remaining_key] = full_key
             return tuple(remaining)
 
     def _after_partition_result(self, partition_id, avg_time, **kwargs):

@@ -1841,7 +1841,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     if current_partition_id >= 0:
                         self._current_partition_id = int(current_partition_id)
                     else:
-                        self._current_partition_id = None
+                        if window_members is not None and len(window_members) > 0:
+                            self._current_partition_id = tuple(
+                                int(x) for x in window_members.tolist()
+                            )
+                        else:
+                            self._current_partition_id = None
                 else:
                     if isinstance(current_partition_id, torch.Tensor):
                         current_partition_id = current_partition_id.tolist()
