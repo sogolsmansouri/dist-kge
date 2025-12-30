@@ -46,6 +46,7 @@ class DistAdagrad(Optimizer):
         conflict_free_merge=False,
         causal_merge=False,
         row_causal_merge=False,
+        record_replay=True,
     ):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -87,6 +88,7 @@ class DistAdagrad(Optimizer):
         self.conflict_free_merge = bool(conflict_free_merge)
         self.causal_merge = bool(causal_merge)
         self.row_causal_merge = bool(row_causal_merge)
+        self._record_replay = bool(record_replay)
         self._partition_context = {
             "partition_id": None,
             "partition_version": None,
@@ -425,6 +427,8 @@ class DistAdagrad(Optimizer):
     def set_partition_context(self, partition_id: int, partition_version: int):
         self._partition_context["partition_id"] = partition_id
         self._partition_context["partition_version"] = partition_version
+        if not self._record_replay:
+            return
         self._current_replay_key = (partition_id, partition_version)
         self._current_replay_payloads = {"entity": [], "relation": []}
 
@@ -439,10 +443,12 @@ class DistAdagrad(Optimizer):
         }
         self._partition_context_maps["entity"] = entity_partition_map
         self._partition_context_maps["relation"] = relation_partition_map
+        if not self._record_replay:
+            return
         self._window_replay_payloads = {}
 
     def clear_partition_context_map(self):
-        if self._window_replay_payloads:
+        if self._record_replay and self._window_replay_payloads:
             for key, payloads in self._window_replay_payloads.items():
                 self._store_replay_entry(key, payloads)
         self._partition_context_map = None
@@ -451,7 +457,7 @@ class DistAdagrad(Optimizer):
         self._window_replay_payloads = None
 
     def finalize_partition_context(self):
-        if self._current_replay_key is not None:
+        if self._record_replay and self._current_replay_key is not None:
             self._store_replay_entry(
                 self._current_replay_key, self._current_replay_payloads
             )
@@ -482,6 +488,8 @@ class DistAdagrad(Optimizer):
         return (keys.clone(), payload.clone())
 
     def _record_partition_push(self, group_name, keys, payload):
+        if not self._record_replay:
+            return
         if self._current_replay_key is None:
             return
         if keys.numel() == 0 or payload.numel() == 0:
@@ -491,6 +499,8 @@ class DistAdagrad(Optimizer):
         )
 
     def _record_window_push(self, partition_id, version, group_name, keys, payload):
+        if not self._record_replay:
+            return
         if self._window_replay_payloads is None or version is None:
             return
         if keys.numel() == 0 or payload.numel() == 0:

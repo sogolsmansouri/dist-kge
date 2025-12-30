@@ -36,6 +36,22 @@ class KgeOptimizer:
             if config.get("train.lr_scheduler") != "":
                 use_lr_scheduler = True
             min_rank = get_min_rank(config)
+            conflict_free_merge = bool(config.get("job.distributed.conflict_free_merge"))
+            causal_merge = bool(config.get("job.distributed.causal_merge"))
+            row_causal_merge = bool(config.get("job.distributed.causal_merge_row"))
+            record_replay = (not conflict_free_merge) and (
+                causal_merge or row_causal_merge
+            )
+            if config.get("job.distributed.partition_type") == "glow":
+                glow_cfg = config.get("job.distributed.glow") or {}
+                overlap_cfg = glow_cfg.get("causal_overlap") or {}
+                if bool(overlap_cfg.get("enable", False)):
+                    record_replay = True
+                if bool(glow_cfg.get("window_work", False)):
+                    concurrent = bool(glow_cfg.get("concurrent_windows", False))
+                    window_overlap = int(glow_cfg.get("window_overlap", 0) or 0)
+                    if concurrent and window_overlap > 0:
+                        record_replay = True
             optimizer = DistAdagrad(
                 KgeOptimizer._get_parameters_and_optimizer_args(
                     config,
@@ -53,11 +69,10 @@ class KgeOptimizer:
                 max_pending_pushes=config.get(
                     "job.distributed.optimizer.max_pending_pushes"
                 ),
-                conflict_free_merge=config.get(
-                    "job.distributed.conflict_free_merge"
-                ),
-                causal_merge=config.get("job.distributed.causal_merge"),
-                row_causal_merge=config.get("job.distributed.causal_merge_row"),
+                conflict_free_merge=conflict_free_merge,
+                causal_merge=causal_merge,
+                row_causal_merge=row_causal_merge,
+                record_replay=record_replay,
                 **config.get("train.optimizer.default.args"),
             )
             return optimizer
