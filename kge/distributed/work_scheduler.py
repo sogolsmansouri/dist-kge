@@ -2474,11 +2474,18 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         return self._all_relations
 
     def _pop_next_partition(self):
-        if not self.glow_windows_enabled or not self._glow_windows:
+        if not self.glow_windows_enabled:
             try:
                 return self.work_to_do.pop()
             except IndexError:
                 return None
+        if not self._glow_windows:
+            if self._glow_debug and self.work_to_do:
+                self._glow_log(
+                    "Windows empty but work_to_do still has "
+                    f"{len(self.work_to_do)} entries."
+                )
+            return None
         if self.glow_concurrent_windows:
             while True:
                 if self._current_window_entry is None:
