@@ -400,6 +400,53 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _send_work(
         self, rank, cmd_buffer, work_package, pre_localize=False
     ):
+        if (
+            work_package.partition_data is None
+            and getattr(self, "glow_window_work", False)
+            and work_package.window_members is not None
+        ):
+            window_members = [int(pid) for pid in work_package.window_members]
+            partition_slices = []
+            for pid in window_members:
+                partition_tensor = None
+                if 0 <= pid < len(self.partitions):
+                    partition_tensor = self.partitions[pid]
+                if partition_tensor is None or len(partition_tensor) == 0:
+                    continue
+                partition_slices.append(partition_tensor)
+            if partition_slices:
+                work_package.partition_data = (
+                    torch.cat(partition_slices).contiguous()
+                )
+                if work_package.partition_id is None:
+                    work_package.partition_id = tuple(window_members)
+                if work_package.window_versions is None:
+                    window_versions = []
+                    for pid in window_members:
+                        version = self.partition_issue_versions[pid]
+                        self.partition_issue_versions[pid] = version + 1
+                        window_versions.append(int(version))
+                    work_package.window_versions = window_versions
+                if work_package.entities_in_partition is None:
+                    window_entities = None
+                    if hasattr(self, "_get_window_entities"):
+                        window_entities = self._get_window_entities(
+                            tuple(window_members)
+                        )
+                    if window_entities is None:
+                        window_entities = self.local_entities.get(rank)
+                    work_package.entities_in_partition = window_entities
+                if getattr(self, "_glow_debug", False):
+                    self._glow_log(
+                        "Rebuilt window work in _send_work for "
+                        f"{tuple(window_members)} "
+                        f"size={int(work_package.partition_data.numel())}."
+                    )
+            elif getattr(self, "_glow_debug", False):
+                self._glow_log(
+                    "Failed to rebuild window work in _send_work for "
+                    f"{tuple(window_members)}; no partition data."
+                )
         debug_glow = getattr(self, "_glow_debug", False)
         if debug_glow:
             context = "pre_localize" if pre_localize else "work"
