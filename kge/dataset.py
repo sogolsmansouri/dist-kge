@@ -664,16 +664,54 @@ class Dataset(Configurable):
 
     def load_relations_to_partitions(self, num_partitions):
         print("loading partitions")
-        return self._load_list(
-            os.path.join(
-                self.folder,
-                "partitions",
-                self._partition_type,
-                f"num_{num_partitions}",
-                "relation_to_partitions.del",
-            ),
-            use_pickle=self.config.get("dataset.pickle"),
+        output_file = os.path.join(
+            self.folder,
+            "partitions",
+            self._partition_type,
+            f"num_{num_partitions}",
+            "relation_to_partitions.del",
         )
+        try:
+            return self._load_list(
+                output_file,
+                use_pickle=self.config.get("dataset.pickle"),
+            )
+        except Exception as exc:
+            self.config.log(
+                "Relation partition map missing; computing from train triples "
+                f"({exc})."
+            )
+            return self._build_relation_partition_map(
+                num_partitions, output_file
+            )
+
+    def _build_relation_partition_map(self, num_partitions, output_file):
+        assignments = self.load_train_partitions(num_partitions)
+        assignments = np.asarray(assignments).reshape(-1).astype(np.int64)
+        if assignments.size == 0:
+            raise ValueError("empty train partition assignments")
+        rels = self.split("train")[:, 1].cpu().numpy().astype(np.int64)
+        if rels.shape[0] != assignments.shape[0]:
+            raise ValueError(
+                "train partition assignments do not match train triples"
+            )
+        num_relations = self.num_relations()
+        if num_relations == 0:
+            return np.empty((0,), dtype=np.int64)
+        if assignments.min() < 0 or assignments.max() >= num_partitions:
+            raise ValueError(
+                "train partition assignments out of range for "
+                f"num_partitions={num_partitions}"
+            )
+        counts = np.zeros((num_relations, num_partitions), dtype=np.int64)
+        np.add.at(counts, (rels, assignments), 1)
+        relation_map = counts.argmax(axis=1).astype(np.int64)
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        np.savetxt(output_file, relation_map, fmt="%d", delimiter="\t")
+        self.config.log(
+            f"Saved relation partition map to {output_file}."
+        )
+        return relation_map
 
     def load_train_partitions(self, num_partitions):
         print("loading partitions")
