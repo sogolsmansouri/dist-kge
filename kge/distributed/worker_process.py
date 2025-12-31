@@ -29,6 +29,10 @@ class WorkerProcessPool:
         config.log(f"creating worker process pool with {config.get('job.distributed.num_workers')} workers")
         sanitized_pool = self._sanitize_device_pool(config)
         config.set("job.device_pool", sanitized_pool)
+        config.log(
+            "device_pool (sanitized)="
+            f"{sanitized_pool} cuda.device_count={torch.cuda.device_count()}"
+        )
         self.workers = []
         configs = {}
         parameters = None
@@ -137,8 +141,9 @@ class WorkerProcess(mp.get_context("spawn").Process):
         self.result_pipe = result_pipe
 
     def run(self):
-        torch_device = self.config.get("job.device")
-        if self.config.get("job.device") == "cuda":
+        base_device = self.config.get("job.device")
+        torch_device = base_device
+        if base_device == "cuda":
             torch_device = "cuda:0"
         if torch_device != "cpu":
             torch.cuda.set_device(torch_device)
@@ -161,11 +166,26 @@ class WorkerProcess(mp.get_context("spawn").Process):
         if len(device_pool) == 0:
             device_pool.append(self.config.get("job.device"))
         config = deepcopy(self.config)
-        config.set("job.device", device_pool[self.rank % len(device_pool)])
+        selected_device = device_pool[self.rank % len(device_pool)]
+        config.set("job.device", selected_device)
         config.folder = os.path.join(self.config.folder, f"worker-{self.rank}")
         config.init_folder()
         if getattr(config, "invocation", None):
             config.log(config.invocation, echo=False)
+        config.log(
+            "Worker device assignment: "
+            f"rank={self.rank} base_device={base_device} "
+            f"device_pool={device_pool} selected={selected_device} "
+            f"torch_device={torch_device} "
+            f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '')} "
+            f"cuda_count={torch.cuda.device_count()}",
+            echo=False,
+        )
+        if selected_device != "cpu" and torch.cuda.is_available():
+            config.log(
+                f"Worker CUDA current_device={torch.cuda.current_device()}",
+                echo=False,
+            )
 
         parameter_client = KgeParameterClient.create(
             config=config,

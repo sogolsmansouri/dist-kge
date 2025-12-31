@@ -86,6 +86,16 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.eval_hists = []
         self.active_partition_per_worker = dict()
         self.active_partition_chunk_sizes = dict()
+        self._active_partition_start_time = {}
+        self._worker_last_seen = {}
+        self._disabled_workers = set()
+        self._stall_reported = set()
+        self._worker_stall_timeout = float(
+            config.get("job.distributed.worker_stall_timeout") or 0
+        )
+        self._worker_stall_action = str(
+            config.get("job.distributed.worker_stall_action") or "fail"
+        ).lower()
         self.partition_stats = dict()
         self.partition_gradient_stats = defaultdict(lambda: {"sum": 0.0, "count": 0})
         self.partition_relation_gradient_stats = defaultdict(
@@ -311,7 +321,7 @@ class WorkScheduler(mp.get_context("fork").Process):
             cmd_buffer = torch.full((2,), -1, dtype=self.data_type)
 
             # refill work and distribute to all asking workers
-            if len(self.done_workers) == self.num_clients:
+            if self._effective_done_workers() == self.num_clients:
                 epoch_time += time.time()
                 self.config.log(f"complete_epoch_time: {epoch_time}")
                 epoch_time = None
@@ -325,12 +335,18 @@ class WorkScheduler(mp.get_context("fork").Process):
                 self.asking_workers = []
                 continue
 
+            self._check_worker_stalls(time.time())
             rank = dist.recv(cmd_buffer)
+            self._worker_last_seen[rank] = time.time()
             cmd = cmd_buffer[0].item()
             if cmd == SCHEDULER_CMDS.GET_WORK:
                 if epoch_time is None:
                     epoch_time = -time.time()
                 machine_id = cmd_buffer[1].item()
+                if rank in self._disabled_workers:
+                    work_package = WorkPackage()
+                    self._send_work(rank, cmd_buffer, work_package)
+                    continue
                 if rank in self.done_workers:
                     self.asking_workers.append((rank, machine_id))
                     continue
@@ -397,6 +413,62 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _repartition_in_background(self):
         pass
 
+    def _effective_done_workers(self):
+        if not self._disabled_workers:
+            return len(self.done_workers)
+        return len(set(self.done_workers) | self._disabled_workers)
+
+    def _record_partition_start(self, rank, partition_id):
+        self._active_partition_start_time[rank] = time.time()
+        self._stall_reported.discard((rank, partition_id))
+
+    def _clear_partition_state(self, rank):
+        self._active_partition_start_time.pop(rank, None)
+        self._stall_reported = {
+            key for key in self._stall_reported if key[0] != rank
+        }
+
+    def _drop_stalled_worker(self, rank, partition_id, elapsed):
+        self.config.log(
+            "Scheduler watchdog dropping stalled worker "
+            f"{rank} partition={partition_id} elapsed={elapsed:.1f}s."
+        )
+        self._disabled_workers.add(rank)
+        self.active_partition_per_worker.pop(rank, None)
+        self.active_partition_chunk_sizes.pop(rank, None)
+        self.active_partition_versions.pop(rank, None)
+        self._clear_partition_state(rank)
+
+    def _check_worker_stalls(self, now):
+        if self._worker_stall_timeout <= 0:
+            return
+        if not self.active_partition_per_worker:
+            return
+        for rank, start_time in list(self._active_partition_start_time.items()):
+            if rank in self._disabled_workers:
+                continue
+            elapsed = now - start_time
+            if elapsed < self._worker_stall_timeout:
+                continue
+            partition_id = self.active_partition_per_worker.get(rank)
+            report_key = (rank, partition_id)
+            if report_key in self._stall_reported:
+                continue
+            self._stall_reported.add(report_key)
+            action = self._worker_stall_action
+            if action == "drop":
+                self._drop_stalled_worker(rank, partition_id, elapsed)
+                continue
+            if action != "fail":
+                self.config.log(
+                    "Scheduler watchdog invalid action "
+                    f"'{action}', falling back to 'fail'."
+                )
+            raise RuntimeError(
+                "Scheduler watchdog detected stalled worker "
+                f"{rank} partition={partition_id} elapsed={elapsed:.1f}s"
+            )
+
     def _send_work(
         self, rank, cmd_buffer, work_package, pre_localize=False
     ):
@@ -450,8 +522,20 @@ class WorkScheduler(mp.get_context("fork").Process):
         debug_glow = getattr(self, "_glow_debug", False)
         if debug_glow:
             context = "pre_localize" if pre_localize else "work"
-            if work_package.partition_data is None:
-                self._glow_log(f"Sending NO_WORK to rank {rank} ({context}).")
+            if work_package.wait:
+                self._glow_log(
+                    "Sending WAIT to rank "
+                    f"{rank} ({context}) "
+                    f"active={len(self.active_partition_per_worker)} "
+                    f"disabled={len(self._disabled_workers)}."
+                )
+            elif work_package.partition_data is None:
+                self._glow_log(
+                    "Sending NO_WORK to rank "
+                    f"{rank} ({context}) "
+                    f"active={len(self.active_partition_per_worker)} "
+                    f"disabled={len(self._disabled_workers)}."
+                )
             else:
                 window_members = work_package.window_members
                 window_members = (
@@ -462,7 +546,9 @@ class WorkScheduler(mp.get_context("fork").Process):
                     f"{rank} ({context}) "
                     f"partition_id={work_package.partition_id} "
                     f"size={len(work_package.partition_data)} "
-                    f"window_members={window_members}."
+                    f"window_members={window_members} "
+                    f"active={len(self.active_partition_per_worker)} "
+                    f"disabled={len(self._disabled_workers)}."
                 )
         if work_package.partition_data is not None:
             if work_package.partition_id is not None:
@@ -504,6 +590,7 @@ class WorkScheduler(mp.get_context("fork").Process):
             dist.send(version_tensor, dst=rank)
             if not pre_localize:
                 self.active_partition_per_worker[rank] = work_package.partition_id
+                self._record_partition_start(rank, work_package.partition_id)
                 if (
                     work_package.window_members is not None
                     and work_package.window_versions is not None
@@ -597,6 +684,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.active_partition_per_worker.pop(rank, None)
         self.active_partition_chunk_sizes.pop(rank, None)
         self.active_partition_versions.pop(rank, None)
+        self._clear_partition_state(rank)
 
     def _handle_init_info(self, rank):
         max_entities = self._get_max_entities()

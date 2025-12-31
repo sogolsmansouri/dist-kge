@@ -81,6 +81,8 @@ job:
     pre_localize_batch: False # pre localize entities in batch one batch ahead
     scheduler_data_type: int32 # torch type used for communication of the work scheduler
     scheduler_prefetch: 1      # number of partitions to prefetch per worker request
+    worker_stall_timeout: 0    # seconds; 0 disables scheduler watchdog
+    worker_stall_action: 'fail' # fail|drop
     materialize_partition_batches: False  # stage partition triples once per chunk instead of per batch
     stage_local_ids: False  # remap partition triples to local ids before staging
     map_ids_on_gpu: False  # map global->local ids on GPU when stage_local_ids is False
