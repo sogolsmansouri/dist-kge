@@ -2362,19 +2362,19 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 entities = entities.to(dtype=self.data_type).contiguous()
                 mapping[partition_id] = entities
                 max_entities = max(max_entities, int(entities.numel()))
-        self._partition_entities_map = mapping
-        self._max_partition_entities = max_entities
-        self.config.log(
-            f"Glow scheduler computed entity sets for {len(mapping)} partitions "
-            f"from train triples ({reason})."
-        )
-        if self._glow_debug and mapping:
-            counts = [int(v.numel()) for v in mapping.values()]
-            self._glow_log(
-                "Partition entity counts "
-                f"avg={sum(counts) / max(1, len(counts)):.0f}, "
-                f"min={min(counts)}, max={max(counts)}."
+            self._partition_entities_map = mapping
+            self._max_partition_entities = max_entities
+            self.config.log(
+                f"Glow scheduler computed entity sets for {len(mapping)} partitions "
+                f"from train triples ({reason})."
             )
+            if self._glow_debug and mapping:
+                counts = [int(v.numel()) for v in mapping.values()]
+                self._glow_log(
+                    "Partition entity counts "
+                    f"avg={sum(counts) / max(1, len(counts)):.0f}, "
+                    f"min={min(counts)}, max={max(counts)}."
+                )
 
         if (
             self._glow_base_partition_type == "stratification"
