@@ -13,6 +13,7 @@ import os
 from typing import Tuple
 
 import torch
+import os
 
 try:  # pragma: no-cover - optional dependency
     import triton
@@ -20,6 +21,17 @@ try:  # pragma: no-cover - optional dependency
 
     _HAS_TRITON = True
 except Exception:  # pragma: no-cover - import guard
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
+_DISABLE_TRITON = os.getenv("KGE_DISABLE_TRITON", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+if _DISABLE_TRITON:
     triton = None
     tl = None
     _HAS_TRITON = False
