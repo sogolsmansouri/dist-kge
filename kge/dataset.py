@@ -687,24 +687,53 @@ class Dataset(Configurable):
 
     def _build_relation_partition_map(self, num_partitions, output_file):
         assignments = self.load_train_partitions(num_partitions)
-        assignments = np.asarray(assignments).reshape(-1).astype(np.int64)
+        assignments = np.asarray(assignments)
         if assignments.size == 0:
             raise ValueError("empty train partition assignments")
         rels = self.split("train")[:, 1].cpu().numpy().astype(np.int64)
-        if rels.shape[0] != assignments.shape[0]:
+        num_triples = rels.shape[0]
+        partition_ids = None
+        partition_count = None
+        if assignments.ndim == 2 and assignments.shape[1] >= 2:
+            if assignments.shape[0] != num_triples:
+                raise ValueError(
+                    "train partition assignments do not match train triples "
+                    f"(assignments={assignments.shape}, triples={num_triples})"
+                )
+            cols = assignments[:, :2].astype(np.int64, copy=False)
+            if (
+                cols.min() < 0
+                or cols.max() >= num_partitions
+            ):
+                raise ValueError(
+                    "train partition assignments out of range for "
+                    f"num_partitions={num_partitions}"
+                )
+            partition_ids = cols[:, 0] * num_partitions + cols[:, 1]
+            partition_count = num_partitions * num_partitions
+        else:
+            assignments = assignments.reshape(-1).astype(np.int64, copy=False)
+            if assignments.shape[0] != num_triples:
+                raise ValueError(
+                    "train partition assignments do not match train triples "
+                    f"(assignments={assignments.shape}, triples={num_triples})"
+                )
+            if assignments.min() < 0 or assignments.max() >= num_partitions:
+                raise ValueError(
+                    "train partition assignments out of range for "
+                    f"num_partitions={num_partitions}"
+                )
+            partition_ids = assignments
+            partition_count = num_partitions
+        if partition_ids is None or partition_count is None:
             raise ValueError(
-                "train partition assignments do not match train triples"
+                "train partition assignments could not be interpreted"
             )
         num_relations = self.num_relations()
         if num_relations == 0:
             return np.empty((0,), dtype=np.int64)
-        if assignments.min() < 0 or assignments.max() >= num_partitions:
-            raise ValueError(
-                "train partition assignments out of range for "
-                f"num_partitions={num_partitions}"
-            )
-        counts = np.zeros((num_relations, num_partitions), dtype=np.int64)
-        np.add.at(counts, (rels, assignments), 1)
+        counts = np.zeros((num_relations, partition_count), dtype=np.int64)
+        np.add.at(counts, (rels, partition_ids), 1)
         relation_map = counts.argmax(axis=1).astype(np.int64)
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
         np.savetxt(output_file, relation_map, fmt="%d", delimiter="\t")
