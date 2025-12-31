@@ -3140,19 +3140,40 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             window_members = [int(pid) for pid in window_members]
             partition_slices = []
             window_versions = []
+            sizes = None
+            if self._glow_debug_verbose:
+                sizes = []
             for pid in window_members:
                 partition_tensor = self.partitions[pid]
+                if sizes is not None:
+                    sizes.append(
+                        0 if partition_tensor is None else int(len(partition_tensor))
+                    )
                 if partition_tensor is None or len(partition_tensor) == 0:
                     continue
                 partition_slices.append(partition_tensor)
                 version = self.partition_issue_versions[pid]
                 self.partition_issue_versions[pid] = version + 1
                 window_versions.append(int(version))
+            if sizes is not None:
+                self._glow_log_verbose(
+                    f"Window work build {tuple(window_members)} sizes={sizes}."
+                )
             if not partition_slices:
+                if self._glow_debug:
+                    self._glow_log(
+                        f"Window work build {tuple(window_members)} "
+                        "produced empty partition_data."
+                    )
                 return None
             work_package = WorkPackage()
             work_package.partition_id = tuple(window_members)
             work_package.partition_data = torch.cat(partition_slices).contiguous()
+            if self._glow_debug and work_package.partition_data.numel() == 0:
+                self._glow_log(
+                    f"Window work build {tuple(window_members)} "
+                    "produced 0 triples after concat."
+                )
             if self.config.get("job.distributed.shuffle_partition_samples"):
                 perm = torch.randperm(
                     work_package.partition_data.numel(), dtype=self.data_type

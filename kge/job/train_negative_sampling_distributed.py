@@ -1849,6 +1849,28 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.relation_partition_localized = False
             if work is None:
                 break
+            if work.numel() == 0:
+                window_members_list = None
+                if window_members is not None and len(window_members) > 0:
+                    try:
+                        window_members_list = [
+                            int(x) for x in window_members.tolist()
+                        ]
+                    except Exception:
+                        window_members_list = str(window_members)
+                ent_count = int(work_entities.numel()) if work_entities is not None else 0
+                rel_count = int(work_relations.numel()) if work_relations is not None else 0
+                window_ent_count = (
+                    int(window_entities.numel()) if window_entities is not None else 0
+                )
+                self.config.log(
+                    "Received empty work package "
+                    f"(partition_id={current_partition_id}, "
+                    f"window_members={window_members_list}, "
+                    f"version={current_partition_version}, "
+                    f"entities={ent_count}, relations={rel_count}, "
+                    f"window_entities={window_ent_count})."
+                )
             self._current_partition_size = int(work.numel())
             if window_members is not None and len(window_members) > 0:
                 self._current_window_members = window_members.long()
