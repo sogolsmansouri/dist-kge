@@ -81,6 +81,9 @@ def fused_embedding_optimizer_update(
     if (
         not _HAS_TRITON
         or not embeddings.is_cuda
+        or not optimizer_values.is_cuda
+        or not optimizer_updates.is_cuda
+        or not indices.is_cuda
         or not embedding_updates.is_cuda
         or embeddings.shape[1] > MAX_BLOCK_SIZE
         or optimizer_values.shape[1] > MAX_BLOCK_SIZE

@@ -2139,10 +2139,18 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if self._glow_debug:
             window_count = len(self._glow_windows)
             entity_counts = []
+            overlap_ratios = []
+            window_stats = []
             if self._partition_entities_map is not None:
                 for entry in list(self._glow_windows):
-                    entity_counts.append(
-                        self._estimate_window_entity_count(entry.get("key"))
+                    window_key = entry.get("key")
+                    unique_count, total_count, overlap_ratio = (
+                        self._estimate_window_entity_overlap(window_key)
+                    )
+                    entity_counts.append(unique_count)
+                    overlap_ratios.append(overlap_ratio)
+                    window_stats.append(
+                        (window_key, unique_count, total_count, overlap_ratio)
                     )
             msg = (
                 "Rebuilt windows "
@@ -2158,6 +2166,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     f"{sum(entity_counts) / max(1, len(entity_counts)):.0f}, "
                     f"min={min(entity_counts)}, max={max(entity_counts)}."
                 )
+            if overlap_ratios:
+                msg += (
+                    " overlap_ratio_avg="
+                    f"{sum(overlap_ratios) / max(1, len(overlap_ratios)):.4f}, "
+                    f"min={min(overlap_ratios):.4f}, "
+                    f"max={max(overlap_ratios):.4f}."
+                )
             self._glow_log(msg)
             if self._glow_debug_verbose:
                 limit = self._glow_debug_window_limit
@@ -2165,14 +2180,22 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     if limit and idx >= limit:
                         break
                     window_key = entry.get("key")
-                    count = (
-                        self._estimate_window_entity_count(window_key)
-                        if self._partition_entities_map is not None
-                        else 0
-                    )
+                    stats = None
+                    for candidate in window_stats:
+                        if candidate[0] == window_key:
+                            stats = candidate
+                            break
+                    if stats is None:
+                        unique_count, total_count, overlap_ratio = (
+                            self._estimate_window_entity_overlap(window_key)
+                        )
+                    else:
+                        _, unique_count, total_count, overlap_ratio = stats
                     self._glow_log_verbose(
                         f"Window[{idx}] key={window_key} "
-                        f"entities={count}."
+                        f"entities_unique={unique_count}, "
+                        f"entities_total={total_count}, "
+                        f"overlap_ratio={overlap_ratio:.4f}."
                     )
         if (
             (self.glow_overlap_sampling or self.glow_window_work)
@@ -2809,6 +2832,28 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if len(tensors) == 1:
             return int(tensors[0].numel())
         return int(torch.unique(torch.cat(tensors)).numel())
+
+    def _estimate_window_entity_overlap(self, window_key):
+        if self._partition_entities_map is None or not window_key:
+            return 0, 0, 0.0
+        tensors = []
+        total_count = 0
+        for pid in window_key:
+            entries = self._partition_entities_map.get(pid)
+            if entries is None or entries.numel() == 0:
+                continue
+            total_count += int(entries.numel())
+            tensors.append(entries)
+        if not tensors:
+            return 0, 0, 0.0
+        if len(tensors) == 1:
+            unique_count = int(tensors[0].numel())
+        else:
+            unique_count = int(torch.unique(torch.cat(tensors)).numel())
+        if total_count <= 0:
+            return unique_count, total_count, 0.0
+        overlap_ratio = max(0.0, 1.0 - unique_count / total_count)
+        return unique_count, total_count, overlap_ratio
 
     def _maybe_reshape_partitions(self):
         if not self.reshape_enabled:
