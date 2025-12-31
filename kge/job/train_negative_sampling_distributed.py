@@ -457,12 +457,20 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.relation_sync_level = self.config.get(
             "job.distributed.relation_sync_level"
         )
-        # DistAdagrad already pushes sparse updates per step; avoid full set at partition end.
+        # DistAdagrad pushes sparse updates per step only for batch-level sync.
+        # When using partition-level sync, we must write back the pulled embeddings.
+        has_partition_sync = (
+            self.entity_sync_level == "partition"
+            or self.relation_sync_level == "partition"
+        )
         self._skip_partition_set = (
-            isinstance(self.optimizer, DistAdagrad)
-            or bool(self.config.get("job.distributed.causal_merge"))
-            or bool(self.config.get("job.distributed.causal_merge_row"))
-            or bool(self._window_work)
+            (not has_partition_sync)
+            and (
+                isinstance(self.optimizer, DistAdagrad)
+                or bool(self.config.get("job.distributed.causal_merge"))
+                or bool(self.config.get("job.distributed.causal_merge_row"))
+                or bool(self._window_work)
+            )
         )
         self._entity_vocab_size = self.dataset.num_entities()
         self._relation_vocab_size = self.dataset.num_relations()
