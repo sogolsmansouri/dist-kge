@@ -1459,7 +1459,8 @@ class RandomWorkScheduler(AdaptiveWorkScheduler):
 
     def _load_partitions(self, num_partitions):
         num_triples = len(self.dataset.split("train"))
-        permuted_triple_index = torch.randperm(num_triples, dtype=self.data_type)
+        # Use long indices for safe tensor indexing.
+        permuted_triple_index = torch.randperm(num_triples)
         partitions = list(torch.chunk(permuted_triple_index, num_partitions))
         partitions = [p.clone() for p in partitions]
         return partitions
@@ -2068,7 +2069,8 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         )
         if base_type == "random":
             num_triples = len(self.dataset.split("train"))
-            permuted_triple_index = torch.randperm(num_triples, dtype=self.data_type)
+            # Use long indices for safe tensor indexing.
+            permuted_triple_index = torch.randperm(num_triples)
             partitions = list(torch.chunk(permuted_triple_index, num_partitions))
             partitions = [p.clone() for p in partitions]
             return partitions
@@ -3311,6 +3313,15 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 if self.glow_window_work:
                     window_members = self._pop_next_window()
                     if window_members is None:
+                        if self.active_partition_per_worker:
+                            if self._glow_debug:
+                                self._glow_log(
+                                    "Window work queue empty; active partitions "
+                                    f"remain, returning WAIT to rank {rank}."
+                                )
+                            work_package = WorkPackage()
+                            work_package.wait = True
+                            return work_package
                         if self._glow_debug:
                             self._glow_log(
                                 "Window work queue empty; returning NO_WORK "
