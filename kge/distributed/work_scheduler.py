@@ -3228,6 +3228,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 if self.glow_window_work:
                     window_members = self._pop_next_window()
                     if window_members is None:
+                        if self._glow_debug:
+                            self._glow_log(
+                                "Window work queue empty; returning NO_WORK "
+                                f"to rank {rank}."
+                            )
                         return WorkPackage()
                     work_package = build_window_work(window_members)
                     if work_package is None:
@@ -3237,6 +3242,19 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                                 "returned None."
                             )
                         continue
+                    if self._glow_debug:
+                        data = work_package.partition_data
+                        if data is None:
+                            data_info = "None"
+                        else:
+                            data_info = (
+                                f"numel={int(data.numel())} "
+                                f"shape={tuple(data.shape)}"
+                            )
+                        self._glow_log(
+                            f"Built window work {tuple(window_members)} "
+                            f"partition_data={data_info}."
+                        )
                     if self._glow_debug:
                         size = (
                             int(work_package.partition_data.numel())
@@ -3287,6 +3305,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     self._causal_overlap_active[partition_id] += 1
                 return work_package
         except IndexError:
+            if self._glow_debug:
+                self._glow_log(
+                    "IndexError while selecting work; returning NO_WORK."
+                )
             return WorkPackage()
 
     def _handle_work_done(self, rank):
