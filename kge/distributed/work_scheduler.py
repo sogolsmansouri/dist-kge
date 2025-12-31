@@ -3231,7 +3231,22 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                         return WorkPackage()
                     work_package = build_window_work(window_members)
                     if work_package is None:
+                        if self._glow_debug:
+                            self._glow_log(
+                                f"Window work build {tuple(window_members)} "
+                                "returned None."
+                            )
                         continue
+                    if self._glow_debug:
+                        size = (
+                            int(work_package.partition_data.numel())
+                            if work_package.partition_data is not None
+                            else -1
+                        )
+                        self._glow_log(
+                            f"Dispatching window work {tuple(window_members)} "
+                            f"size={size} to rank {rank}."
+                        )
                     return work_package
                 if self._causal_overlap_enabled and self._causal_overlap_queue:
                     partition_id = self._causal_overlap_queue.popleft()
