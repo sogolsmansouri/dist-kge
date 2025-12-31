@@ -400,6 +400,23 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _send_work(
         self, rank, cmd_buffer, work_package, pre_localize=False
     ):
+        debug_glow = getattr(self, "_glow_debug", False)
+        if debug_glow:
+            context = "pre_localize" if pre_localize else "work"
+            if work_package.partition_data is None:
+                self._glow_log(f"Sending NO_WORK to rank {rank} ({context}).")
+            else:
+                window_members = work_package.window_members
+                window_members = (
+                    tuple(window_members) if window_members is not None else None
+                )
+                self._glow_log(
+                    "Sending WORK to rank "
+                    f"{rank} ({context}) "
+                    f"partition_id={work_package.partition_id} "
+                    f"size={len(work_package.partition_data)} "
+                    f"window_members={window_members}."
+                )
         if work_package.partition_data is not None:
             if work_package.partition_id is not None:
                 if work_package.reuse_partition_version:

@@ -1848,6 +1848,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.entity_partition_localized = False
             self.relation_partition_localized = False
             if work is None:
+                self.config.log(
+                    "No work received from scheduler; ending epoch early."
+                )
                 break
             if work.numel() == 0:
                 window_members_list = None
