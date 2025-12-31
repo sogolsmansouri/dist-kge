@@ -3273,8 +3273,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     "produced 0 triples after concat."
                 )
             if self.config.get("job.distributed.shuffle_partition_samples"):
+                # Use long indices for safe tensor indexing.
                 perm = torch.randperm(
-                    work_package.partition_data.numel(), dtype=self.data_type
+                    work_package.partition_data.numel(),
+                    device=work_package.partition_data.device,
                 )
                 work_package.partition_data = work_package.partition_data[perm]
             work_package.window_members = list(window_members)
