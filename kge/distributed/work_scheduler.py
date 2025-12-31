@@ -2049,6 +2049,15 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._load_existing_gradients()
         self._init_partition_entity_map()
         self._init_partition_relation_map()
+        actual_partitions = len(self.partitions)
+        if actual_partitions != self.num_partitions:
+            self._glow_log(
+                "Adjusting num_partitions from "
+                f"{self.num_partitions} to {actual_partitions} "
+                "to match loaded partitions."
+            )
+            self.num_partitions = actual_partitions
+            self.work_to_do = deque(list(range(self.num_partitions)))
         self._current_window_entry = None
         self._rebuild_glow_windows(list(range(self.num_partitions)))
 
@@ -2640,7 +2649,22 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             window_key = entry.get("key")
             if not window_key:
                 continue
-            remaining = [pid for pid in window_key if pid not in self._served_partitions]
+            invalid = [
+                pid
+                for pid in window_key
+                if not (0 <= int(pid) < len(self.partitions))
+            ]
+            if invalid and self._glow_debug:
+                self._glow_log(
+                    "Glow window contains invalid partition ids "
+                    f"{invalid}; partitions_len={len(self.partitions)}."
+                )
+            remaining = [
+                pid
+                for pid in window_key
+                if pid not in self._served_partitions
+                and (0 <= int(pid) < len(self.partitions))
+            ]
             if not remaining:
                 continue
             for pid in remaining:
@@ -3208,6 +3232,16 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             if self._glow_debug_verbose:
                 sizes = []
             for pid in window_members:
+                if pid < 0 or pid >= len(self.partitions):
+                    if self._glow_debug:
+                        self._glow_log(
+                            "Window work member pid "
+                            f"{pid} out of range; "
+                            f"partitions_len={len(self.partitions)}."
+                        )
+                    if sizes is not None:
+                        sizes.append(0)
+                    continue
                 partition_tensor = self.partitions[pid]
                 if sizes is not None:
                     sizes.append(
