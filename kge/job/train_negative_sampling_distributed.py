@@ -1457,6 +1457,21 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             "grad_avg": grad_sum / max(1, count),
         }
         partition_id = self._current_partition_id
+        rel_ids = None
+        rel_sums = None
+        rel_counts = None
+        rel_partitions = None
+        if self._relation_gradient_trace and self._relation_grad_sum is not None:
+            mask = self._relation_grad_count > 0
+            if mask.any():
+                rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
+                rel_sums = self._relation_grad_sum[mask]
+                rel_counts = self._relation_grad_count[mask]
+                summary["relation_grad_count"] = int(rel_ids.numel())
+                if self._relation_partition_map is not None:
+                    rel_partitions = self._relation_partition_map.to(
+                        device=rel_ids.device
+                    )[rel_ids]
         if isinstance(partition_id, (list, tuple)):
             partition_ids = [
                 int(x)
@@ -1472,20 +1487,25 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self.work_scheduler_client.register_partition_gradient(
                     pid, per_sum, per_count
                 )
+            if rel_ids is not None and rel_partitions is not None:
+                for pid in torch.unique(rel_partitions).tolist():
+                    pid_mask = rel_partitions == pid
+                    if not torch.any(pid_mask):
+                        continue
+                    self.work_scheduler_client.register_partition_relation_gradient(
+                        int(pid),
+                        rel_ids[pid_mask],
+                        rel_sums[pid_mask],
+                        rel_counts[pid_mask],
+                    )
         else:
             self.work_scheduler_client.register_partition_gradient(
                 partition_id, grad_sum, count
             )
-            if self._relation_gradient_trace and self._relation_grad_sum is not None:
-                mask = self._relation_grad_count > 0
-                if mask.any():
-                    rel_ids = torch.nonzero(mask, as_tuple=False).view(-1)
-                    rel_sums = self._relation_grad_sum[mask]
-                    rel_counts = self._relation_grad_count[mask]
-                    summary["relation_grad_count"] = int(rel_ids.numel())
-                    self.work_scheduler_client.register_partition_relation_gradient(
-                        partition_id, rel_ids, rel_sums, rel_counts
-                    )
+            if rel_ids is not None:
+                self.work_scheduler_client.register_partition_relation_gradient(
+                    partition_id, rel_ids, rel_sums, rel_counts
+                )
         self._reset_partition_gradient_trace()
         self._last_partition_grad_summary = summary
         return summary
