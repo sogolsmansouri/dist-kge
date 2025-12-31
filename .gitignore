@@ -153,3 +153,7 @@ docs/_build
 # Large datasets / generated artifacts (do not commit)
 data/freebase/train.del
 data/freebase/partitions/
+
+# local run outputs / checkpoints
+wikidata5m_glow_2gpu/
+*.pt

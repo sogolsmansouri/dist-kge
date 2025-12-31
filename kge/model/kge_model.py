@@ -397,6 +397,8 @@ class KgeModel(KgeBase):
         max_partition_entities=0,
     ):
         super().__init__(config, dataset, configuration_key)
+        self._parameter_client = parameter_client
+        self._max_partition_entities = max_partition_entities
 
         # TODO support different embedders for subjects and objects
 
@@ -503,12 +505,21 @@ class KgeModel(KgeBase):
             self._scorer = scorer
 
     def _create_embedders(self, init_for_load_only):
+        entity_vocab_size = self.dataset.num_entities()
+        if (
+            self.config.get("job.distributed.entity_sync_level") == "partition"
+            and self._max_partition_entities
+        ):
+            entity_vocab_size = self._max_partition_entities
         self._entity_embedder = KgeEmbedder.create(
             self.config,
             self.dataset,
             self.configuration_key + ".entity_embedder",
-            self.dataset.num_entities(),
+            entity_vocab_size,
             init_for_load_only=init_for_load_only,
+            parameter_client=self._parameter_client,
+            lapse_offset=0,
+            complete_vocab_size=self.dataset.num_entities(),
         )
 
         #: Embedder used for relations
@@ -519,6 +530,9 @@ class KgeModel(KgeBase):
             self.configuration_key + ".relation_embedder",
             num_relations,
             init_for_load_only=init_for_load_only,
+            parameter_client=self._parameter_client,
+            lapse_offset=self.dataset.num_entities(),
+            complete_vocab_size=self.dataset.num_relations(),
         )
 
         if not init_for_load_only:

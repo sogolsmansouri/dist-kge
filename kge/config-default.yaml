@@ -164,6 +164,10 @@ job:
       overlap_negative_sampling: False
       stratification_pairs: True
       debug_window_versions: 0
+      debug_log: False
+      debug_log_verbose: False
+      debug_log_interval: 50
+      debug_log_window_limit: 10
       affinity_alpha: 0.3
       bandit:
         enable: True

@@ -1797,6 +1797,20 @@ class GraphCutWorkScheduler(WorkScheduler):
 class GlowWorkScheduler(AdaptiveWorkScheduler):
     def __init__(self, config, dataset):
         glow_cfg = config.get("job.distributed.glow") or {}
+        self._glow_debug = bool(glow_cfg.get("debug_log", False))
+        self._glow_debug_verbose = bool(
+            glow_cfg.get("debug_log_verbose", False)
+        )
+        if self._glow_debug_verbose:
+            self._glow_debug = True
+        self._glow_debug_interval = max(
+            1, int(glow_cfg.get("debug_log_interval", 50))
+        )
+        self._glow_debug_window_limit = max(
+            0, int(glow_cfg.get("debug_log_window_limit", 0))
+        )
+        self._glow_debug_pick_count = 0
+        self._glow_debug_result_count = 0
         base_partition_type = glow_cfg.get("base_partition_type") or "random"
         dataset._partition_type = base_partition_type
         self._glow_base_partition_type = base_partition_type
@@ -1888,6 +1902,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 "Disabled causal_overlap because window_work already "
                 "issues multi-partition windows."
             )
+        if self._glow_debug:
+            config.log(
+                "Glow debug logging enabled "
+                f"(verbose={self._glow_debug_verbose}, "
+                f"interval={self._glow_debug_interval})."
+            )
         self._glow_windows: deque = deque()
         self._current_window_entry = None
         self._max_window_entities = 0
@@ -1926,8 +1946,34 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         )
         self._train_triples_cache = None
 
+    def _glow_log(self, message: str):
+        if self._glow_debug:
+            self.config.log(f"Glow debug: {message}")
+
+    def _glow_log_verbose(self, message: str):
+        if self._glow_debug_verbose:
+            self.config.log(f"Glow debug: {message}")
+
     def _init_in_started_process(self):
         super(GlowWorkScheduler, self)._init_in_started_process()
+        self._glow_log(
+            "Init settings "
+            f"base_partition_type={self._glow_base_partition_type}, "
+            f"num_partitions={self.num_partitions}, "
+            f"num_workers={self.num_clients}, "
+            f"window_size={self.glow_window_size}, "
+            f"window_overlap={self.glow_window_overlap}, "
+            f"concurrent_windows={self.glow_concurrent_windows}, "
+            f"window_work={self.glow_window_work}, "
+            f"overlap_sampling={self.glow_overlap_sampling}, "
+            f"prefetch_window_entities={self._send_window_entities}, "
+            f"lookahead_negatives="
+            f"{self.config.get('job.distributed.glow.lookahead_negatives')}, "
+            f"bandit={self.glow_bandit_enabled}, "
+            f"reshape={self.reshape_enabled}, "
+            f"gradient_clustering={self._gradient_cluster_enabled}, "
+            f"causal_overlap={self._causal_overlap_enabled}."
+        )
         effective = getattr(self, "_glow_effective_partitions", None)
         if effective is not None and effective != self.num_partitions:
             self.config.log(
@@ -1944,6 +1990,9 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
 
     def _load_partitions(self, num_partitions):
         base_type = getattr(self.dataset, "_partition_type", "random")
+        self._glow_log(
+            f"Loading partitions base_type={base_type}, num_partitions={num_partitions}."
+        )
         if base_type == "random":
             num_triples = len(self.dataset.split("train"))
             permuted_triple_index = torch.randperm(num_triples, dtype=self.data_type)
@@ -1968,6 +2017,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             )
             if use_pairs:
                 pairs = np.unique(partition_assignment, axis=0)
+                self._glow_log(
+                    "Stratification pairs enabled; "
+                    f"unique_pairs={len(pairs)}."
+                )
                 partitions = []
                 for pair in pairs:
                     mask = (
@@ -1982,6 +2035,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     )
                 self._glow_effective_partitions = len(partitions)
                 return partitions
+            self._glow_log("Stratification pairs disabled.")
         partition_indexes = np.unique(partition_assignment)
         partitions = [
             torch.from_numpy(
@@ -2082,6 +2136,44 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     self._max_window_entities = window_count
         self._sort_glow_windows()
         self._served_partitions = set()
+        if self._glow_debug:
+            window_count = len(self._glow_windows)
+            entity_counts = []
+            if self._partition_entities_map is not None:
+                for entry in list(self._glow_windows):
+                    entity_counts.append(
+                        self._estimate_window_entity_count(entry.get("key"))
+                    )
+            msg = (
+                "Rebuilt windows "
+                f"count={window_count}, "
+                f"size={self.glow_window_size}, "
+                f"overlap={self.glow_window_overlap}, "
+                f"step={step}, "
+                f"max_window_entities={self._max_window_entities}."
+            )
+            if entity_counts:
+                msg += (
+                    " window_entities_avg="
+                    f"{sum(entity_counts) / max(1, len(entity_counts)):.0f}, "
+                    f"min={min(entity_counts)}, max={max(entity_counts)}."
+                )
+            self._glow_log(msg)
+            if self._glow_debug_verbose:
+                limit = self._glow_debug_window_limit
+                for idx, entry in enumerate(list(self._glow_windows)):
+                    if limit and idx >= limit:
+                        break
+                    window_key = entry.get("key")
+                    count = (
+                        self._estimate_window_entity_count(window_key)
+                        if self._partition_entities_map is not None
+                        else 0
+                    )
+                    self._glow_log_verbose(
+                        f"Window[{idx}] key={window_key} "
+                        f"entities={count}."
+                    )
         if (
             (self.glow_overlap_sampling or self.glow_window_work)
             and self._max_window_entities > self._max_partition_entities
@@ -2103,6 +2195,17 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             reverse=True,
         )
         self._glow_windows = deque(sorted_entries)
+        if self._glow_debug_verbose:
+            limit = self._glow_debug_window_limit or 5
+            summary = []
+            for entry in list(self._glow_windows)[:limit]:
+                key = entry.get("key")
+                score = self._window_scores.get(key, 0.0)
+                summary.append(f"{key}:{score:.4f}")
+            if summary:
+                self._glow_log_verbose(
+                    "Sorted window scores (top): " + ", ".join(summary)
+                )
 
     def _refill_work(self):
         super(GlowWorkScheduler, self)._refill_work()
@@ -2145,6 +2248,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         window_key = tuple(members)
         full_key = self._window_work_key_map.pop(window_key, window_key)
         conflict_flag = bool(conflicts)
+        self._glow_log_verbose(
+            f"Window result rank={rank}, window={full_key}, "
+            f"step_time={step_time:.4f}, conflict={conflict_flag}."
+        )
         self._after_partition_result(
             full_key,
             float(step_time),
@@ -2255,11 +2362,18 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 entities = entities.to(dtype=self.data_type).contiguous()
                 mapping[partition_id] = entities
                 max_entities = max(max_entities, int(entities.numel()))
-            self._partition_entities_map = mapping
-            self._max_partition_entities = max_entities
-            self.config.log(
-                f"Glow scheduler computed entity sets for {len(mapping)} partitions "
-                f"from train triples ({reason})."
+        self._partition_entities_map = mapping
+        self._max_partition_entities = max_entities
+        self.config.log(
+            f"Glow scheduler computed entity sets for {len(mapping)} partitions "
+            f"from train triples ({reason})."
+        )
+        if self._glow_debug and mapping:
+            counts = [int(v.numel()) for v in mapping.values()]
+            self._glow_log(
+                "Partition entity counts "
+                f"avg={sum(counts) / max(1, len(counts)):.0f}, "
+                f"min={min(counts)}, max={max(counts)}."
             )
 
         if (
@@ -2294,6 +2408,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.config.log(
             f"Glow scheduler loaded entity partition map for {len(mapping)} partitions."
         )
+        if self._glow_debug and mapping:
+            counts = [int(v.numel()) for v in mapping.values()]
+            self._glow_log(
+                "Partition entity counts "
+                f"avg={sum(counts) / max(1, len(counts)):.0f}, "
+                f"min={min(counts)}, max={max(counts)}."
+            )
 
     def _init_partition_relation_map(self):
         if self.config.get("job.distributed.relation_sync_level") != "partition":
@@ -2321,6 +2442,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.config.log(
             f"Glow scheduler loaded relation partition map for {len(mapping)} partitions."
         )
+        if self._glow_debug and mapping:
+            counts = [int(v.numel()) for v in mapping.values()]
+            self._glow_log(
+                "Partition relation counts "
+                f"avg={sum(counts) / max(1, len(counts)):.0f}, "
+                f"min={min(counts)}, max={max(counts)}."
+            )
 
     def _get_max_entities(self):
         if self._max_partition_entities > 0:
@@ -2369,6 +2497,15 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 self._partition_to_window[pid] = entry["key"]
                 if not partitions:
                     self._current_window_entry = None
+                self._glow_debug_pick_count += 1
+                if (
+                    self._glow_debug
+                    and self._glow_debug_pick_count % self._glow_debug_interval == 0
+                ):
+                    self._glow_log(
+                        f"Selected partition {pid} from window {entry.get('key')} "
+                        f"(served={len(self._served_partitions)}/{self.num_partitions})."
+                    )
                 return pid
         while True:
             if self._current_window_entry is None:
@@ -2388,6 +2525,15 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 continue
             self._served_partitions.add(pid)
             self._partition_to_window[pid] = entry["key"]
+            self._glow_debug_pick_count += 1
+            if (
+                self._glow_debug
+                and self._glow_debug_pick_count % self._glow_debug_interval == 0
+            ):
+                self._glow_log(
+                    f"Selected partition {pid} from window {entry.get('key')} "
+                    f"(served={len(self._served_partitions)}/{self.num_partitions})."
+                )
             return pid
 
     def _pop_next_window(self):
@@ -2409,6 +2555,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 remaining_key = tuple(int(pid) for pid in remaining)
                 full_key = tuple(int(pid) for pid in window_key)
                 self._window_work_key_map[remaining_key] = full_key
+            if self._glow_debug:
+                self._glow_log(
+                    f"Selected window {tuple(remaining)} "
+                    f"from key={window_key}."
+                )
             return tuple(remaining)
 
     def _after_partition_result(self, partition_id, avg_time, **kwargs):
@@ -2433,6 +2584,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if avg_time and avg_time > 0:
             throughput = chunk_size / max(avg_time, 1e-6)
             reward = throughput * self.glow_reward_scale
+        queue_ratio = 0.0
         if kwargs.get("conflict"):
             reward -= self.glow_conflict_penalty
         if self.glow_queue_penalty_scale > 0:
@@ -2442,12 +2594,26 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if self.glow_overlap_penalty > 0 and self._causal_overlap_enabled:
             active = self._causal_overlap_active.get(partition_id, 0)
             if active > 1:
-                reward -= self.glow_overlap_penalty * (active - 1)
+            reward -= self.glow_overlap_penalty * (active - 1)
         prev = self._window_scores.get(window_key, 0.0)
         alpha = self.glow_reward_alpha
         self._window_scores[window_key] = (1.0 - alpha) * prev + alpha * reward
         self._window_counts[window_key] = self._window_counts.get(window_key, 0) + 1
         count = self._window_counts[window_key]
+        self._glow_debug_result_count += 1
+        if (
+            self._glow_debug
+            and self._glow_debug_result_count % self._glow_debug_interval == 0
+        ):
+            self._glow_log(
+                "Window result "
+                f"window={window_key}, partition={partition_id}, "
+                f"avg_time={avg_time:.4f}, chunk_size={chunk_size}, "
+                f"reward={reward:.4f}, throughput="
+                f"{chunk_size / max(avg_time, 1e-6):.2f}, "
+                f"conflict={bool(kwargs.get('conflict'))}, "
+                f"queue_ratio={queue_ratio:.3f}."
+            )
         if count == 1 or count % 50 == 0:
             self.config.log(
                 f"Glow bandit updated window {window_key} to score "
@@ -2593,7 +2759,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             return None
         if len(tensors) == 1:
             return tensors[0]
-        return torch.unique(torch.cat(tensors))
+        result = torch.unique(torch.cat(tensors))
+        if self._glow_debug_verbose:
+            self._glow_log_verbose(
+                f"Window entities key={tuple(window_key)} "
+                f"count={int(result.numel())}."
+            )
+        return result
 
     def _get_window_relations(self, window_key):
         if (
@@ -2903,6 +3075,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     window_entities = self._get_window_entities(window_key)
                     if window_entities is not None:
                         work_package.window_entities = window_entities
+                        if self._glow_debug_verbose:
+                            self._glow_log_verbose(
+                                f"Attach window_entities size="
+                                f"{int(window_entities.numel())} "
+                                f"for window={window_key} "
+                                f"partition={partition_id}."
+                            )
             return work_package
 
         def build_window_work(window_members):
@@ -2946,6 +3125,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 window_entities = self._get_window_entities(tuple(window_members))
                 if window_entities is not None:
                     work_package.window_entities = window_entities
+                    if self._glow_debug_verbose:
+                        self._glow_log_verbose(
+                            f"Attach window_entities size="
+                            f"{int(window_entities.numel())} "
+                            f"for window={tuple(window_members)}."
+                        )
             return work_package
 
         try:
