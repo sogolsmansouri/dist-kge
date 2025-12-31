@@ -2601,7 +2601,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if self.glow_overlap_penalty > 0 and self._causal_overlap_enabled:
             active = self._causal_overlap_active.get(partition_id, 0)
             if active > 1:
-            reward -= self.glow_overlap_penalty * (active - 1)
+                reward -= self.glow_overlap_penalty * (active - 1)
         prev = self._window_scores.get(window_key, 0.0)
         alpha = self.glow_reward_alpha
         self._window_scores[window_key] = (1.0 - alpha) * prev + alpha * reward
