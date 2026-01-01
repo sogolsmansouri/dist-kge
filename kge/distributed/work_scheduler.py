@@ -4034,7 +4034,17 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         ]
         if not entity_sets:
             return None
-        return torch.unique(torch.cat(entity_sets)).to(dtype=self.data_type)
+        union = torch.unique(torch.cat(entity_sets)).to(dtype=self.data_type)
+        max_entities = self._get_max_entities()
+        if max_entities and union.numel() > max_entities:
+            if not hasattr(self, "_cover_entity_overflow_logged"):
+                self.config.log(
+                    "COVER window entities exceed max_entities; "
+                    "falling back to per-strata entities for partition sync."
+                )
+                self._cover_entity_overflow_logged = True
+            return None
+        return union
 
     def _advance_cover_group(self):
         if self._cover_group_index >= len(self._cover_groups):
@@ -4084,7 +4094,10 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
             work_package.partition_data = strata_data
         else:
             work_package.partition_data = partition_slice
-        work_package.entities_in_partition = state["entities"]
+        if state["entities"] is None:
+            work_package.entities_in_partition = self._entities_in_strata.get(strata)
+        else:
+            work_package.entities_in_partition = state["entities"]
         return work_package
 
     def _adaptive_get_partition_length(self, partition_id):
