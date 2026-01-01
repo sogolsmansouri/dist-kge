@@ -492,6 +492,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
         except KeyError:
             self._gradient_log_interval = 0
+        if 0 < self._gradient_log_interval < 5:
+            self.config.log(
+                "gradient_trace_log_interval is very small; "
+                "clamping to 5 to reduce logging overhead."
+            )
+            self._gradient_log_interval = 5
         try:
             self._gradient_log_top_relations = int(
                 self.config.get("job.distributed.gradient_trace_top_relations")

@@ -191,6 +191,7 @@ job:
       causal_overlap:
         enable: False
         max_workers_per_partition: 2
+        duplicate_partitions: False
       force_pooled_negatives: False
       reshape:
         enable: False

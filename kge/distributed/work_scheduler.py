@@ -104,6 +104,16 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.gradient_snapshot_interval = max(
             0, int(config.get("job.distributed.gradient_snapshot_interval") or 0)
         )
+        if (
+            self.gradient_snapshot_interval
+            and self.gradient_snapshot_interval > self.num_partitions
+        ):
+            config.log(
+                "Clamping gradient_snapshot_interval "
+                f"{self.gradient_snapshot_interval} to num_partitions "
+                f"{self.num_partitions} to ensure updates per epoch."
+            )
+            self.gradient_snapshot_interval = self.num_partitions
         graph_cfg = config.get("job.distributed.gradient_graph") or {}
         self._gradient_graph_enabled = bool(graph_cfg.get("enable", False))
         self._gradient_graph_top_relations = max(
@@ -112,6 +122,17 @@ class WorkScheduler(mp.get_context("fork").Process):
         self._gradient_graph_export_interval = max(
             0, int(graph_cfg.get("export_interval", 0))
         )
+        if (
+            self._gradient_graph_enabled
+            and self._gradient_graph_export_interval
+            and self._gradient_graph_export_interval > self.num_partitions
+        ):
+            config.log(
+                "Clamping gradient_graph.export_interval "
+                f"{self._gradient_graph_export_interval} to num_partitions "
+                f"{self.num_partitions} to ensure updates per epoch."
+            )
+            self._gradient_graph_export_interval = self.num_partitions
         self._gradient_graph_last_export = 0
         self._gradient_graph_partitions = (
             defaultdict(dict) if self._gradient_graph_enabled else None
@@ -124,6 +145,28 @@ class WorkScheduler(mp.get_context("fork").Process):
         self._gradient_graph_cluster_update_interval = max(
             0, int(cluster_cfg.get("update_interval", 0))
         )
+        if (
+            self._gradient_graph_cluster_enabled
+            and self._gradient_graph_cluster_update_interval
+            and self._gradient_graph_cluster_update_interval > self.num_partitions
+        ):
+            config.log(
+                "Clamping gradient_graph.clustering.update_interval "
+                f"{self._gradient_graph_cluster_update_interval} to "
+                f"num_partitions {self.num_partitions} to ensure updates per epoch."
+            )
+            self._gradient_graph_cluster_update_interval = self.num_partitions
+        if (
+            self._gradient_graph_cluster_enabled
+            and self._gradient_graph_cluster_update_interval == 0
+            and self._gradient_graph_export_interval == 0
+            and self.gradient_snapshot_interval == 0
+        ):
+            config.log(
+                "Gradient graph clustering enabled but no update interval is set; "
+                "set gradient_graph.clustering.update_interval, "
+                "gradient_graph.export_interval, or gradient_snapshot_interval."
+            )
         self._gradient_graph_cluster_min_affinity = float(
             cluster_cfg.get("min_affinity", 0.1)
         )
@@ -2054,15 +2097,35 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._causal_overlap_max_workers = max(
             1, int(overlap_cfg.get("max_workers_per_partition", 1))
         )
+        self._causal_overlap_duplicate = bool(
+            overlap_cfg.get("duplicate_partitions", False)
+        )
         if self._causal_overlap_enabled:
             self._causal_overlap_max_workers = min(
                 self._causal_overlap_max_workers, max(1, self.num_clients)
+            )
+            config.log(
+                "Glow causal_overlap config: "
+                f"max_workers={self._causal_overlap_max_workers} "
+                f"duplicate_partitions={self._causal_overlap_duplicate} "
+                f"causal_merge_row="
+                f"{bool(config.get('job.distributed.causal_merge_row'))}."
             )
             if getattr(self, "_adaptive_enabled", False):
                 self._adaptive_enabled = False
                 config.log(
                     "Disabled scheduler feedback chunking because "
                     "causal_overlap requires stable partition versions."
+                )
+            if not self._causal_overlap_duplicate:
+                config.log(
+                    "Glow causal_overlap enabled without duplicate_partitions; "
+                    "overlap will not re-issue partitions to multiple workers."
+                )
+            if not bool(config.get("job.distributed.causal_merge_row")):
+                config.log(
+                    "Glow causal_overlap enabled but causal_merge_row is disabled; "
+                    "overlap will not be conflict-safe until causal_merge_row is set."
                 )
         if self.glow_window_work and getattr(self, "_adaptive_enabled", False):
             self._adaptive_enabled = False
@@ -2082,6 +2145,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 f"(verbose={self._glow_debug_verbose}, "
                 f"interval={self._glow_debug_interval})."
             )
+            if self._glow_debug_interval < 5:
+                config.log(
+                    "Glow debug_log_interval is very small; "
+                    "clamping to 5 to reduce logging overhead."
+                )
+                self._glow_debug_interval = 5
         self._glow_windows: deque = deque()
         self._current_window_entry = None
         self._max_window_entities = 0
@@ -2148,6 +2217,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             f"gradient_clustering={self._gradient_cluster_enabled}, "
             f"causal_overlap={self._causal_overlap_enabled}."
         )
+        if self.glow_windows_enabled and not self.glow_window_work:
+            self.config.log(
+                "Glow window_work is disabled; windows only affect "
+                "ordering/prefetch, not dispatch. Enable window_work to "
+                "use window scheduling."
+            )
         effective = getattr(self, "_glow_effective_partitions", None)
         if effective is not None and effective != self.num_partitions:
             self.config.log(
@@ -2294,7 +2369,23 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         ordered_partitions = self._order_partitions_by_gradient_graph_clusters(
             list(ordered_partitions)
         )
+        if (
+            self._glow_debug
+            and getattr(self, "_gradient_graph_clusters", None)
+        ):
+            cluster_ids = {
+                cid for cid in self._gradient_graph_clusters.values()
+            }
+            self._glow_log(
+                "Gradient graph clustering used for window ordering "
+                f"(clusters={len(cluster_ids)})."
+            )
         if self._co_gradient_scores:
+            if self._glow_debug:
+                self._glow_log(
+                    "Co-gradient affinity used for window ordering "
+                    f"(pairs={len(self._co_gradient_scores)})."
+                )
             ordered_partitions = self._cluster_partitions_by_affinity(
                 list(ordered_partitions)
             )
@@ -2417,6 +2508,44 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
     def _refill_work(self):
         super(GlowWorkScheduler, self)._refill_work()
         ordered = self._order_by_gradient(list(self.work_to_do))
+        if self._glow_debug:
+            gradients = (
+                self.partition_gradient_stats
+                if self.partition_gradient_stats
+                else self._latest_gradients
+            )
+            if not gradients:
+                self._glow_log(
+                    "No gradient stats available; using original order."
+                )
+            else:
+                source = (
+                    "current"
+                    if self.partition_gradient_stats
+                    else "snapshot"
+                )
+                scored = []
+                for pid in ordered:
+                    stats = gradients.get(pid)
+                    if not stats:
+                        continue
+                    count = stats.get("count", 0)
+                    if count < self.glow_min_gradient:
+                        continue
+                    avg = stats.get("sum", 0.0) / max(1, count)
+                    scored.append((avg, pid, count))
+                scored.sort(reverse=True)
+                top = ", ".join(
+                    f"{pid}:{avg:.4f}({count})"
+                    for avg, pid, count in scored[:5]
+                )
+                if not top:
+                    top = "none"
+                self._glow_log(
+                    "Gradient ordering applied "
+                    f"(source={source}, partitions_with_grad={len(scored)}, "
+                    f"min_count={self.glow_min_gradient}, top=[{top}])."
+                )
         self.work_to_do = deque(ordered)
         self._rebuild_glow_windows(ordered)
         self._reset_overlap_state()
@@ -3490,7 +3619,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                             f"size={size} to rank {rank}."
                         )
                     return work_package
-                if self._causal_overlap_enabled and self._causal_overlap_queue:
+                if (
+                    self._causal_overlap_enabled
+                    and self._causal_overlap_duplicate
+                    and self._causal_overlap_queue
+                ):
                     partition_id = self._causal_overlap_queue.popleft()
                     version = self._causal_overlap_versions.get(partition_id)
                     if version is None:
@@ -3518,6 +3651,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 if (
                     self._causal_overlap_enabled
                     and self._causal_overlap_max_workers > 1
+                    and self._causal_overlap_duplicate
                     and partition_id not in self._causal_overlap_versions
                 ):
                     self._causal_overlap_versions[partition_id] = (

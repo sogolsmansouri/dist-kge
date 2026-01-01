@@ -159,6 +159,11 @@ class WorkerProcess(mp.get_context("spawn").Process):
         set_master_environment(self.config)
         min_rank = get_min_rank(self.config)
         print("before init", self.rank + min_rank)
+        if self.config.get("job.distributed.glow.causal_overlap.enable"):
+            if not self.config.get("job.distributed.causal_merge_row"):
+                self.config.set(
+                    "job.distributed.causal_merge_row", True, log=True
+                )
 
         # create parameter server
         server = None
@@ -174,6 +179,23 @@ class WorkerProcess(mp.get_context("spawn").Process):
         config.init_folder()
         if getattr(config, "invocation", None):
             config.log(config.invocation, echo=False)
+        causal_overlap = bool(
+            config.get("job.distributed.glow.causal_overlap.enable")
+        )
+        if causal_overlap and not config.get("job.distributed.causal_merge_row"):
+            config.set("job.distributed.causal_merge_row", True, log=True)
+            config.log(
+                "Enabled causal_merge_row because causal_overlap is enabled.",
+                echo=False,
+            )
+        config.log(
+            "Causal overlap config: "
+            f"enabled={causal_overlap} "
+            f"duplicate_partitions="
+            f"{bool(config.get('job.distributed.glow.causal_overlap.duplicate_partitions'))} "
+            f"causal_merge_row={bool(config.get('job.distributed.causal_merge_row'))}.",
+            echo=False,
+        )
         config.log(
             "Worker device assignment: "
             f"local_rank={self.rank} dist_rank={self.rank + min_rank} "
