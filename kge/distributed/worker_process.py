@@ -176,7 +176,8 @@ class WorkerProcess(mp.get_context("spawn").Process):
             config.log(config.invocation, echo=False)
         config.log(
             "Worker device assignment: "
-            f"rank={self.rank} base_device={base_device} "
+            f"local_rank={self.rank} dist_rank={self.rank + min_rank} "
+            f"base_device={base_device} "
             f"device_pool={device_pool} selected={selected_device} "
             f"torch_device_set={torch_device} "
             f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '')} "

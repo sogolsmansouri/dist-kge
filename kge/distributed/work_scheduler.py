@@ -521,18 +521,22 @@ class WorkScheduler(mp.get_context("fork").Process):
                 )
         debug_glow = getattr(self, "_glow_debug", False)
         if debug_glow:
+            local_rank = rank - self.min_rank
+            rank_label = f"{rank}"
+            if 0 <= local_rank < self.num_clients:
+                rank_label = f"{rank} (local={local_rank})"
             context = "pre_localize" if pre_localize else "work"
             if work_package.wait:
                 self._glow_log(
                     "Sending WAIT to rank "
-                    f"{rank} ({context}) "
+                    f"{rank_label} ({context}) "
                     f"active={len(self.active_partition_per_worker)} "
                     f"disabled={len(self._disabled_workers)}."
                 )
             elif work_package.partition_data is None:
                 self._glow_log(
                     "Sending NO_WORK to rank "
-                    f"{rank} ({context}) "
+                    f"{rank_label} ({context}) "
                     f"active={len(self.active_partition_per_worker)} "
                     f"disabled={len(self._disabled_workers)}."
                 )
@@ -543,7 +547,7 @@ class WorkScheduler(mp.get_context("fork").Process):
                 )
                 self._glow_log(
                     "Sending WORK to rank "
-                    f"{rank} ({context}) "
+                    f"{rank_label} ({context}) "
                     f"partition_id={work_package.partition_id} "
                     f"size={len(work_package.partition_data)} "
                     f"window_members={window_members} "
@@ -931,6 +935,13 @@ class WorkScheduler(mp.get_context("fork").Process):
             < self._gradient_graph_cluster_last_update + interval
         ):
             return
+        self.config.log(
+            "Glow gradient graph clustering update at snapshot "
+            f"{self._gradient_updates} "
+            f"(relations={len(self._gradient_graph_relations)}, "
+            f"partitions={len(self._gradient_graph_partitions or {})}, "
+            f"force={force})."
+        )
         self._recompute_gradient_graph_clusters()
         self._gradient_graph_cluster_last_update = self._gradient_updates
 
@@ -943,6 +954,9 @@ class WorkScheduler(mp.get_context("fork").Process):
         if not self._gradient_graph_relations:
             self._gradient_graph_clusters = {}
             self._gradient_graph_cluster_members = {}
+            self.config.log(
+                "Glow gradient graph clustering skipped: no relation stats available."
+            )
             return
         allowed_relations = None
         top_relations = self._gradient_graph_cluster_top_relations
@@ -1052,6 +1066,13 @@ class WorkScheduler(mp.get_context("fork").Process):
             cluster_members[root] = members_sorted
         self._gradient_graph_clusters = clusters
         self._gradient_graph_cluster_members = dict(cluster_members)
+        max_size = max((len(m) for m in cluster_members.values()), default=0)
+        min_size = min((len(m) for m in cluster_members.values()), default=0)
+        self.config.log(
+            "Glow gradient graph clustering produced "
+            f"{len(cluster_members)} clusters "
+            f"(min_size={min_size}, max_size={max_size})."
+        )
 
     def _update_gradient_graph(
         self, partition_id, rel_ids_list, rel_sums_list, rel_counts_list
@@ -3154,10 +3175,23 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         ):
             return 0
         if not self._gradient_graph_relations:
+            self.config.log(
+                "Glow gradient repartition skipped: no relation stats available."
+            )
             return 0
         num_relations = self.dataset.num_relations()
         if num_relations is None or num_relations <= 0:
+            self.config.log(
+                "Glow gradient repartition skipped: no relations in dataset."
+            )
             return 0
+        self.config.log(
+            "Glow gradient repartition evaluating graph at snapshot "
+            f"{self._gradient_updates} "
+            f"(relations={len(self._gradient_graph_relations)}, "
+            f"max_moves={self._gradient_repartition_max_moves}, "
+            f"max_relations={self._gradient_repartition_max_relations})."
+        )
         relation_owner = torch.full(
             (num_relations,), -1, dtype=torch.long
         )
@@ -3267,6 +3301,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 self._recompute_partition_relations(pid)
         if moved_total > 0 and self._gradient_graph_cluster_enabled:
             self._maybe_update_gradient_graph_clusters(force=True)
+        if moved_total == 0:
+            self.config.log(
+                "Glow gradient repartition found no moves to apply."
+            )
         return moved_total
 
     def _next_work(self, rank, machine_id) -> WorkPackage:
