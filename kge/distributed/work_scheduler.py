@@ -3367,6 +3367,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             if len(part) <= min_size:
                 continue
             rels = triples[part.long(), 1]
+            if not isinstance(rels, torch.Tensor):
+                rels = torch.as_tensor(rels)
+            if rels.device.type != "cpu":
+                rels = rels.cpu()
+            rels = rels.long()
             targets = relation_owner[rels]
             move_mask = (targets >= 0) & (targets != pid)
             if not move_mask.any():
