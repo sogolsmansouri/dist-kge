@@ -597,6 +597,18 @@ class WorkScheduler(mp.get_context("fork").Process):
                     f"active={len(self.active_partition_per_worker)} "
                     f"disabled={len(self._disabled_workers)}."
                 )
+        if (
+            not pre_localize
+            and work_package.partition_data is None
+            and not work_package.wait
+            and self.active_partition_per_worker
+        ):
+            work_package.wait = True
+            if debug_glow:
+                self._glow_log(
+                    "Active partitions remain; converting NO_WORK to WAIT "
+                    f"for rank {rank}."
+                )
         partition_payload = work_package.partition_data
         if pre_localize and partition_payload is not None:
             partition_payload = torch.empty((0,), dtype=self.data_type)
