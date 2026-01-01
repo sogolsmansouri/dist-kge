@@ -4135,12 +4135,15 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         if self.repartition_epoch:
             self.partitions, self._entities_in_strata = self.repartition_future.get()
             self._repartition_in_background()
+        # Always reset served tracking at epoch boundaries so partitions are re-issued.
+        if hasattr(self, "_served_partitions"):
+            self._served_partitions = set()
         if self._cover_enabled:
             self._init_cover_schedule()
         else:
+            # Recompute schedule every epoch and rebuild the work queue.
             self.fixed_schedule = self.schedule_creator.create_schedule()
-            if self.fixed_schedule is None:
-                self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
+            self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
 
     def _order_by_schedule(self, partitions):
         if self.schedule_creator is None:
