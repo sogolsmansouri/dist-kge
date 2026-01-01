@@ -597,8 +597,12 @@ class WorkScheduler(mp.get_context("fork").Process):
                     f"active={len(self.active_partition_per_worker)} "
                     f"disabled={len(self._disabled_workers)}."
                 )
-        if work_package.partition_data is not None:
-            if work_package.partition_id is not None:
+        partition_payload = work_package.partition_data
+        if pre_localize and partition_payload is not None:
+            partition_payload = torch.empty((0,), dtype=self.data_type)
+            work_package.partition_version = None
+        if partition_payload is not None:
+            if not pre_localize and work_package.partition_id is not None:
                 if work_package.reuse_partition_version:
                     if work_package.partition_version is None:
                         work_package.partition_version = self.partition_issue_versions[
@@ -613,9 +617,9 @@ class WorkScheduler(mp.get_context("fork").Process):
                         current_version + 1
                     )
             cmd_buffer[0] = SCHEDULER_CMDS.WORK
-            cmd_buffer[1] = len(work_package.partition_data)
+            cmd_buffer[1] = len(partition_payload)
             dist.send(cmd_buffer, dst=rank)
-            dist.send(work_package.partition_data, dst=rank)
+            dist.send(partition_payload, dst=rank)
             partition_alias = self._encode_partition_id(work_package.partition_id)
             partition_info = torch.tensor(
                 [
@@ -2360,10 +2364,17 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 seen.add(pid)
         return ordered
 
-    def _rebuild_glow_windows(self, ordered_partitions):
+    def _rebuild_glow_windows(self, ordered_partitions, preserve_served=False):
         self._glow_windows = deque()
         self._max_window_entities = 0
         self._window_work_key_map.clear()
+        if preserve_served and self._served_partitions:
+            ordered_partitions = [
+                pid for pid in ordered_partitions
+                if pid not in self._served_partitions
+            ]
+        else:
+            self._served_partitions = set()
         if not ordered_partitions or not self.glow_windows_enabled:
             return
         ordered_partitions = self._order_partitions_by_gradient_graph_clusters(
@@ -3188,6 +3199,9 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             return
         if self.reshape_hot_splits <= 0 or self.reshape_cold_merges <= 0:
             return
+        served_count = len(self._served_partitions)
+        mid_epoch = 0 < served_count < self.num_partitions
+        epoch_complete = served_count >= self.num_partitions
         gradients = self.partition_gradient_stats or self._latest_gradients
         if not gradients:
             return
@@ -3228,13 +3242,31 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     [f"{hot}->{cold} ({moved} triples)" for hot, cold, moved in changes]
                 )
             )
-            self._rebuild_glow_windows(list(range(self.num_partitions)))
+            if epoch_complete:
+                if self._glow_debug:
+                    self._glow_log(
+                        "Glow reshape changes will apply next epoch."
+                    )
+            else:
+                self._rebuild_glow_windows(
+                    list(range(self.num_partitions)),
+                    preserve_served=mid_epoch,
+                )
         moved = self._maybe_repartition_from_gradient_graph()
         if moved > 0:
             self.config.log(
                 f"Glow gradient repartition moved {moved} triples across partitions."
             )
-            self._rebuild_glow_windows(list(range(self.num_partitions)))
+            if epoch_complete:
+                if self._glow_debug:
+                    self._glow_log(
+                        "Glow gradient repartition will apply next epoch."
+                    )
+            else:
+                self._rebuild_glow_windows(
+                    list(range(self.num_partitions)),
+                    preserve_served=mid_epoch,
+                )
 
     def _move_triples_from_hot_to_cold(self, hot_id, cold_id):
         hot_tensor = self.partitions[hot_id]
@@ -3647,7 +3679,21 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     return work_package
                 partition_id = self._pop_next_partition()
                 if partition_id is None:
-                    return WorkPackage()
+                    if (
+                        self.glow_windows_enabled
+                        and len(self._served_partitions) < self.num_partitions
+                    ):
+                        self._rebuild_glow_windows(
+                            list(range(self.num_partitions)),
+                            preserve_served=True,
+                        )
+                        partition_id = self._pop_next_partition()
+                    if partition_id is None and self.active_partition_per_worker:
+                        work_package = WorkPackage()
+                        work_package.wait = True
+                        return work_package
+                    if partition_id is None:
+                        return WorkPackage()
                 if partition_id < 0 or partition_id >= len(self.partitions):
                     continue
                 work_package = build_work(partition_id)
