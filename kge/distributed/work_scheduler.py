@@ -3601,7 +3601,7 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         )
         if self._cover_enabled:
             self._init_cover_schedule()
-        if not self.fixed_schedule:
+        if not self._cover_enabled and not self.fixed_schedule:
             self.work_to_do: Dict[Tuple[int, int], torch.Tensor] = self._order_by_schedule(
                 deepcopy(self.partitions)
             )
@@ -3942,6 +3942,22 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
             self.fixed_schedule = self.schedule_creator.create_schedule()
             if self.fixed_schedule is None:
                 self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
+
+    def _order_by_schedule(self, partitions):
+        if self.schedule_creator is None:
+            return partitions
+        schedule = self.schedule_creator.create_schedule()
+        if not schedule:
+            return partitions
+        ordered = {}
+        for iteration in schedule:
+            for strata in iteration:
+                if strata in partitions:
+                    ordered[strata] = partitions[strata]
+        for strata, data in partitions.items():
+            if strata not in ordered:
+                ordered[strata] = data
+        return ordered
 
     def _supports_adaptive_feedback(self):
         return True
