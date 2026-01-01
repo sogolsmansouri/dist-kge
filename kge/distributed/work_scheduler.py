@@ -2834,10 +2834,19 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
 
     def _pop_next_partition(self):
         if not self.glow_windows_enabled:
-            try:
-                return self.work_to_do.pop()
-            except IndexError:
-                return None
+            # Stratification keeps work_to_do as a deque of partition ids.
+            if isinstance(self.work_to_do, deque):
+                try:
+                    return self.work_to_do.pop()
+                except IndexError:
+                    return None
+            # Fallback: dict/ordered mapping of partition ids -> data.
+            if isinstance(self.work_to_do, dict):
+                try:
+                    return self.work_to_do.popitem()[0]
+                except KeyError:
+                    return None
+            return None
         if not self._glow_windows:
             if self._glow_debug and self.work_to_do:
                 self._glow_log(
@@ -3801,9 +3810,9 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         else:
             # Always build the scheduled work queue for stratification runs
             # (even when a fixed schedule was precomputed in __init__).
-            self.work_to_do: Dict[Tuple[int, int], torch.Tensor] = self._order_by_schedule(
-                deepcopy(self.partitions)
-            )
+            ordered = self._order_by_schedule(deepcopy(self.partitions))
+            # Store only the partition ids in a deque; actual data stays in self.partitions.
+            self.work_to_do = deque(ordered.keys())
 
     @staticmethod
     @numba.guvectorize(
@@ -4143,7 +4152,8 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         else:
             # Recompute schedule every epoch and rebuild the work queue.
             self.fixed_schedule = self.schedule_creator.create_schedule()
-            self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
+            ordered = self._order_by_schedule(deepcopy(self.partitions))
+            self.work_to_do = deque(ordered.keys())
 
     def _order_by_schedule(self, partitions):
         if self.schedule_creator is None:
