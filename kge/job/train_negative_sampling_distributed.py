@@ -1410,8 +1410,6 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             return
         embedder = self.model.get_p_embedder()
         pulled_ids = getattr(embedder, "pulled_ids", None)
-        if pulled_ids is None:
-            return
         grad = getattr(embedder._embeddings.weight, "grad", None)
         if grad is None:
             return
@@ -1429,14 +1427,30 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         grad_norms_cpu = grad_norms.to(
             device="cpu", dtype=self._relation_grad_sum.dtype
         )
-        pulled_ids_cpu = pulled_ids.detach().to(device="cpu", dtype=torch.long)
-        if grad_norms_cpu.numel() != pulled_ids_cpu.numel():
-            return
-        mask = grad_norms_cpu != 0
+        pulled_ids_cpu = None
+        if pulled_ids is not None:
+            pulled_ids_cpu = pulled_ids.detach().to(device="cpu", dtype=torch.long)
+        if pulled_ids_cpu is None or grad_norms_cpu.numel() != pulled_ids_cpu.numel():
+            if not hasattr(self, "_relation_grad_fallback_logged"):
+                self._relation_grad_fallback_logged = False
+            if not self._relation_grad_fallback_logged:
+                self.config.log(
+                    "Relation gradient trace: falling back to "
+                    "embedding row indices (pulled_ids missing/mismatched)."
+                )
+                self._relation_grad_fallback_logged = True
+            rel_ids = torch.arange(
+                grad_norms_cpu.numel(), dtype=torch.long, device="cpu"
+            )
+            rel_vals = grad_norms_cpu
+        else:
+            rel_ids = pulled_ids_cpu
+            rel_vals = grad_norms_cpu
+        mask = rel_vals != 0
         if not mask.any():
             return
-        rel_ids = pulled_ids_cpu[mask]
-        rel_vals = grad_norms_cpu[mask]
+        rel_ids = rel_ids[mask]
+        rel_vals = rel_vals[mask]
         self._relation_grad_sum.index_add_(0, rel_ids, rel_vals)
         ones = torch.ones_like(rel_ids, dtype=self._relation_grad_count.dtype)
         self._relation_grad_count.index_add_(0, rel_ids, ones)

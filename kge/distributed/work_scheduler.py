@@ -3555,18 +3555,29 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
     ):
         dataset._partition_type = "stratification"
         self.combine_mirror_blocks = config.get("job.distributed.stratification.combine_mirror")
+        cover_cfg = config.get("job.distributed.stratification.cover") or {}
+        self._cover_enabled = bool(cover_cfg.get("enable", False))
+        self._cover_q = max(2, int(cover_cfg.get("q", 4)))
+        self._cover_log_groups = bool(cover_cfg.get("log_groups", False))
         super(StratificationWorkScheduler, self).__init__(
             config=config,
             dataset=dataset,
         )
-        self.schedule_creator = StratificationScheduleCreator(
-            num_partitions=self.num_partitions,
-            num_workers=self.num_clients,
-            randomize_iterations=True,
-            combine_mirror_blocks=self.combine_mirror_blocks,
-        )
-        self.fixed_schedule = self.schedule_creator.create_schedule()
+        self.schedule_creator = None
+        self.fixed_schedule = []
         self.current_iteration = set()
+        self._cover_groups = []
+        self._cover_group_index = 0
+        self._cover_pending_states = deque()
+        self._cover_active_states = {}
+        if not self._cover_enabled:
+            self.schedule_creator = StratificationScheduleCreator(
+                num_partitions=self.num_partitions,
+                num_workers=self.num_clients,
+                randomize_iterations=True,
+                combine_mirror_blocks=self.combine_mirror_blocks,
+            )
+            self.fixed_schedule = self.schedule_creator.create_schedule()
         self._pre_localized_strata: Dict[int, Tuple[int, int]] = {}
         # dictionary: key=worker_rank, value=block
         self.running_blocks: Dict[int, Tuple[int, int]] = {}
@@ -3588,6 +3599,8 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
             self.combine_mirror_blocks,
             TORCH_TO_NP_DTYPE[self.data_type]
         )
+        if self._cover_enabled:
+            self._init_cover_schedule()
         if not self.fixed_schedule:
             self.work_to_do: Dict[Tuple[int, int], torch.Tensor] = self._order_by_schedule(
                 deepcopy(self.partitions)
@@ -3818,6 +3831,8 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         return self._acquire_strata(rank, machine_id, pre_localize=True)
 
     def _acquire_strata(self, rank, machine_id, pre_localize=False):
+        if self._cover_enabled:
+            return self._acquire_strata_cover(rank)
         try:
             if len(self.current_iteration) == 0:
                 self.current_iteration = set(self.fixed_schedule.pop())
@@ -3899,6 +3914,10 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
     def _handle_work_done(self, rank):
         super(StratificationWorkScheduler, self)._handle_work_done(rank)
         self.running_blocks.pop(rank, None)
+        if self._cover_enabled:
+            state = self._cover_active_states.get(rank)
+            if state is not None and not state["strata"]:
+                self._cover_active_states.pop(rank, None)
 
     def _repartition_in_background(self):
         self.repartition_future = self.repartition_worker_pool.apply_async(
@@ -3917,12 +3936,140 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         if self.repartition_epoch:
             self.partitions, self._entities_in_strata = self.repartition_future.get()
             self._repartition_in_background()
-        self.fixed_schedule = self.schedule_creator.create_schedule()
-        if self.fixed_schedule is None:
-            self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
+        if self._cover_enabled:
+            self._init_cover_schedule()
+        else:
+            self.fixed_schedule = self.schedule_creator.create_schedule()
+            if self.fixed_schedule is None:
+                self.work_to_do = self._order_by_schedule(deepcopy(self.partitions))
 
     def _supports_adaptive_feedback(self):
         return True
+
+    def _init_cover_schedule(self):
+        if self.num_partitions % self._cover_q != 0:
+            raise ValueError(
+                "COVER scheduling requires num_partitions divisible by "
+                f"q={self._cover_q}, got num_partitions={self.num_partitions}."
+            )
+        self._cover_groups = self._build_cover_groups(
+            self.num_partitions, self._cover_q
+        )
+        self._cover_group_index = 0
+        self._cover_pending_states = deque()
+        self._cover_active_states = {}
+        if self._cover_log_groups:
+            self.config.log(
+                "COVER schedule groups="
+                f"{len(self._cover_groups)} "
+                f"states_per_group={self.num_partitions // self._cover_q}."
+            )
+
+    def _build_cover_groups(self, num_partitions, q):
+        buckets = {(i, j) for i in range(num_partitions) for j in range(num_partitions)}
+        groups = []
+        while len(buckets) > num_partitions:
+            partitions = list(range(num_partitions))
+            group = []
+            while partitions:
+                state = []
+                while len(state) < q:
+                    picked = None
+                    for idx, pid in enumerate(partitions):
+                        ok = True
+                        for existing in state:
+                            if (existing, pid) not in buckets or (pid, existing) not in buckets:
+                                ok = False
+                                break
+                        if ok:
+                            picked = pid
+                            partitions.pop(idx)
+                            break
+                    if picked is None:
+                        picked = partitions.pop(0)
+                    state.append(picked)
+                for a in state:
+                    for b in state:
+                        if a == b:
+                            continue
+                        buckets.discard((a, b))
+                group.append(state)
+            groups.append(group)
+        return groups
+
+    def _cover_state_strata(self, state):
+        strata = []
+        for i in state:
+            for j in state:
+                if self.combine_mirror_blocks and j < i:
+                    continue
+                key = (i, j)
+                if key in self.partitions:
+                    strata.append(key)
+        return strata
+
+    def _cover_state_entities(self, strata):
+        if not self._entities_in_strata:
+            return None
+        entity_sets = [
+            self._entities_in_strata.get(s)
+            for s in strata
+            if self._entities_in_strata.get(s) is not None
+        ]
+        if not entity_sets:
+            return None
+        return torch.unique(torch.cat(entity_sets)).to(dtype=self.data_type)
+
+    def _advance_cover_group(self):
+        if self._cover_group_index >= len(self._cover_groups):
+            return False
+        group = self._cover_groups[self._cover_group_index]
+        self._cover_group_index += 1
+        self._cover_pending_states = deque(group)
+        if self._cover_log_groups:
+            self.config.log(
+                "COVER group "
+                f"{self._cover_group_index}/{len(self._cover_groups)} "
+                f"states={len(group)}."
+            )
+        return True
+
+    def _acquire_strata_cover(self, rank):
+        work_package = WorkPackage()
+        state = self._cover_active_states.get(rank)
+        if state is None:
+            if not self._cover_pending_states and not self._cover_active_states:
+                if not self._advance_cover_group():
+                    return work_package
+            if not self._cover_pending_states:
+                work_package.wait = True
+                return work_package
+            buffer_state = self._cover_pending_states.popleft()
+            strata = deque(self._cover_state_strata(buffer_state))
+            entities = self._cover_state_entities(strata)
+            state = {"strata": strata, "entities": entities}
+            self._cover_active_states[rank] = state
+        if not state["strata"]:
+            work_package.wait = True
+            return work_package
+        strata = state["strata"].popleft()
+        strata_data = self.partitions.get(strata)
+        if self.combine_mirror_blocks and strata_data is not None:
+            if strata[0] == strata[1]:
+                mirror_strata = (strata[0] - 1, strata[1] - 1)
+            else:
+                mirror_strata = (strata[1], strata[0])
+            mirror_data = self.partitions.get(mirror_strata)
+            if mirror_data is not None:
+                strata_data = torch.cat((strata_data, mirror_data))
+        work_package.partition_id = strata
+        partition_slice = self._adaptive_maybe_slice(strata, strata_data)
+        if partition_slice is None or len(partition_slice) == 0:
+            work_package.partition_data = strata_data
+        else:
+            work_package.partition_data = partition_slice
+        work_package.entities_in_partition = state["entities"]
+        return work_package
 
     def _adaptive_get_partition_length(self, partition_id):
         data = self.partitions.get(partition_id)

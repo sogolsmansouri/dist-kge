@@ -153,6 +153,10 @@ job:
       #  diagonals lying next to each other will be combined
       #  e.g.: (0,0) and (1,1)
       combine_mirror: True
+      cover:
+        enable: False
+        q: 4
+        log_groups: False
     glow:
       base_partition_type: random
       window_size: 2
