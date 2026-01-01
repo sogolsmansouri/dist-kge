@@ -4154,6 +4154,7 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
             self.fixed_schedule = self.schedule_creator.create_schedule()
             ordered = self._order_by_schedule(deepcopy(self.partitions))
             self.work_to_do = deque(ordered.keys())
+            self.config.log(f"Refill work: queued={len(self.work_to_do)}")
 
     def _order_by_schedule(self, partitions):
         if self.schedule_creator is None:
