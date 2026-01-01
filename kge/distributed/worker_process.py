@@ -142,9 +142,15 @@ class WorkerProcess(mp.get_context("spawn").Process):
 
     def run(self):
         base_device = self.config.get("job.device")
+        device_pool: list = list(self.config.get("job.device_pool") or [])
+        if len(device_pool) == 0:
+            device_pool.append(base_device)
+        selected_device = device_pool[self.rank % len(device_pool)]
         torch_device = base_device
-        if base_device == "cuda":
+        if selected_device == "cuda":
             torch_device = "cuda:0"
+        else:
+            torch_device = selected_device
         if torch_device != "cpu":
             torch.cuda.set_device(torch_device)
         # seeds need to be set in every process
@@ -162,11 +168,7 @@ class WorkerProcess(mp.get_context("spawn").Process):
             server = self.parameters
 
         # create train-worker config, dataset and folder
-        device_pool: list = self.config.get("job.device_pool")
-        if len(device_pool) == 0:
-            device_pool.append(self.config.get("job.device"))
         config = deepcopy(self.config)
-        selected_device = device_pool[self.rank % len(device_pool)]
         config.set("job.device", selected_device)
         config.folder = os.path.join(self.config.folder, f"worker-{self.rank}")
         config.init_folder()
@@ -176,7 +178,7 @@ class WorkerProcess(mp.get_context("spawn").Process):
             "Worker device assignment: "
             f"rank={self.rank} base_device={base_device} "
             f"device_pool={device_pool} selected={selected_device} "
-            f"torch_device={torch_device} "
+            f"torch_device_set={torch_device} "
             f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '')} "
             f"cuda_count={torch.cuda.device_count()}",
             echo=False,
