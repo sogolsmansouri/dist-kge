@@ -3145,7 +3145,9 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             return
         triples_subset = triples[tensor_ids.long()]
         entities = torch.unique(triples_subset[:, [0, 2]].reshape(-1))
-        self._partition_entities_map[partition_id] = entities.cpu().long()
+        self._partition_entities_map[partition_id] = (
+            entities.to(dtype=self.data_type).contiguous().cpu()
+        )
 
     def _recompute_partition_relations(self, partition_id):
         if self._partition_relations_map is None:
@@ -3159,7 +3161,9 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             return
         triples_subset = triples[tensor_ids.long()]
         rels = torch.unique(triples_subset[:, 1].reshape(-1))
-        self._partition_relations_map[partition_id] = rels.cpu().long()
+        self._partition_relations_map[partition_id] = (
+            rels.to(dtype=self.data_type).contiguous().cpu()
+        )
 
     def _get_train_triples(self):
         if self._train_triples_cache is None:
