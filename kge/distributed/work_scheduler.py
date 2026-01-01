@@ -3798,7 +3798,9 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         )
         if self._cover_enabled:
             self._init_cover_schedule()
-        if not self._cover_enabled and not self.fixed_schedule:
+        else:
+            # Always build the scheduled work queue for stratification runs
+            # (even when a fixed schedule was precomputed in __init__).
             self.work_to_do: Dict[Tuple[int, int], torch.Tensor] = self._order_by_schedule(
                 deepcopy(self.partitions)
             )
