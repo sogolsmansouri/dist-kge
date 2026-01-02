@@ -1,8 +1,0 @@
-import: [complex]
-
-distributed_model:
-  class_name: DistributedModel
-  base_model:
-    type: complex
-    +++: +++
-  create_eval: False
