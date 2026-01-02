@@ -234,6 +234,25 @@ class WorkScheduler(mp.get_context("fork").Process):
             return partition_id
         return self._alias_to_partition.get(partition_id, partition_id)
 
+    def _base_partition_ids(self, partition_id):
+        """Return a list of int partition ids suitable for gradient-graph/clustering."""
+        pid = self._decode_partition_id(partition_id)
+        if pid is None:
+            return []
+        if isinstance(pid, (tuple, list)):
+            out = []
+            for x in pid:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    pass
+            return out
+        try:
+            return [int(pid)]
+        except Exception:
+            return []
+
+    
     def _serialize_partition_key(self, partition_id):
         if isinstance(partition_id, (list, tuple)):
             return [int(x) for x in partition_id]
@@ -889,6 +908,7 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None:
             return
+
         # Ignore sentinel NO_WORK (-1). Keep negative aliases (< -1) and complex ids (e.g., tuples).
         if isinstance(partition_id, (int, np.integer)):
             pid_int = int(partition_id)
@@ -896,10 +916,21 @@ class WorkScheduler(mp.get_context("fork").Process):
                 return
             if pid_int < -1:
                 partition_id = self._decode_partition_id(pid_int)
-        stats = self.partition_gradient_stats[partition_id]
-        stats["sum"] += grad_sum
-        stats["count"] += max(0, sample_count)
+
+        # NEW: normalize partition_id into a list of *int* base partition ids
+        if isinstance(partition_id, (tuple, list)):
+            base_pids = [int(x) for x in partition_id]
+        else:
+            base_pids = [int(partition_id)]
+
+        # Update stats for each base partition id (int keys only)
+        for pid in base_pids:
+            stats = self.partition_gradient_stats[pid]
+            stats["sum"] += float(grad_sum)
+            stats["count"] += max(0, int(sample_count))
+
         self._gradient_updates += 1
+
         if (
             self.gradient_snapshot_interval
             and self._gradient_updates
@@ -907,7 +938,9 @@ class WorkScheduler(mp.get_context("fork").Process):
         ):
             self._export_gradient_statistics()
             self._last_gradient_snapshot = self._gradient_updates
+
         self._maybe_export_gradient_graph()
+
     def _register_partition_relation_gradient(
         self, partition_id, rel_ids, rel_sums, rel_counts
     ):
