@@ -1,0 +1,73 @@
+# GE2 Table 4 mimic for Freebase86M/ComplEx (single GPU) in dist-kge.
+# Notes / mismatches vs GE2:
+# - GE2 uses 50 groups per batch, 1e3 positives per group, and 1e3 shared negatives
+#   per group. dist-kge only supports shared sampling per-batch (no explicit groups),
+#   so this config uses shared negatives per batch as the closest match.
+# - GE2 uses a hybrid of RNS + DegreeNS; dist-kge uses pooled sampling here because
+#   partition sync requires pooled sampling and the hybrid is not directly expressible.
+# - GE2 mentions delayed relation updates; dist-kge approximates this via async
+#   write-back (enabled by default).
+import:
+- complex
+- distributed_model
+
+dataset:
+  name: freebase
+
+model: distributed_model
+
+lookup_embedder:
+  dim: 100
+  sparse: true
+  initialize: xavier_uniform_
+
+complex:
+  entity_embedder:
+    dropout: 0.0
+  relation_embedder:
+    dropout: 0.0
+
+negative_sampling:
+  sampling_type: pooled
+  implementation: batch
+  shared: true
+  shared_type: naive
+  num_samples:
+    s: 1000
+    o: 1000
+
+train:
+  type: distributed_negative_sampling
+  batch_size: 50000
+  max_epochs: 10
+  optimizer:
+    default:
+      type: dist_rowadagrad
+      args:
+        lr: 0.1
+
+job:
+  device_pool:
+  - cuda:0
+  distributed:
+    num_partitions: 16
+    num_workers: 1
+    partition_type: glow
+    glow:
+      base_partition_type: random
+      enable_windows: false
+      concurrent_windows: false
+      overlap_negative_sampling: false
+    scheduler_feedback:
+      enable: false
+    repartition_epoch: false
+    shuffle_partition_samples: false
+    parameter_server: shared
+    entity_sync_level: partition
+    relation_sync_level: partition
+    materialize_partition_batches: true
+    stage_local_ids: true
+    entity_async_write_back: true
+    relation_async_write_back: true
+    unique_on_gpu: true
+    debug_id_bounds: false

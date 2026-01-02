@@ -1,0 +1,259 @@
+import os
+import gc
+import datetime
+import warnings
+from typing import Optional
+from copy import deepcopy
+import torch
+from torch import multiprocessing as mp
+
+from kge.misc import set_seeds
+from kge.job import Job
+from .parameter_client import KgeParameterClient
+from .parameter_server import LapseParameterServer
+from .misc import get_min_rank, get_num_keys, get_optimizer_dim, set_master_environment
+
+class WorkerProcessPool:
+    """
+    Creates all the train-workers for distributed training
+    """
+    def __init__(
+        self,
+        config,
+        dataset,
+        checkpoint_name: Optional[str] = None,
+    ):
+        num_workers_machine = config.get("job.distributed.num_workers_machine")
+        already_init_workers = config.get("job.distributed.already_init_workers")
+
+        config.log(f"creating worker process pool with {config.get('job.distributed.num_workers')} workers")
+        sanitized_pool = self._sanitize_device_pool(config)
+        config.set("job.device_pool", sanitized_pool)
+        config.log(
+            "device_pool (sanitized)="
+            f"{sanitized_pool} cuda.device_count={torch.cuda.device_count()}"
+        )
+        self.workers = []
+        configs = {}
+        parameters = None
+        if config.get("job.distributed.parameter_server") == "shared":
+            # When we use a shared tensor as a parameter server, the shared memory needs
+            # to be allocated before creating the worker processes and shared between
+            # workers
+            num_keys = get_num_keys(config, dataset)
+            embedding_dim = config.get("lookup_embedder.dim")
+            optimizer_dim = get_optimizer_dim(config, embedding_dim)
+            # Zero-init shared parameters to avoid adding into uninitialized memory
+            parameters = torch.zeros(
+                (num_keys, embedding_dim + optimizer_dim),
+                dtype=torch.float32,
+                requires_grad=False
+            ).share_memory_()
+        for rank in range(num_workers_machine):
+            if rank == 0:
+                self.recv_end, send_end = mp.Pipe(False)
+            else:
+                send_end = None
+            configs[rank] = deepcopy(config)
+            configs[rank].init_folder()
+            worker = WorkerProcess(
+                rank + already_init_workers,
+                configs[rank],
+                dataset,
+                parameters=parameters,
+                checkpoint_name=checkpoint_name,
+                result_pipe=send_end
+            )
+            worker.start()
+            self.workers.append(worker)
+
+    def _sanitize_device_pool(self, config):
+        device_pool = list(config.get("job.device_pool") or [])
+        if not device_pool:
+            return device_pool
+        available_cuda = torch.cuda.device_count()
+        sanitized = []
+        for dev in device_pool:
+            if isinstance(dev, str) and dev.startswith("cuda"):
+                idx = 0
+                if dev != "cuda":
+                    try:
+                        idx = int(dev.split(":")[1])
+                    except (IndexError, ValueError):
+                        idx = None
+                if idx is not None and (available_cuda == 0 or idx >= available_cuda):
+                    warnings.warn(
+                        f"Ignoring unavailable device '{dev}' "
+                        f"(cuda.device_count={available_cuda})."
+                    )
+                    continue
+            sanitized.append(dev)
+        if not sanitized:
+            fallback = config.get("job.device")
+            warnings.warn(
+                "All entries in job.device_pool were invalid; "
+                f"falling back to '{fallback}'."
+            )
+            sanitized = [fallback]
+        return sanitized
+
+    def join(self):
+        """Wait for all workers"""
+        try:
+            valid_trace = self.recv_end.recv()
+        except:
+            valid_trace = None
+        for worker in self.workers:
+            worker.join()
+        return valid_trace
+
+    def terminate(self):
+        print("terminating worker process pool")
+        for worker in self.workers:
+            worker.terminate()
+
+    def kill(self):
+        print("killing worker process pool")
+        for worker in self.workers:
+            worker.kill()
+
+
+class WorkerProcess(mp.get_context("spawn").Process):
+    """Train worker"""
+    def __init__(
+        self,
+        rank,
+        config,
+        dataset,
+        parameters=None,
+        checkpoint_name: Optional[str] = None,
+        result_pipe=None,
+    ):
+        # rank = rank + 1
+        daemon = config.get("train.num_workers") <= 0 and config.get("eval.num_workers") <= 0
+        super().__init__(daemon=daemon, name=f"Worker #{rank}")
+        self.rank = rank
+        self.num_keys = get_num_keys(config, dataset)
+        self.config = config
+        self.dataset = dataset
+        self.parameters = parameters
+        self.checkpoint_name = checkpoint_name
+        self.result_pipe = result_pipe
+
+    def run(self):
+        base_device = self.config.get("job.device")
+        device_pool: list = list(self.config.get("job.device_pool") or [])
+        if len(device_pool) == 0:
+            device_pool.append(base_device)
+        selected_device = device_pool[self.rank % len(device_pool)]
+        torch_device = base_device
+        if selected_device == "cuda":
+            torch_device = "cuda:0"
+        else:
+            torch_device = selected_device
+        if torch_device != "cpu":
+            torch.cuda.set_device(torch_device)
+        # seeds need to be set in every process
+        set_seeds(self.config, self.rank)
+
+        set_master_environment(self.config)
+        min_rank = get_min_rank(self.config)
+        print("before init", self.rank + min_rank)
+        if self.config.get("job.distributed.glow.causal_overlap.enable"):
+            if not self.config.get("job.distributed.causal_merge_row"):
+                self.config.set(
+                    "job.distributed.causal_merge_row", True, log=True
+                )
+
+        # create parameter server
+        server = None
+        if self.config.get("job.distributed.parameter_server") == "lapse":
+            server = LapseParameterServer.get_parameter_server(self.config, self.num_keys)
+        elif self.config.get("job.distributed.parameter_server") == "shared":
+            server = self.parameters
+
+        # create train-worker config, dataset and folder
+        config = deepcopy(self.config)
+        config.set("job.device", selected_device)
+        config.folder = os.path.join(self.config.folder, f"worker-{self.rank}")
+        config.init_folder()
+        if getattr(config, "invocation", None):
+            config.log(config.invocation, echo=False)
+        causal_overlap = bool(
+            config.get("job.distributed.glow.causal_overlap.enable")
+        )
+        if causal_overlap and not config.get("job.distributed.causal_merge_row"):
+            config.set("job.distributed.causal_merge_row", True, log=True)
+            config.log(
+                "Enabled causal_merge_row because causal_overlap is enabled.",
+                echo=False,
+            )
+        config.log(
+            "Causal overlap config: "
+            f"enabled={causal_overlap} "
+            f"duplicate_partitions="
+            f"{bool(config.get('job.distributed.glow.causal_overlap.duplicate_partitions'))} "
+            f"causal_merge_row={bool(config.get('job.distributed.causal_merge_row'))}.",
+            echo=False,
+        )
+        config.log(
+            "Worker device assignment: "
+            f"local_rank={self.rank} dist_rank={self.rank + min_rank} "
+            f"base_device={base_device} "
+            f"device_pool={device_pool} selected={selected_device} "
+            f"torch_device_set={torch_device} "
+            f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '')} "
+            f"cuda_count={torch.cuda.device_count()}",
+            echo=False,
+        )
+        if selected_device != "cpu" and torch.cuda.is_available():
+            config.log(
+                f"Worker CUDA current_device={torch.cuda.current_device()}",
+                echo=False,
+            )
+
+        parameter_client = KgeParameterClient.create(
+            config=config,
+            server_id=0,
+            client_id=self.rank + min_rank,
+            server=server,
+            num_keys=self.num_keys,
+        )
+        # don't re-initialize the model after loading checkpoint
+        init_for_load_only = self.checkpoint_name is not None
+        job = Job.create(
+            config=config,
+            dataset=self.dataset,
+            parameter_client=parameter_client,
+            init_for_load_only=init_for_load_only,
+        )
+        if self.checkpoint_name is not None:
+            job.load_distributed(checkpoint_name=self.checkpoint_name)
+
+        job.run()
+
+        # all done, clean up
+        print("shut down everything")
+        parameter_client.barrier()
+        if hasattr(job, "work_scheduler_client"):
+            job.work_scheduler_client.shutdown()
+        parameter_client.shutdown()
+        # delete all occurrences of the parameter client to properly shutdown lapse
+        # del job
+        del job.parameter_client
+        del job.model.get_s_embedder().parameter_client
+        del job.model.get_p_embedder().parameter_client
+        del job.model
+        if hasattr(job, "optimizer"):
+            del job.optimizer
+        del parameter_client
+        gc.collect()  # make sure lapse-worker destructor is called
+        # shutdown server
+        if server is not None and type(server) != torch.Tensor:
+            server.shutdown()
+        if self.result_pipe is not None:
+            if hasattr(job, "valid_trace"):
+                # if we valid from checkpoint there is no valid trace
+                self.result_pipe.send(job.valid_trace)
+            else:
+                self.result_pipe.send(None)

@@ -887,8 +887,15 @@ class WorkScheduler(mp.get_context("fork").Process):
         )
 
     def _register_partition_gradient(self, partition_id, grad_sum, sample_count):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
             return
+        # Ignore sentinel NO_WORK (-1). Keep negative aliases (< -1) and complex ids (e.g., tuples).
+        if isinstance(partition_id, (int, np.integer)):
+            pid_int = int(partition_id)
+            if pid_int == -1:
+                return
+            if pid_int < -1:
+                partition_id = self._decode_partition_id(pid_int)
         stats = self.partition_gradient_stats[partition_id]
         stats["sum"] += grad_sum
         stats["count"] += max(0, sample_count)
@@ -905,19 +912,25 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _register_partition_relation_gradient(
         self, partition_id, rel_ids, rel_sums, rel_counts
     ):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
             return
-        rel_ids_list = rel_ids.cpu().tolist()
-        rel_sums_list = rel_sums.cpu().tolist()
-        rel_counts_list = rel_counts.cpu().tolist()
-        rel_stats = self.partition_relation_gradient_stats[partition_id]
-        for rel_id, rel_sum, rel_count in zip(
-            rel_ids_list, rel_sums_list, rel_counts_list
-        ):
-            if rel_count <= 0:
-                continue
+        # Ignore sentinel NO_WORK (-1). Keep negative aliases (< -1) and complex ids (e.g., tuples).
+        if isinstance(partition_id, (int, np.integer)):
+            pid_int = int(partition_id)
+            if pid_int == -1:
+                return
+            if pid_int < -1:
+                partition_id = self._decode_partition_id(pid_int)
+        if rel_ids is None:
+            return
+        rel_ids_list = rel_ids.tolist() if torch.is_tensor(rel_ids) else list(rel_ids)
+        rel_sums_list = rel_sums.tolist() if torch.is_tensor(rel_sums) else list(rel_sums)
+        rel_counts_list = rel_counts.tolist() if torch.is_tensor(rel_counts) else list(rel_counts)
+        for rel_id, rel_sum, rel_count in zip(rel_ids_list, rel_sums_list, rel_counts_list):
             rel_id = int(rel_id)
-            stats = rel_stats[rel_id]
+            if rel_id < 0:
+                continue
+            stats = self.relation_gradient_stats[rel_id]
             stats["sum"] += float(rel_sum)
             stats["count"] += int(rel_count)
         self._update_gradient_graph(
@@ -4708,13 +4721,15 @@ class SchedulerClient:
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None:
             return
+        # partition_id is sent by the scheduler as a scalar; complex ids are encoded as negative aliases.
         if isinstance(partition_id, (list, tuple)):
             return
         try:
             partition_id = int(partition_id)
         except (TypeError, ValueError):
             return
-        if partition_id < 0:
+        # allow negative partition aliases; only -1 means NO_WORK
+        if partition_id == -1:
             return
         cmd = torch.tensor(
             [SCHEDULER_CMDS.REGISTER_PARTITION_GRADIENT, self.machine_id],
@@ -4729,7 +4744,17 @@ class SchedulerClient:
     def register_partition_relation_gradient(
         self, partition_id, relation_ids, grad_sums, grad_counts
     ):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
+            return
+        # partition_id is sent by the scheduler as a scalar; complex ids are encoded as negative aliases.
+        if isinstance(partition_id, (list, tuple)):
+            return
+        try:
+            partition_id = int(partition_id)
+        except (TypeError, ValueError):
+            return
+        # allow negative partition aliases; only -1 means NO_WORK
+        if partition_id == -1:
             return
         relation_ids = torch.as_tensor(
             relation_ids, dtype=self.data_type, device="cpu"
@@ -5003,14 +5028,19 @@ class LocalSchedulerClient:
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None:
             return
+        # In local mode we can accept complex ids (e.g., (i,j) strata keys) directly.
+        # Also allow negative aliases produced by the scheduler encoder; decode them back.
         if isinstance(partition_id, (list, tuple)):
-            return
-        try:
-            partition_id = int(partition_id)
-        except (TypeError, ValueError):
-            return
-        if partition_id < 0:
-            return
+            partition_id = tuple(int(x) for x in partition_id)
+        else:
+            try:
+                partition_id = int(partition_id)
+            except (TypeError, ValueError):
+                return
+            if partition_id == -1:
+                return
+            if partition_id < -1:
+                partition_id = self.scheduler._decode_partition_id(partition_id)
         self.scheduler._register_partition_gradient(
             partition_id, float(grad_sum), int(sample_count)
         )

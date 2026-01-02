@@ -1,0 +1,422 @@
+1vsAll:
+  class_name: TrainingJob1vsAll
+KvsAll:
+  class_name: TrainingJobKvsAll
+  label_smoothing: 0.0
+  query_types:
+    _po: true
+    s_o: false
+    sp_: true
+ax_search:
+  class_name: AxSearchJob
+  num_sobol_trials: -1
+  num_trials: 10
+  parameter_constraints: []
+  parameters: []
+  sobol_seed: 0
+complex:
+  class_name: ComplEx
+  entity_embedder:
+    +++: +++
+    dropout: 0.44299429655075073
+    regularize_weight: 7.830760727899156e-12
+    type: lookup_embedder
+  relation_embedder:
+    +++: +++
+    dropout: -0.4746062345802784
+    regularize_weight: 1.182876478423781e-10
+    type: lookup_embedder
+console:
+  format: {}
+  quiet: false
+dataset:
+  +++: +++
+  analysis:
+    auto_generate: true
+    hot_entity_percent: 0.01
+    split: train
+  binary_cache:
+    dtype: int32
+    enable: true
+    mmap: true
+  files:
+    +++: +++
+    entity_ids:
+      filename: entity_ids.del
+      type: map
+    entity_strings:
+      filename: entity_ids.del
+      type: map
+    relation_ids:
+      filename: relation_ids.del
+      type: map
+    relation_strings:
+      filename: relation_ids.del
+      type: map
+    test:
+      filename: test.del
+      size: 5321
+      split_type: test
+      type: triples
+    test_without_unseen:
+      filename: test_without_unseen.del
+      size: 5144
+      split_type: test
+      type: triples
+    train:
+      filename: train.del
+      size: 21343681
+      split_type: train
+      type: triples
+    train_sample:
+      filename: train_sample.del
+      size: 5357
+      split_type: train
+      type: triples
+    valid:
+      filename: valid.del
+      size: 5357
+      split_type: valid
+      type: triples
+    valid_without_unseen:
+      filename: valid_without_unseen.del
+      size: 5153
+      split_type: valid
+      type: triples
+  name: wikidata5m
+  nary:
+    max_arity: 0
+    pad_id: -1
+  num_entities: 4818679
+  num_relations: 828
+  pickle: true
+distributed_model:
+  base_model:
+    +++: +++
+    type: complex
+  class_name: DistributedModel
+  create_eval: false
+distributed_negative_sampling:
+  class_name: TrainingJobNegativeSamplingDistributed
+entity_ranking:
+  chunk_size: 25000
+  class_name: EntityRankingJob
+  filter_splits:
+  - train
+  - valid
+  filter_with_test: true
+  hits_at_k_s:
+  - 1
+  - 3
+  - 10
+  - 50
+  - 100
+  - 200
+  - 300
+  - 400
+  - 500
+  - 1000
+  labels_on_cpu: false
+  metrics_per:
+    argument_frequency: false
+    head_and_tail: false
+    relation_type: false
+  rank_against: -1
+  rank_against_options:
+    combined: false
+    combined_options:
+      sampling_type: frequency
+    sampling_type: uniform
+  tie_handling: rounded_mean_rank
+eval:
+  batch_size: 200
+  num_workers: 0
+  pin_memory: false
+  split: valid
+  trace_level: epoch
+  type: entity_ranking
+grid_search:
+  class_name: GridSearchJob
+  parameters:
+    +++: +++
+  run: true
+import:
+- distributed_model
+- complex
+job:
+  device: cuda:1
+  device_pool:
+  - cuda:0
+  - cuda:1
+  distributed:
+    already_init_workers: 0
+    causal_merge: false
+    causal_merge_row: false
+    causal_merge_row_log_interval: 0
+    causal_merge_row_max_staleness: 0
+    causal_merge_row_policy: strict
+    conflict_free_merge: false
+    debug_id_bounds: false
+    entity_async_write_back: true
+    entity_localize: false
+    entity_pre_pull: 1
+    entity_sync_level: partition
+    gloo_socket_ifname: lo
+    glow:
+      affinity_alpha: 0.3
+      bandit:
+        conflict_penalty: 0.5
+        enable: true
+        overlap_penalty: 0.0
+        queue_penalty_scale: 0.0
+        reward_alpha: 0.3
+        reward_scale: 0.001
+      base_partition_type: stratification
+      causal_overlap:
+        enable: false
+        max_workers_per_partition: 2
+      concurrent_windows: true
+      debug_log: true
+      debug_log_interval: 1
+      debug_log_verbose: true
+      debug_log_window_limit: 10
+      debug_window_versions: 0
+      enable_windows: true
+      force_pooled_negatives: false
+      gradient_clustering:
+        affinity_alpha: 0.3
+        enable: true
+        max_partitions_per_relation: 4
+        min_shared_relations: 1
+        top_relations: 64
+      lookahead_negatives: true
+      min_gradient_count: 1
+      overlap_negative_sampling: false
+      prefetch_window_entities: true
+      reshape:
+        check_interval: 200
+        cold_merges: 1
+        enable: false
+        hot_splits: 1
+        min_partition_size: 2048
+      stratification_pairs: true
+      window_overlap: 1
+      window_size: 2
+      window_work: true
+    gradient_graph:
+      clustering:
+        enable: false
+        max_cluster_size: 0
+        max_partitions_per_relation: 8
+        min_affinity: 0.1
+        min_shared_relations: 1
+        top_relations: 64
+        update_interval: 0
+      enable: true
+      export_interval: 1
+      repartition:
+        enable: false
+        max_moves_per_partition: 0
+        max_partition_size: 0
+        max_relations: 0
+        min_partition_size: 2048
+      top_relations: 64
+    gradient_snapshot_interval: 1
+    gradient_trace_log_interval: 1
+    gradient_trace_top_relations: 32
+    graph_cut:
+      chunk_warmup_epochs: 0
+      cost_aware_schedule: false
+      dynamic_chunking: true
+      export_feedback: false
+      max_chunk_size: 0
+      min_chunk_size: 0
+      target_chunk_time: 2.0
+    hot_entity_cache:
+      enable: false
+      file: ''
+      max_entities: -1
+    lapse_port: 9091
+    locality_ordering:
+      enable: false
+      entity_rank_file: analysis_entity_locality_rank.npy
+      relation_rank_file: analysis_relation_locality_rank.npy
+    machine_id: 0
+    map_ids_on_gpu: true
+    master_ip: 127.0.0.1
+    master_port: 8888
+    materialize_partition_batches: false
+    num_eval_workers: 1
+    num_machines: 1
+    num_partitions: 8
+    num_threads_per_process: 2
+    num_workers: 4
+    num_workers_machine: 4
+    optimizer:
+      max_pending_pushes: 8
+    parameter_server: shared
+    partition_type: glow
+    pre_localize_batch: false
+    pre_localize_partition: false
+    relation_async_write_back: true
+    relation_gradient_trace: true
+    relation_localize: false
+    relation_pre_pull: 1
+    relation_sync_level: batch
+    repartition_epoch: true
+    sample_on_gpu: false
+    scheduler_data_type: int32
+    scheduler_feedback:
+      ema_decay: 0.5
+      enable: true
+      max_splits_per_partition: 8
+      min_chunk_size: 1024
+      min_history: 3
+      slow_partition_factor: 1.5
+      target_chunk_size: 0
+    scheduler_prefetch: 1
+    shuffle_partition_samples: true
+    single_process: false
+    stage_local_ids: false
+    stratification:
+      active_only: true
+      combine_mirror: true
+    unique_on_gpu: false
+  type: train
+lookup_embedder:
+  class_name: LookupEmbedder
+  dim: 128
+  dropout: 0.0
+  initialize: normal_
+  initialize_args:
+    +++: +++
+    normal_:
+      mean: 0.0
+      std: 5.8970567449527816e-05
+    uniform_:
+      a: -0.6644901805979013
+    xavier_normal_:
+      gain: 1.0
+    xavier_uniform_:
+      gain: 1.0
+  normalize:
+    p: -1.0
+  pretrain:
+    ensure_all: false
+    model_filename: ''
+  regularize: lp
+  regularize_args:
+    +++: +++
+    p: 1
+    weighted: true
+  regularize_weight: 0.0
+  round_dim_to: []
+  sparse: true
+manual_search:
+  class_name: ManualSearchJob
+  configurations: []
+  run: true
+model: distributed_model
+modules:
+- kge.model.embedder
+- kge.model
+- kge.job
+nary_negative_sampling:
+  class_name: TrainingJobNaryNegativeSampling
+  corrupt_all_arguments: false
+  num_negatives: 5
+negative_sampling:
+  class_name: TrainingJobNegativeSampling
+  combined: false
+  combined_options:
+    negatives_percentage: 0.5
+    sampling_type: batch
+    shared_type: naive
+    with_replacement: true
+  filtering:
+    implementation: fast_if_available
+    o: false
+    p: false
+    s: false
+    split: ''
+  frequency:
+    smoothing: 1
+  implementation: batch
+  num_samples:
+    o: 7851
+    p: 0
+    s: 2176
+  sampling_type: pooled
+  shared: true
+  shared_type: naive
+  with_replacement: true
+random_seed:
+  default: -1
+  numba: -1
+  numpy: -1
+  python: -1
+  torch: -1
+search:
+  device_pool: []
+  num_workers: 1
+  on_error: abort
+  type: ax_search
+train:
+  abort_on_nan: true
+  auto_correct: true
+  batch_size: 1024
+  checkpoint:
+    every: 3
+    keep: 3
+    keep_init: true
+  loss: kl
+  loss_arg: 1.0
+  lr_scheduler: ReduceLROnPlateau
+  lr_scheduler_args:
+    +++: +++
+    factor: 0.95
+    mode: max
+    patience: 1
+    threshold: 0.0001
+  lr_warmup: 0
+  max_epochs: 300
+  num_workers: 4
+  optimizer:
+    +++: +++
+    default:
+      args:
+        +++: +++
+        lr: 0.6560544891789137
+      type: dist_adagrad
+    entity:
+      args:
+        +++: +++
+      regex: .*_entity_embedder.*
+    relation:
+      args:
+        +++: +++
+      regex: .*_relation_embedder.*
+  pin_memory: true
+  profile_interval_batches: 0
+  split: train
+  subbatch_auto_tune: false
+  subbatch_size: -1
+  trace_level: epoch
+  type: distributed_negative_sampling
+  visualize_graph: false
+training_loss:
+  class_name: TrainingLossEvaluationJob
+user:
+  +++: +++
+valid:
+  early_stopping:
+    patience: 10
+    threshold:
+      epochs: 2
+      metric_value: 0.1
+  every: 5
+  metric: mean_reciprocal_rank_filtered_with_test
+  metric_expr: float("nan")
+  metric_max: true
+  split: valid
+  trace_level: epoch
