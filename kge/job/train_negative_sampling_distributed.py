@@ -1436,13 +1436,18 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         pulled_ids_cpu = None
         if pulled_ids is not None:
             pulled_ids_cpu = pulled_ids.detach().to(device="cpu", dtype=torch.long)
-        if pulled_ids_cpu is None or grad_norms_cpu.numel() != pulled_ids_cpu.numel():
+
+        # Prefer mapping gradient rows back to global relation ids via pulled_ids.
+        # In distributed embedders, grad_norms may be the full local table, while pulled_ids
+        # contains only the active pulled rows. In that case, slice grad_norms to the pulled region
+        # instead of falling back to local row indices.
+        if pulled_ids_cpu is None:
             if not hasattr(self, "_relation_grad_fallback_logged"):
                 self._relation_grad_fallback_logged = False
             if not self._relation_grad_fallback_logged:
                 self.config.log(
-                    "Relation gradient trace: falling back to "
-                    "embedding row indices (pulled_ids missing/mismatched)."
+                    "Relation gradient trace: pulled_ids missing; "
+                    "falling back to embedding row indices (may be incorrect in distributed mode)."
                 )
                 self._relation_grad_fallback_logged = True
             rel_ids = torch.arange(
@@ -1450,8 +1455,18 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
             rel_vals = grad_norms_cpu
         else:
-            rel_ids = pulled_ids_cpu
-            rel_vals = grad_norms_cpu
+            n_rows = int(min(grad_norms_cpu.numel(), pulled_ids_cpu.numel()))
+            if grad_norms_cpu.numel() != pulled_ids_cpu.numel():
+                if not hasattr(self, "_relation_grad_mismatch_logged"):
+                    self._relation_grad_mismatch_logged = False
+                if not self._relation_grad_mismatch_logged:
+                    self.config.log(
+                        f"Relation gradient trace: size mismatch grad_rows={grad_norms_cpu.numel()} "
+                        f"pulled_ids={pulled_ids_cpu.numel()}; slicing to n={n_rows}."
+                    )
+                    self._relation_grad_mismatch_logged = True
+            rel_ids = pulled_ids_cpu[:n_rows]
+            rel_vals = grad_norms_cpu[:n_rows]
         mask = rel_vals != 0
         if not mask.any():
             return
@@ -1493,14 +1508,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         device=rel_ids.device
                     )[rel_ids]
         if isinstance(partition_id, (list, tuple)):
-            partition_ids = [
-                int(x)
-                for x in (
-                    self._current_window_members.tolist()
-                    if self._current_window_members is not None
-                    else partition_id
-                )
-            ]
+            # Distribute the window's accumulated gradient across its member partitions.
+            # IMPORTANT: a stratification stratum id like (i, j) is a single atomic work unit,
+            # not a "window" of two partitions. Only split when _current_window_members is set.
+            if self._current_window_members is not None:
+                partition_ids = [int(x) for x in self._current_window_members.tolist()]
+            else:
+                partition_ids = [partition_id]
             per_sum = grad_sum / max(1, len(partition_ids))
             per_count = max(1, int(round(count / max(1, len(partition_ids)))))
             for pid in partition_ids:

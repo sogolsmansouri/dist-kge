@@ -887,8 +887,15 @@ class WorkScheduler(mp.get_context("fork").Process):
         )
 
     def _register_partition_gradient(self, partition_id, grad_sum, sample_count):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
             return
+        # Ignore sentinel NO_WORK (-1). Keep negative aliases (< -1) and complex ids (e.g., tuples).
+        if isinstance(partition_id, (int, np.integer)):
+            pid_int = int(partition_id)
+            if pid_int == -1:
+                return
+            if pid_int < -1:
+                partition_id = self._decode_partition_id(pid_int)
         stats = self.partition_gradient_stats[partition_id]
         stats["sum"] += grad_sum
         stats["count"] += max(0, sample_count)
@@ -901,29 +908,33 @@ class WorkScheduler(mp.get_context("fork").Process):
             self._export_gradient_statistics()
             self._last_gradient_snapshot = self._gradient_updates
         self._maybe_export_gradient_graph()
-
     def _register_partition_relation_gradient(
         self, partition_id, rel_ids, rel_sums, rel_counts
     ):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
             return
-        rel_ids_list = rel_ids.cpu().tolist()
-        rel_sums_list = rel_sums.cpu().tolist()
-        rel_counts_list = rel_counts.cpu().tolist()
-        rel_stats = self.partition_relation_gradient_stats[partition_id]
-        for rel_id, rel_sum, rel_count in zip(
-            rel_ids_list, rel_sums_list, rel_counts_list
-        ):
-            if rel_count <= 0:
-                continue
+        # Ignore sentinel NO_WORK (-1). Keep negative aliases (< -1) and complex ids (e.g., tuples).
+        if isinstance(partition_id, (int, np.integer)):
+            pid_int = int(partition_id)
+            if pid_int == -1:
+                return
+            if pid_int < -1:
+                partition_id = self._decode_partition_id(pid_int)
+        if rel_ids is None:
+            return
+        rel_ids_list = rel_ids.tolist() if torch.is_tensor(rel_ids) else list(rel_ids)
+        rel_sums_list = rel_sums.tolist() if torch.is_tensor(rel_sums) else list(rel_sums)
+        rel_counts_list = rel_counts.tolist() if torch.is_tensor(rel_counts) else list(rel_counts)
+        for rel_id, rel_sum, rel_count in zip(rel_ids_list, rel_sums_list, rel_counts_list):
             rel_id = int(rel_id)
-            stats = rel_stats[rel_id]
+            if rel_id < 0:
+                continue
+            stats = self.relation_gradient_stats[rel_id]
             stats["sum"] += float(rel_sum)
             stats["count"] += int(rel_count)
         self._update_gradient_graph(
             partition_id, rel_ids_list, rel_sums_list, rel_counts_list
         )
-
     def _export_gradient_statistics(self, final: bool = False):
         if not self.partition_gradient_stats:
             return
@@ -2191,6 +2202,17 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         graph_cfg = config.get("job.distributed.gradient_graph") or {}
         repartition_cfg = graph_cfg.get("repartition") or {}
         self._gradient_repartition_enabled = bool(repartition_cfg.get("enable", False))
+        # How often to attempt repartitioning from the gradient graph.
+        # If not set (or <= 0), we fall back to the export interval / snapshot interval.
+        #
+        # NOTE: Previously, gradient-graph repartitioning was only triggered indirectly
+        # via reshape callbacks. That made it effectively a no-op when reshape was
+        # disabled, even if repartition.enable=True. This explicit interval makes the
+        # feature usable without requiring reshape.
+        self._gradient_repartition_check_interval = int(
+            repartition_cfg.get("check_interval", 0)
+        )
+        self._gradient_repartition_last_check = 0
         self._gradient_repartition_max_moves = max(
             0, int(repartition_cfg.get("max_moves_per_partition", 0))
         )
@@ -2961,61 +2983,97 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         else:
             window_key = self._partition_to_window.pop(partition_id, None)
         self._update_window_affinity(window_key)
-        if (
-            not self.glow_bandit_enabled
-            or partition_id is None
-            or window_key is None
-        ):
-            return
-        chunk_size = kwargs.get("chunk_size") or 0
-        if chunk_size <= 0:
-            chunk_size = self._adaptive_get_partition_length(partition_id) or 0
-        reward = 0.0
-        if avg_time and avg_time > 0:
-            throughput = chunk_size / max(avg_time, 1e-6)
-            reward = throughput * self.glow_reward_scale
-        queue_ratio = 0.0
-        if kwargs.get("conflict"):
-            reward -= self.glow_conflict_penalty
-        if self.glow_queue_penalty_scale > 0:
-            pending = len(self.work_to_do) if hasattr(self, "work_to_do") else 0
-            queue_ratio = pending / max(1, self.num_partitions)
-            reward -= self.glow_queue_penalty_scale * queue_ratio
-        if self.glow_overlap_penalty > 0 and self._causal_overlap_enabled:
-            active = self._causal_overlap_active.get(partition_id, 0)
-            if active > 1:
-                reward -= self.glow_overlap_penalty * (active - 1)
-        prev = self._window_scores.get(window_key, 0.0)
-        alpha = self.glow_reward_alpha
-        self._window_scores[window_key] = (1.0 - alpha) * prev + alpha * reward
-        self._window_counts[window_key] = self._window_counts.get(window_key, 0) + 1
-        count = self._window_counts[window_key]
-        self._glow_debug_result_count += 1
-        if (
-            self._glow_debug
-            and self._glow_debug_result_count % self._glow_debug_interval == 0
-        ):
-            self._glow_log(
-                "Window result "
-                f"window={window_key}, partition={partition_id}, "
-                f"avg_time={avg_time:.4f}, chunk_size={chunk_size}, "
-                f"reward={reward:.4f}, throughput="
-                f"{chunk_size / max(avg_time, 1e-6):.2f}, "
-                f"conflict={bool(kwargs.get('conflict'))}, "
-                f"queue_ratio={queue_ratio:.3f}."
-            )
-        if count == 1 or count % 50 == 0:
-            self.config.log(
-                f"Glow bandit updated window {window_key} to score "
-                f"{self._window_scores[window_key]:.4f} "
-                f"(reward={reward:.4f}, count={count})."
-            )
-        self._sort_glow_windows()
+        if self.glow_bandit_enabled and partition_id is not None and window_key is not None:
+            chunk_size = kwargs.get("chunk_size") or 0
+            if chunk_size <= 0:
+                chunk_size = self._adaptive_get_partition_length(partition_id) or 0
+            reward = 0.0
+            if avg_time and avg_time > 0:
+                throughput = chunk_size / max(avg_time, 1e-6)
+                reward = throughput * self.glow_reward_scale
+            queue_ratio = 0.0
+            if kwargs.get("conflict"):
+                reward -= self.glow_conflict_penalty
+            if self.glow_queue_penalty_scale > 0:
+                pending = len(self.work_to_do) if hasattr(self, "work_to_do") else 0
+                queue_ratio = pending / max(1, self.num_partitions)
+                reward -= self.glow_queue_penalty_scale * queue_ratio
+            if self.glow_overlap_penalty > 0 and self._causal_overlap_enabled:
+                active = self._causal_overlap_active.get(partition_id, 0)
+                if active > 1:
+                    reward -= self.glow_overlap_penalty * (active - 1)
+            prev = self._window_scores.get(window_key, 0.0)
+            alpha = self.glow_reward_alpha
+            self._window_scores[window_key] = (1.0 - alpha) * prev + alpha * reward
+            self._window_counts[window_key] = self._window_counts.get(window_key, 0) + 1
+            count = self._window_counts[window_key]
+            self._glow_debug_result_count += 1
+            if (
+                self._glow_debug
+                and self._glow_debug_result_count % self._glow_debug_interval == 0
+            ):
+                self._glow_log(
+                    "Window result "
+                    f"window={window_key}, partition={partition_id}, "
+                    f"avg_time={avg_time:.4f}, chunk_size={chunk_size}, "
+                    f"reward={reward:.4f}, throughput="
+                    f"{chunk_size / max(avg_time, 1e-6):.2f}, "
+                    f"conflict={bool(kwargs.get('conflict'))}, "
+                    f"queue_ratio={queue_ratio:.3f}."
+                )
+            if count == 1 or count % 50 == 0:
+                self.config.log(
+                    f"Glow bandit updated window {window_key} to score "
+                    f"{self._window_scores[window_key]:.4f} "
+                    f"(reward={reward:.4f}, count={count})."
+                )
+            self._sort_glow_windows()
         if self.reshape_enabled:
             self._reshape_counter += 1
             if self._reshape_counter >= self.reshape_interval:
                 self._reshape_counter = 0
                 self._maybe_reshape_partitions()
+
+        # Gradient-graph repartitioning should not depend on reshape being enabled.
+        # Try it periodically based on gradient snapshot / export cadence.
+        self._maybe_run_gradient_repartition()
+
+    def _maybe_run_gradient_repartition(self, force: bool = False):
+        """Periodically apply small repartition moves using the gradient graph.
+
+        This makes `gradient_graph.repartition.enable=True` effective even when
+        reshape is disabled.
+        """
+        if not self._gradient_repartition_enabled:
+            return
+        # Decide cadence.
+        interval = int(getattr(self, "_gradient_repartition_check_interval", 0) or 0)
+        if interval <= 0:
+            interval = int(getattr(self, "_gradient_graph_export_interval", 0) or 0)
+        if interval <= 0:
+            interval = int(getattr(self, "gradient_snapshot_interval", 0) or 0)
+        if interval <= 0 and not force:
+            return
+        if not force:
+            if self._gradient_updates < self._gradient_repartition_last_check + interval:
+                return
+        self._gradient_repartition_last_check = self._gradient_updates
+
+        served_count = len(getattr(self, "_served_partitions", set()))
+        mid_epoch = 0 < served_count < self.num_partitions
+        epoch_complete = served_count >= self.num_partitions
+
+        moved = self._maybe_repartition_from_gradient_graph()
+        if moved <= 0:
+            return
+        self.config.log(
+            f"Glow gradient repartition moved {moved} triples across partitions."
+        )
+        if not epoch_complete:
+            # Rebuild remaining windows so subsequent work sees the updated partitions.
+            self._rebuild_glow_windows(
+                list(range(self.num_partitions)), preserve_served=mid_epoch
+            )
 
     def _update_window_affinity(self, window_key):
         if (
@@ -3273,21 +3331,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     list(range(self.num_partitions)),
                     preserve_served=mid_epoch,
                 )
-        moved = self._maybe_repartition_from_gradient_graph()
-        if moved > 0:
-            self.config.log(
-                f"Glow gradient repartition moved {moved} triples across partitions."
-            )
-            if epoch_complete:
-                if self._glow_debug:
-                    self._glow_log(
-                        "Glow gradient repartition will apply next epoch."
-                    )
-            else:
-                self._rebuild_glow_windows(
-                    list(range(self.num_partitions)),
-                    preserve_served=mid_epoch,
-                )
+        # Gradient-graph repartitioning is handled by _maybe_run_gradient_repartition,
+        # which is called from the result path even when reshape is disabled.
+        # Keep a forced check here so reshape-triggered cycles can still apply moves
+        # immediately after a reshape.
+        self._maybe_run_gradient_repartition(force=True)
 
     def _move_triples_from_hot_to_cold(self, hot_id, cold_id):
         hot_tensor = self.partitions[hot_id]
@@ -4293,11 +4341,12 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
             return work_package
         strata = state["strata"].popleft()
         strata_data = self.partitions.get(strata)
-        if self.combine_mirror_blocks and strata_data is not None:
-            if strata[0] == strata[1]:
-                mirror_strata = (strata[0] - 1, strata[1] - 1)
-            else:
-                mirror_strata = (strata[1], strata[0])
+        # If combine_mirror_blocks is enabled, only combine *off-diagonal* mirrors:
+        # (i, j) with (j, i). Diagonal strata (i, i) are already self-contained and
+        # must not attempt to mirror to (i-1, i-1), which can create invalid keys like
+        # (-1, -1) when i == 0.
+        if self.combine_mirror_blocks and strata_data is not None and strata[0] != strata[1]:
+            mirror_strata = (strata[1], strata[0])
             mirror_data = self.partitions.get(mirror_strata)
             if mirror_data is not None:
                 strata_data = torch.cat((strata_data, mirror_data))
@@ -4321,12 +4370,10 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
         if not self.combine_mirror_blocks:
             return length
         i, j = partition_id
+        # Same logic as above: only off-diagonal blocks have meaningful mirrors.
         if i == j:
-            if i % 2 == 0:
-                return length
-            mirror = (i - 1, j - 1)
-        else:
-            mirror = (j, i)
+            return length
+        mirror = (j, i)
         mirror_data = self.partitions.get(mirror)
         if mirror_data is not None:
             length += len(mirror_data)
@@ -4708,13 +4755,15 @@ class SchedulerClient:
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None:
             return
+        # partition_id is sent by the scheduler as a scalar; complex ids are encoded as negative aliases.
         if isinstance(partition_id, (list, tuple)):
             return
         try:
             partition_id = int(partition_id)
         except (TypeError, ValueError):
             return
-        if partition_id < 0:
+        # allow negative partition aliases; only -1 means NO_WORK
+        if partition_id == -1:
             return
         cmd = torch.tensor(
             [SCHEDULER_CMDS.REGISTER_PARTITION_GRADIENT, self.machine_id],
@@ -4725,11 +4774,20 @@ class SchedulerClient:
         dist.send(info, dst=self.scheduler_rank)
         payload = torch.tensor([grad_sum], dtype=torch.float32)
         dist.send(payload, dst=self.scheduler_rank)
-
     def register_partition_relation_gradient(
         self, partition_id, relation_ids, grad_sums, grad_counts
     ):
-        if partition_id is None or partition_id < 0:
+        if partition_id is None:
+            return
+        # partition_id is sent by the scheduler as a scalar; complex ids are encoded as negative aliases.
+        if isinstance(partition_id, (list, tuple)):
+            return
+        try:
+            partition_id = int(partition_id)
+        except (TypeError, ValueError):
+            return
+        # allow negative partition aliases; only -1 means NO_WORK
+        if partition_id == -1:
             return
         relation_ids = torch.as_tensor(
             relation_ids, dtype=self.data_type, device="cpu"
@@ -4750,8 +4808,6 @@ class SchedulerClient:
         dist.send(relation_ids, dst=self.scheduler_rank)
         dist.send(grad_counts, dst=self.scheduler_rank)
         dist.send(grad_sums, dst=self.scheduler_rank)
-
-
 class LocalSchedulerClient:
     """Single-process scheduler client that bypasses torch.distributed."""
 
@@ -5003,18 +5059,22 @@ class LocalSchedulerClient:
     def register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None:
             return
+        # In local mode we can accept complex ids (e.g., (i,j) strata keys) directly.
+        # Also allow negative aliases produced by the scheduler encoder; decode them back.
         if isinstance(partition_id, (list, tuple)):
-            return
-        try:
-            partition_id = int(partition_id)
-        except (TypeError, ValueError):
-            return
-        if partition_id < 0:
-            return
+            partition_id = tuple(int(x) for x in partition_id)
+        else:
+            try:
+                partition_id = int(partition_id)
+            except (TypeError, ValueError):
+                return
+            if partition_id == -1:
+                return
+            if partition_id < -1:
+                partition_id = self.scheduler._decode_partition_id(partition_id)
         self.scheduler._register_partition_gradient(
             partition_id, float(grad_sum), int(sample_count)
         )
-
     def register_partition_relation_gradient(
         self, partition_id, relation_ids, grad_sums, grad_counts
     ):
