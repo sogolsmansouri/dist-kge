@@ -3722,9 +3722,9 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 )
             if self.config.get("job.distributed.shuffle_partition_samples"):
                 # Use long indices for safe tensor indexing.
+                n_rows = int(work_package.partition_data.shape[0])
                 perm = torch.randperm(
-                    work_package.partition_data.numel(),
-                    device=work_package.partition_data.device,
+                    n_rows, device=work_package.partition_data.device
                 )
                 work_package.partition_data = work_package.partition_data[perm]
             work_package.window_members = list(window_members)

@@ -1555,12 +1555,16 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._window_prefetch_key = None
             return
         window_key = None
+        prefetch_key = None
         if (
             self._current_window_members is not None
             and self._current_window_members.numel() > 0
         ):
-            window_key = tuple(int(x) for x in self._current_window_members.tolist())
-            if window_key == self._window_prefetch_key:
+            window_key = tuple(
+                int(x) for x in self._current_window_members.cpu().tolist()
+            )
+            prefetch_key = (self._current_partition_id, window_key)
+            if prefetch_key == self._window_prefetch_key:
                 return
         extras = self._current_window_entities
         if extras.device.type != "cpu":
@@ -1573,14 +1577,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 mask = ~torch.isin(extras, work_cpu)
                 extras = extras[mask]
             except Exception:
-                work_set = set(work_cpu.tolist())
-                extras = torch.tensor(
-                    [idx for idx in extras.tolist() if idx not in work_set],
-                    dtype=extras.dtype,
-                )
-        extras = torch.unique(extras)
+                self._window_prefetch_key = prefetch_key
+                return
+        max_prefetch = int(
+            self.config.get(
+                "job.distributed.glow.max_window_prefetch", 200000
+            )
+        )
+        if extras.numel() > max_prefetch:
+            extras = extras[:max_prefetch]
         if extras.numel() == 0:
-            self._window_prefetch_key = window_key
+            self._window_prefetch_key = prefetch_key
             return
         try:
             self.model.get_s_embedder().localize(
@@ -1592,7 +1599,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 )
         except Exception as exc:
             self.config.log(f"Glow window prefetch failed: {exc}")
-        self._window_prefetch_key = window_key
+        self._window_prefetch_key = prefetch_key
 
     def _current_window_key(self):
         if (
@@ -1935,7 +1942,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             else:
                 self._current_window_members = None
             if window_entities is not None and len(window_entities) > 0:
-                self._current_window_entities = torch.unique(window_entities.long())
+                # Scheduler already deduplicates window entities.
+                self._current_window_entities = window_entities.long()
             else:
                 self._current_window_entities = None
             if window_versions is not None and len(window_versions) > 0:
@@ -1987,9 +1995,23 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     or self.entity_sync_level != "partition"
                 )
             ):
-                pool_entities = torch.unique(
-                    torch.cat((work_entities, self._current_window_entities))
+                max_pool_entities = int(
+                    self.config.get(
+                        "job.distributed.glow.max_pool_entities", 300000
+                    )
                 )
+                if (
+                    work_entities.numel()
+                    + self._current_window_entities.numel()
+                    <= max_pool_entities
+                ):
+                    pool_entities = torch.unique(
+                        torch.cat(
+                            (work_entities, self._current_window_entities)
+                        )
+                    )
+                else:
+                    pool_entities = work_entities
                 if self.entity_sync_level == "partition":
                     max_vocab = self.model.get_s_embedder().vocab_size
                     if pool_entities.numel() <= max_vocab:
