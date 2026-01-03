@@ -1548,6 +1548,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if (
             not self._prefetch_window_entities
             or not self.entity_localize
+            or not self._window_work
             or self._current_window_entities is None
             or self._current_window_entities.numel() == 0
         ):
