@@ -988,15 +988,22 @@ class WorkScheduler(mp.get_context("fork").Process):
             stats = self.relation_gradient_stats[rel_id]
             stats["sum"] += float(rel_sum)
             stats["count"] += int(rel_count)
+                # Normalize partition_id to base int pids before touching the gradient graph
+        base_pids = self._base_partition_ids(partition_id)
+        if not base_pids:
+            return
+
         try:
-            self._update_gradient_graph(
-                partition_id, rel_ids_list, rel_sums_list, rel_counts_list
-            )
+            for pid in base_pids:
+                self._update_gradient_graph(
+                    pid, rel_ids_list, rel_sums_list, rel_counts_list
+                )
         except Exception as exc:
             self.config.log(
                 "Failed to update gradient graph "
-                f"(partition_id={partition_id}): {exc}"
+                f"(partition_id={partition_id}, base_pids={base_pids}): {exc}"
             )
+
     def _export_gradient_statistics(self, final: bool = False):
         if not self.partition_gradient_stats:
             return
