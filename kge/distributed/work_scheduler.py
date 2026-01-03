@@ -101,6 +101,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.partition_relation_gradient_stats = defaultdict(
             lambda: defaultdict(lambda: {"sum": 0.0, "count": 0})
         )
+        self.relation_gradient_stats = defaultdict(lambda: {"sum": 0.0, "count": 0})
         self.gradient_snapshot_interval = max(
             0, int(config.get("job.distributed.gradient_snapshot_interval") or 0)
         )
@@ -885,7 +886,13 @@ class WorkScheduler(mp.get_context("fork").Process):
         grad_buffer = torch.zeros(1, dtype=torch.float32)
         dist.recv(grad_buffer, src=rank)
         grad_sum = float(grad_buffer[0].item())
-        self._register_partition_gradient(partition_id, grad_sum, sample_count)
+        try:
+            self._register_partition_gradient(partition_id, grad_sum, sample_count)
+        except Exception as exc:
+            self.config.log(
+                "Failed to register partition gradient "
+                f"(partition_id={partition_id}): {exc}"
+            )
 
     def _handle_register_partition_relation_gradient(self, rank):
         info_buffer = torch.zeros(2, dtype=self.data_type)
@@ -901,9 +908,15 @@ class WorkScheduler(mp.get_context("fork").Process):
         dist.recv(rel_counts, src=rank)
         rel_sums = torch.empty(num_relations, dtype=torch.float32)
         dist.recv(rel_sums, src=rank)
-        self._register_partition_relation_gradient(
-            partition_id, rel_ids, rel_sums, rel_counts
-        )
+        try:
+            self._register_partition_relation_gradient(
+                partition_id, rel_ids, rel_sums, rel_counts
+            )
+        except Exception as exc:
+            self.config.log(
+                "Failed to register partition relation gradients "
+                f"(partition_id={partition_id}, relations={num_relations}): {exc}"
+            )
 
     def _register_partition_gradient(self, partition_id, grad_sum, sample_count):
         if partition_id is None:
@@ -917,11 +930,21 @@ class WorkScheduler(mp.get_context("fork").Process):
             if pid_int < -1:
                 partition_id = self._decode_partition_id(pid_int)
 
-        # NEW: normalize partition_id into a list of *int* base partition ids
+        # normalize partition_id into a list of *int* base partition ids
+        base_pids = []
         if isinstance(partition_id, (tuple, list)):
-            base_pids = [int(x) for x in partition_id]
+            for item in partition_id:
+                try:
+                    base_pids.append(int(item))
+                except (TypeError, ValueError):
+                    continue
         else:
-            base_pids = [int(partition_id)]
+            try:
+                base_pids.append(int(partition_id))
+            except (TypeError, ValueError):
+                return
+        if not base_pids:
+            return
 
         # Update stats for each base partition id (int keys only)
         for pid in base_pids:
@@ -965,14 +988,24 @@ class WorkScheduler(mp.get_context("fork").Process):
             stats = self.relation_gradient_stats[rel_id]
             stats["sum"] += float(rel_sum)
             stats["count"] += int(rel_count)
-        self._update_gradient_graph(
-            partition_id, rel_ids_list, rel_sums_list, rel_counts_list
-        )
+        try:
+            self._update_gradient_graph(
+                partition_id, rel_ids_list, rel_sums_list, rel_counts_list
+            )
+        except Exception as exc:
+            self.config.log(
+                "Failed to update gradient graph "
+                f"(partition_id={partition_id}): {exc}"
+            )
     def _export_gradient_statistics(self, final: bool = False):
         if not self.partition_gradient_stats:
             return
         output_folder = Path(self.config.folder) / "gradient_snapshots"
-        output_folder.mkdir(parents=True, exist_ok=True)
+        try:
+            output_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.config.log(f"Failed to create gradient snapshot folder: {exc}")
+            return
         if final:
             snapshot_path = output_folder / "gradient_snapshot_final.json"
         else:
@@ -1245,7 +1278,11 @@ class WorkScheduler(mp.get_context("fork").Process):
         if self._gradient_graph_cluster_enabled:
             self._maybe_update_gradient_graph_clusters(force=final)
         output_folder = Path(self.config.folder) / "gradient_graph"
-        output_folder.mkdir(parents=True, exist_ok=True)
+        try:
+            output_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.config.log(f"Failed to create gradient graph folder: {exc}")
+            return
         if final:
             graph_path = output_folder / "gradient_graph_final.json"
         else:
@@ -2057,7 +2094,11 @@ class GraphCutWorkScheduler(WorkScheduler):
             / "graph-cut"
             / f"num_{self.num_partitions}"
         )
-        output_folder.mkdir(parents=True, exist_ok=True)
+        try:
+            output_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.config.log(f"Failed to create graph-cut feedback folder: {exc}")
+            return
         feedback = {}
         for pid, history in self.partition_stats.items():
             if history:
