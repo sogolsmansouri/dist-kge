@@ -31,6 +31,14 @@ job:
   device: 'cuda'
   device_pool: [ ]
   distributed:
+    gpu_cache:
+      enable: False
+      # Max entries for all embedders (0 disables). Can override per type below.
+      max_entries: 0
+      max_entries_entity: 0
+      max_entries_relation: 0
+      # Upper bound on how many *new* ids we insert per step (0 => unlimited).
+      max_insert_per_step: 50000
     # number of workers over all machines
     num_workers: 1
 
@@ -168,7 +176,12 @@ job:
       prefetch_window_entities: True
       lookahead_negatives: True
       overlap_negative_sampling: False
-      stratification_pairs: True
+      swap_aware:
+        enable: False
+        weight: 1.0
+        # Override (bytes) for swap cost estimation; 0 => auto (embed_dim+optimizer_dim)*4
+        bytes_per_entity: 0
+      stratification_pairs: False
       debug_window_versions: 0
       debug_log: False
       debug_log_verbose: False

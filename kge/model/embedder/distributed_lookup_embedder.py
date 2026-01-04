@@ -104,6 +104,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._last_hot_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._gpu_cache_enabled = False
         self._gpu_cache_max_entries = 0
+        self._gpu_cache_max_insert_per_step = 50000
         self._gpu_cache_ids: Optional[torch.Tensor] = None
         self._gpu_cache_id_to_slot: Optional[torch.Tensor] = None
         self._gpu_cache_embeddings: Optional[torch.Tensor] = None
@@ -138,6 +139,14 @@ class DistributedLookupEmbedder(LookupEmbedder):
             )
         else:
             max_entries = int(cache_cfg.get("max_entries", 0))
+        self._gpu_cache_max_insert_per_step = int(
+            cache_cfg.get(
+                "max_insert_per_step",
+                self._gpu_cache_max_insert_per_step,
+            )
+        )
+        if self._gpu_cache_max_insert_per_step < 0:
+            self._gpu_cache_max_insert_per_step = 0
         if max_entries <= 0:
             return
         self._gpu_cache_enabled = True
@@ -484,9 +493,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
             cpu_gpu_time += time.time()
             if self._gpu_cache_enabled:
                 self._gpu_cache_misses += int(num_cold)
-                self._gpu_cache_insert(
-                    cold_indexes, pulled_embeddings_gpu, pulled_optim_gpu
-                )
+                cold_n = int(num_cold)
+                if (
+                    self._gpu_cache_max_insert_per_step
+                    and cold_n > self._gpu_cache_max_insert_per_step
+                ):
+                    pass
+                else:
+                    self._gpu_cache_insert(
+                        cold_indexes, pulled_embeddings_gpu, pulled_optim_gpu
+                    )
 
         self.local_to_lapse_mapper[output_rows] = indexes_cpu + self.lapse_offset
         return pull_time, cpu_gpu_time

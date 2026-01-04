@@ -2189,10 +2189,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         optimizer_dim = get_optimizer_dim(config, embed_dim)
         if optimizer_dim < 0:
             optimizer_dim = 0
-        bytes_per_entity = (embed_dim + optimizer_dim) * 4
-        self.glow_swap_bytes_per_entity = int(
-            swap_cfg.get("bytes_per_entity", bytes_per_entity)
-        )
+        default_bytes = (embed_dim + optimizer_dim) * 4
+        override_bytes = int(swap_cfg.get("bytes_per_entity", 0))
+        if override_bytes > 0:
+            self.glow_swap_bytes_per_entity = override_bytes
+        else:
+            self.glow_swap_bytes_per_entity = default_bytes
         reshape_cfg = glow_cfg.get("reshape") or {}
         self.reshape_enabled = bool(reshape_cfg.get("enable", False))
         self.reshape_interval = max(1, int(reshape_cfg.get("check_interval", 200)))

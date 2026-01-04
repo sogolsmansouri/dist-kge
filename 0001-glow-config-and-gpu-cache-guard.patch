@@ -1,0 +1,99 @@
+diff --git a/kge/config-default.yaml b/kge/config-default.yaml
+index 86ebc23..cecd280 100644
+--- a/kge/config-default.yaml
++++ b/kge/config-default.yaml
+@@ -31,6 +31,14 @@ job:
+   device: 'cuda'
+   device_pool: [ ]
+   distributed:
++    gpu_cache:
++      enable: False
++      # Max entries for all embedders (0 disables). Can override per type below.
++      max_entries: 0
++      max_entries_entity: 0
++      max_entries_relation: 0
++      # Upper bound on how many *new* ids we insert per step (0 => unlimited).
++      max_insert_per_step: 50000
+     # number of workers over all machines
+     num_workers: 1
+ 
+@@ -168,6 +176,11 @@ job:
+       prefetch_window_entities: True
+       lookahead_negatives: True
+       overlap_negative_sampling: False
++      swap_aware:
++        enable: False
++        weight: 1.0
++        # Override (bytes) for swap cost estimation; 0 => auto (embed_dim+optimizer_dim)*4
++        bytes_per_entity: 0
+       stratification_pairs: True
+       debug_window_versions: 0
+       debug_log: False
+diff --git a/kge/distributed/work_scheduler.py b/kge/distributed/work_scheduler.py
+index 0ded4d0..3a78939 100644
+--- a/kge/distributed/work_scheduler.py
++++ b/kge/distributed/work_scheduler.py
+@@ -2189,10 +2189,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
+         optimizer_dim = get_optimizer_dim(config, embed_dim)
+         if optimizer_dim < 0:
+             optimizer_dim = 0
+-        bytes_per_entity = (embed_dim + optimizer_dim) * 4
+-        self.glow_swap_bytes_per_entity = int(
+-            swap_cfg.get("bytes_per_entity", bytes_per_entity)
+-        )
++        default_bytes = (embed_dim + optimizer_dim) * 4
++        override_bytes = int(swap_cfg.get("bytes_per_entity", 0))
++        if override_bytes > 0:
++            self.glow_swap_bytes_per_entity = override_bytes
++        else:
++            self.glow_swap_bytes_per_entity = default_bytes
+         reshape_cfg = glow_cfg.get("reshape") or {}
+         self.reshape_enabled = bool(reshape_cfg.get("enable", False))
+         self.reshape_interval = max(1, int(reshape_cfg.get("check_interval", 200)))
+diff --git a/kge/model/embedder/distributed_lookup_embedder.py b/kge/model/embedder/distributed_lookup_embedder.py
+index 716ccae..f00e684 100644
+--- a/kge/model/embedder/distributed_lookup_embedder.py
++++ b/kge/model/embedder/distributed_lookup_embedder.py
+@@ -104,6 +104,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
+         self._last_hot_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+         self._gpu_cache_enabled = False
+         self._gpu_cache_max_entries = 0
++        self._gpu_cache_max_insert_per_step = 50000
+         self._gpu_cache_ids: Optional[torch.Tensor] = None
+         self._gpu_cache_id_to_slot: Optional[torch.Tensor] = None
+         self._gpu_cache_embeddings: Optional[torch.Tensor] = None
+@@ -138,6 +139,14 @@ class DistributedLookupEmbedder(LookupEmbedder):
+             )
+         else:
+             max_entries = int(cache_cfg.get("max_entries", 0))
++        self._gpu_cache_max_insert_per_step = int(
++            cache_cfg.get(
++                "max_insert_per_step",
++                self._gpu_cache_max_insert_per_step,
++            )
++        )
++        if self._gpu_cache_max_insert_per_step < 0:
++            self._gpu_cache_max_insert_per_step = 0
+         if max_entries <= 0:
+             return
+         self._gpu_cache_enabled = True
+@@ -484,9 +493,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
+             cpu_gpu_time += time.time()
+             if self._gpu_cache_enabled:
+                 self._gpu_cache_misses += int(num_cold)
+-                self._gpu_cache_insert(
+-                    cold_indexes, pulled_embeddings_gpu, pulled_optim_gpu
+-                )
++                cold_n = int(num_cold)
++                if (
++                    self._gpu_cache_max_insert_per_step
++                    and cold_n > self._gpu_cache_max_insert_per_step
++                ):
++                    pass
++                else:
++                    self._gpu_cache_insert(
++                        cold_indexes, pulled_embeddings_gpu, pulled_optim_gpu
++                    )
+ 
+         self.local_to_lapse_mapper[output_rows] = indexes_cpu + self.lapse_offset
+         return pull_time, cpu_gpu_time
