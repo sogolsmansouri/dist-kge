@@ -320,6 +320,27 @@ class DistAdagrad(Optimizer):
         keys = keys[valid_mask]
         payload = payload[valid_mask]
         partition_ids = partition_map[raw_ids]
+        # Fast path: if everything maps to a single partition id, avoid torch.unique()
+        # and avoid building multiple boolean masks / multiple PS calls.
+        if partition_ids.numel() > 0:
+            first_pid = int(partition_ids[0].item())
+            if bool(torch.all(partition_ids == first_pid)):
+                version = self._partition_context_map.get(first_pid)
+                self._record_window_push(
+                    first_pid, version, group_name, keys, payload
+                )
+                if version is None:
+                    return self.parameter_client.push(
+                        keys, payload, asynchronous=asynchronous
+                    )
+                return self.parameter_client.push_versioned(
+                    keys,
+                    payload,
+                    first_pid,
+                    int(version),
+                    asynchronous=asynchronous,
+                )
+
         wait_value = None
         for pid in torch.unique(partition_ids).tolist():
             version = self._partition_context_map.get(pid)
