@@ -14,7 +14,12 @@ import torch
 import torch.distributed as dist
 from collections import deque, defaultdict
 from copy import deepcopy
-from kge.distributed.misc import get_min_rank, set_master_environment, initialize_worker_groups
+from kge.distributed.misc import (
+    get_min_rank,
+    set_master_environment,
+    initialize_worker_groups,
+    get_optimizer_dim,
+)
 from kge.distributed.stratification_schedule_creator import StratificationScheduleCreator
 from kge.misc import set_seeds
 
@@ -2177,6 +2182,17 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.glow_overlap_penalty = float(
             bandit_cfg.get("overlap_penalty", 0.0)
         )
+        swap_cfg = glow_cfg.get("swap_aware") or {}
+        self.glow_swap_aware = bool(swap_cfg.get("enable", False))
+        self.glow_swap_weight = float(swap_cfg.get("weight", 1.0))
+        embed_dim = int(config.get("lookup_embedder.dim"))
+        optimizer_dim = get_optimizer_dim(config, embed_dim)
+        if optimizer_dim < 0:
+            optimizer_dim = 0
+        bytes_per_entity = (embed_dim + optimizer_dim) * 4
+        self.glow_swap_bytes_per_entity = int(
+            swap_cfg.get("bytes_per_entity", bytes_per_entity)
+        )
         reshape_cfg = glow_cfg.get("reshape") or {}
         self.reshape_enabled = bool(reshape_cfg.get("enable", False))
         self.reshape_interval = max(1, int(reshape_cfg.get("check_interval", 200)))
@@ -2266,6 +2282,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._latest_gradients = {}
         self._window_scores = defaultdict(float)
         self._window_counts = defaultdict(int)
+        self._window_swap_costs = {}
         self._partition_to_window = {}
         self._window_work_key_map = {}
         self._partition_entities_map = None
@@ -2528,6 +2545,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     "partitions": deque(window),
                 }
                 self._glow_windows.append(window_entry)
+                if self.glow_swap_aware and self._partition_entities_map is not None:
+                    window_count = self._estimate_window_entity_count(window)
+                    self._window_swap_costs[tuple(window)] = (
+                        window_count * self.glow_swap_bytes_per_entity
+                    )
             if (
                 (self.glow_overlap_sampling or self.glow_window_work)
                 and self._partition_entities_map is not None
@@ -2611,13 +2633,40 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
     def _sort_glow_windows(self):
         if not self._glow_windows:
             return
-        if not self.glow_bandit_enabled:
+        if not self.glow_bandit_enabled and not self.glow_swap_aware:
             return
+
+        scores = []
+        cost_values = []
+        for entry in self._glow_windows:
+            key = entry.get("key")
+            bandit_score = self._window_scores.get(key, 0.0)
+            swap_cost = self._window_swap_costs.get(key)
+            if swap_cost is None and self.glow_swap_aware:
+                unique_count = self._estimate_window_entity_count(key)
+                swap_cost = unique_count * self.glow_swap_bytes_per_entity
+                self._window_swap_costs[key] = swap_cost
+            cost_values.append(swap_cost if swap_cost is not None else 0.0)
+            scores.append((entry, bandit_score, swap_cost))
+
+        min_cost = min(cost_values) if cost_values else 0.0
+        max_cost = max(cost_values) if cost_values else 0.0
+        denom = max(1.0, max_cost - min_cost)
+
+        def combined_score(entry, bandit_score, swap_cost):
+            if not self.glow_swap_aware or swap_cost is None:
+                return bandit_score
+            swap_score = 1.0 - ((swap_cost - min_cost) / denom)
+            if self.glow_bandit_enabled:
+                return bandit_score + self.glow_swap_weight * swap_score
+            return swap_score
+
         sorted_entries = sorted(
-            list(self._glow_windows),
-            key=lambda entry: self._window_scores.get(entry["key"], 0.0),
+            scores,
+            key=lambda item: combined_score(item[0], item[1], item[2]),
             reverse=True,
         )
+        sorted_entries = [entry for entry, _, _ in sorted_entries]
         self._glow_windows = deque(sorted_entries)
         if self._glow_debug_verbose:
             limit = self._glow_debug_window_limit or 5
@@ -2625,7 +2674,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             for entry in list(self._glow_windows)[:limit]:
                 key = entry.get("key")
                 score = self._window_scores.get(key, 0.0)
-                summary.append(f"{key}:{score:.4f}")
+                swap_cost = self._window_swap_costs.get(key, 0.0)
+                if self.glow_swap_aware:
+                    summary.append(f"{key}:{score:.4f},swap={swap_cost:.0f}")
+                else:
+                    summary.append(f"{key}:{score:.4f}")
             if summary:
                 self._glow_log_verbose(
                     "Sorted window scores (top): " + ", ".join(summary)
@@ -3207,9 +3260,16 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         )
         if not self._gradient_cluster_enabled or partition_id is None:
             return
-        self._update_relation_affinity(
-            int(partition_id), relation_ids, grad_sums, grad_counts
-        )
+        # self._update_relation_affinity(
+        #     int(partition_id), relation_ids, grad_sums, grad_counts
+        # )
+        base_pids = self._base_partition_ids(partition_id)
+        if not base_pids:
+            return
+        for pid in base_pids:
+            self._update_relation_affinity(
+                int(pid), relation_ids, grad_sums, grad_counts
+            )
 
     def _update_relation_affinity(
         self, partition_id: int, relation_ids, grad_sums, grad_counts

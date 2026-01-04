@@ -102,8 +102,18 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._hot_cache_embeddings: Optional[torch.Tensor] = None
         self._hot_cache_optimizer: Optional[torch.Tensor] = None
         self._last_hot_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._gpu_cache_enabled = False
+        self._gpu_cache_max_entries = 0
+        self._gpu_cache_ids: Optional[torch.Tensor] = None
+        self._gpu_cache_id_to_slot: Optional[torch.Tensor] = None
+        self._gpu_cache_embeddings: Optional[torch.Tensor] = None
+        self._gpu_cache_optimizer: Optional[torch.Tensor] = None
+        self._gpu_cache_next_slot = 0
+        self._gpu_cache_hits = 0
+        self._gpu_cache_misses = 0
         self._active_partition_id: Optional[int] = None
         self._active_partition_version: Optional[int] = None
+        self._init_gpu_cache_config()
 
     def to_device(self, move_optim_data=True):
         """Needs to be called after model.to(self.device)"""
@@ -111,6 +121,118 @@ class DistributedLookupEmbedder(LookupEmbedder):
             self.optimizer_values = self.optimizer_values.to(
                 self._embeddings.weight.device
             )
+        self._setup_gpu_cache()
+
+    def _init_gpu_cache_config(self):
+        cache_cfg = self.config.get("job.distributed.gpu_cache") or {}
+        enabled = bool(cache_cfg.get("enable", False))
+        if not enabled:
+            return
+        if "entity" in self.configuration_key:
+            max_entries = int(
+                cache_cfg.get("max_entries_entity", cache_cfg.get("max_entries", 0))
+            )
+        elif "relation" in self.configuration_key:
+            max_entries = int(
+                cache_cfg.get("max_entries_relation", cache_cfg.get("max_entries", 0))
+            )
+        else:
+            max_entries = int(cache_cfg.get("max_entries", 0))
+        if max_entries <= 0:
+            return
+        self._gpu_cache_enabled = True
+        self._gpu_cache_max_entries = max_entries
+
+    def _setup_gpu_cache(self):
+        if not self._gpu_cache_enabled:
+            return
+        device = self._embeddings.weight.device
+        if device.type != "cuda":
+            return
+        if (
+            self._gpu_cache_embeddings is not None
+            and self._gpu_cache_embeddings.device == device
+        ):
+            return
+        cache_size = self._gpu_cache_max_entries
+        if cache_size <= 0:
+            return
+        if "relation" in self.configuration_key:
+            mapping_size = self.dataset.num_relations()
+        else:
+            mapping_size = self.complete_vocab_size or self.dataset.num_entities()
+        mapping_size = max(mapping_size, cache_size)
+        self._gpu_cache_id_to_slot = torch.full(
+            (mapping_size,), -1, dtype=torch.long, device="cpu"
+        )
+        self._gpu_cache_ids = torch.full(
+            (cache_size,), -1, dtype=torch.long, device="cpu"
+        )
+        self._gpu_cache_embeddings = torch.empty(
+            (cache_size, self.dim), device=device
+        )
+        self._gpu_cache_optimizer = torch.empty(
+            (cache_size, self.optimizer_dim), device=self.optimizer_values.device
+        )
+        self._gpu_cache_next_slot = 0
+        self._gpu_cache_hits = 0
+        self._gpu_cache_misses = 0
+
+    def _gpu_cache_lookup(self, indexes_cpu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self._gpu_cache_enabled or self._gpu_cache_id_to_slot is None:
+            return None, None
+        slots = self._gpu_cache_id_to_slot[indexes_cpu]
+        mask = slots >= 0
+        return slots, mask
+
+    def _gpu_cache_insert(
+        self,
+        indexes_cpu: torch.Tensor,
+        emb_gpu: torch.Tensor,
+        opt_gpu: torch.Tensor,
+    ) -> None:
+        if (
+            not self._gpu_cache_enabled
+            or self._gpu_cache_id_to_slot is None
+            or self._gpu_cache_ids is None
+            or self._gpu_cache_embeddings is None
+        ):
+            return
+        if indexes_cpu.numel() == 0:
+            return
+        cache_size = self._gpu_cache_max_entries
+        if cache_size <= 0:
+            return
+        if indexes_cpu.numel() > cache_size:
+            indexes_cpu = indexes_cpu[-cache_size:]
+            emb_gpu = emb_gpu[-cache_size:]
+            opt_gpu = opt_gpu[-cache_size:]
+        n = int(indexes_cpu.numel())
+        start = self._gpu_cache_next_slot
+        slots = (torch.arange(n, device="cpu") + start) % cache_size
+        evict_ids = self._gpu_cache_ids[slots]
+        if evict_ids.numel() > 0:
+            valid_evict = evict_ids >= 0
+            if valid_evict.any():
+                self._gpu_cache_id_to_slot[evict_ids[valid_evict]] = -1
+        self._gpu_cache_ids[slots] = indexes_cpu
+        self._gpu_cache_id_to_slot[indexes_cpu] = slots
+        slots_device = slots.to(emb_gpu.device)
+        self._gpu_cache_embeddings[slots_device] = emb_gpu
+        if self._gpu_cache_optimizer is not None and opt_gpu is not None:
+            self._gpu_cache_optimizer[slots_device] = opt_gpu
+        self._gpu_cache_next_slot = int((start + n) % cache_size)
+
+    def get_and_reset_gpu_cache_stats(self):
+        if not self._gpu_cache_enabled:
+            return None
+        stats = {
+            "hits": int(self._gpu_cache_hits),
+            "misses": int(self._gpu_cache_misses),
+        }
+        self._gpu_cache_hits = 0
+        self._gpu_cache_misses = 0
+        return stats
 
     @torch.no_grad()
     def init_pretrained(self, pretrained_embedder: KgeEmbedder) -> None:
@@ -319,6 +441,27 @@ class DistributedLookupEmbedder(LookupEmbedder):
         else:
             cold_mask = ~hot_mask
 
+        cache_mask = None
+        if self._gpu_cache_enabled and self._gpu_cache_id_to_slot is not None:
+            cache_slots, cache_mask = self._gpu_cache_lookup(indexes_cpu)
+            if cache_mask is not None and cache_mask.any():
+                if hot_mask is not None:
+                    cache_mask = cache_mask & cold_mask
+                cache_rows = output_rows[cache_mask]
+                if cache_rows.numel() > 0:
+                    cache_rows_device = cache_rows.to(device)
+                    slots_device = cache_slots[cache_mask].to(device)
+                    self._embeddings.weight.data[cache_rows_device] = (
+                        self._gpu_cache_embeddings[slots_device]
+                    )
+                    self.optimizer_values[cache_rows_device] = (
+                        self._gpu_cache_optimizer[slots_device]
+                    )
+                    self._gpu_cache_hits += int(cache_rows.numel())
+        if cache_mask is None:
+            cache_mask = torch.zeros(len_indexes, dtype=torch.bool)
+
+        cold_mask = cold_mask & ~cache_mask
         cold_rows = output_rows[cold_mask]
         num_cold = cold_rows.numel()
         if num_cold > 0:
@@ -334,11 +477,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 pull_tensor, [self.dim, self.optimizer_dim, self.unnecessary_dim], dim=1
             )
             cold_rows_device = cold_rows.to(device)
-            self._embeddings.weight.data[cold_rows_device] = pulled_embeddings.to(device)
-            self.optimizer_values[cold_rows_device] = pulled_optim_values.to(
-                self.optimizer_values.device
-            )
+            pulled_embeddings_gpu = pulled_embeddings.to(device)
+            pulled_optim_gpu = pulled_optim_values.to(self.optimizer_values.device)
+            self._embeddings.weight.data[cold_rows_device] = pulled_embeddings_gpu
+            self.optimizer_values[cold_rows_device] = pulled_optim_gpu
             cpu_gpu_time += time.time()
+            if self._gpu_cache_enabled:
+                self._gpu_cache_misses += int(num_cold)
+                self._gpu_cache_insert(
+                    cold_indexes, pulled_embeddings_gpu, pulled_optim_gpu
+                )
 
         self.local_to_lapse_mapper[output_rows] = indexes_cpu + self.lapse_offset
         return pull_time, cpu_gpu_time

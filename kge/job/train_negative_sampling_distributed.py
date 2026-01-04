@@ -2578,6 +2578,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     dataloader_time=dataloader_time,
                 )
             )
+            gpu_cache_stats = None
+            embedder = self.model.get_s_embedder()
+            if hasattr(embedder, "get_and_reset_gpu_cache_stats"):
+                gpu_cache_stats = embedder.get_and_reset_gpu_cache_stats()
+            if gpu_cache_stats:
+                chunk_trace.update(
+                    dict(
+                        gpu_cache_hits=gpu_cache_stats.get("hits", 0),
+                        gpu_cache_misses=gpu_cache_stats.get("misses", 0),
+                    )
+                )
             if chunk_grad_summary:
                 chunk_trace.update(
                     dict(
