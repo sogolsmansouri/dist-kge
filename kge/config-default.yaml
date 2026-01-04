@@ -37,6 +37,10 @@ job:
       max_entries: 0
       max_entries_entity: 0
       max_entries_relation: 0
+      # Reserve part of the GPU cache for window-prefetch pins (0 disables).
+      window_pinned_max: 0
+      window_pinned_max_entity: 0
+      window_pinned_max_relation: 0
       # Upper bound on how many *new* ids we insert per step (0 => unlimited).
       max_insert_per_step: 50000
     # number of workers over all machines
