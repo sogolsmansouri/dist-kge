@@ -508,11 +508,77 @@ class DistributedLookupEmbedder(LookupEmbedder):
         return pull_time, cpu_gpu_time
 
     def localize(self, indexes: Tensor, asynchronous=False, make_unique=False):
+        """
+        Hint/prefetch rows that are likely needed soon.
+
+        NOTE:
+        - In shared/torch parameter server modes, ParameterClient.localize() is a no-op.
+        - To make Glow window prefetch effective on a single machine, we warm the optional
+          GPU cache here by explicitly pulling rows and inserting them into the cache.
+        """
         if make_unique:
             indexes = torch.unique(indexes)
-        self.parameter_client.localize(
-            (indexes + self.lapse_offset).cpu(), asynchronous
-        )
+        if indexes is None or indexes.numel() == 0:
+            return
+
+        # Best-effort call (may be a no-op depending on PS backend).
+        try:
+            self.parameter_client.localize((indexes + self.lapse_offset).cpu(), asynchronous)
+        except Exception:
+            pass
+
+        # If GPU cache isn't enabled, nothing more to do.
+        if not getattr(self, "_gpu_cache_enabled", False):
+            return
+
+        # Work on CPU ids (RAW ids without lapse_offset) for cache bookkeeping.
+        raw_ids_cpu = indexes.detach().to("cpu", dtype=torch.long)
+
+        # Avoid refetching rows already in cache.
+        try:
+            _, cold_mask = self._gpu_cache_lookup(raw_ids_cpu)
+            if torch.any(cold_mask):
+                raw_ids_cpu = raw_ids_cpu[cold_mask]
+            else:
+                return
+        except Exception:
+            # If anything goes wrong, fall back to prefetching all provided ids.
+            pass
+
+        device = self._embeddings.weight.device
+        update_cols = int(getattr(self.parameter_client, "dim", 0))
+        opt_cols = int(getattr(self.parameter_client, "optimizer_dim", 0))
+
+        # Pull in chunks to keep temporary tensors bounded.
+        chunk_size = 65536
+        for start in range(0, raw_ids_cpu.numel(), chunk_size):
+            chunk_raw = raw_ids_cpu[start : start + chunk_size]
+            if chunk_raw.numel() == 0:
+                continue
+
+            # Keys into the PS include the lapse offset.
+            chunk_keys = (chunk_raw + self.lapse_offset).to(dtype=torch.long)
+
+            # Reuse the pinned CPU pull tensor.
+            pull_tensor = self.pull_tensors[0][1][: chunk_keys.numel()]
+
+            # Pull is CPU-side; we keep it synchronous here because the warmup is typically
+            # called at window boundaries. (Async would need completion tracking.)
+            wait_value = self.parameter_client.pull(chunk_keys, pull_tensor, asynchronous=False)
+            if hasattr(wait_value, "wait"):
+                wait_value.wait()
+
+            # Split pull payload into update + optimizer state.
+            emb_cpu = pull_tensor[:, :update_cols].contiguous()
+            if opt_cols > 0:
+                opt_cpu = pull_tensor[:, update_cols : update_cols + opt_cols].contiguous()
+            else:
+                opt_cpu = torch.empty((chunk_keys.numel(), 0), dtype=emb_cpu.dtype)
+
+            # Move to GPU and insert into cache.
+            emb_gpu = emb_cpu.to(device, non_blocking=True)
+            opt_gpu = opt_cpu.to(device, non_blocking=True)
+            self._gpu_cache_insert(chunk_raw, emb_gpu, opt_gpu)
 
     def _embed(self, indexes: Tensor) -> Tensor:
         long_indexes = indexes.long()
