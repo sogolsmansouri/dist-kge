@@ -1703,38 +1703,55 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._partition_maps_ready = True
 
     def _notify_partition_start(self):
+        # Glow window work can use tuple partition ids (window keys). Only attach a
+        # partition context when the id is a single integer partition id.
         if (
-            self._current_partition_id is not None
+            isinstance(self._current_partition_id, (int, np.integer))
             and self._current_partition_version is not None
             and hasattr(self.optimizer, "set_partition_context")
         ):
             self.optimizer.set_partition_context(
-                self._current_partition_id, self._current_partition_version
+                int(self._current_partition_id), int(self._current_partition_version)
             )
+    
+        # Versioned per-partition pushes are only needed when the optimizer actually performs
+        # conflict-aware / causal merges. If those are disabled, routing every push by pid adds
+        # a lot of overhead (extra masking + extra PS calls) and hurts epoch time.
+        need_versioned_pushes = bool(
+            getattr(self.optimizer, "conflict_free_merge", False)
+            or getattr(self.optimizer, "causal_merge", False)
+            or getattr(self.optimizer, "row_causal_merge", False)
+        )
+    
         if (
-            self._current_window_members is not None
+            need_versioned_pushes
+            and self._current_window_members is not None
             and self._current_window_versions is not None
             and hasattr(self.optimizer, "set_partition_context_map")
         ):
             self._init_partition_maps()
             window_ids = [int(x) for x in self._current_window_members.tolist()]
-            window_versions = [
-                int(x) for x in self._current_window_versions.tolist()
-            ]
-            version_map = dict(zip(window_ids, window_versions))
+            window_versions = [int(x) for x in self._current_window_versions.tolist()]
+            version_map = {pid: ver for pid, ver in zip(window_ids, window_versions) if pid >= 0}
             self.optimizer.set_partition_context_map(
                 version_map,
-                self._entity_partition_map,
-                self._relation_partition_map,
+                entity_partition_map=self._entity_partition_map,
+                relation_partition_map=self._relation_partition_map,
             )
+    
         for embedder in (
             self.model.get_s_embedder(),
             self.model.get_p_embedder(),
         ):
-            if hasattr(embedder, "set_partition_context"):
+            if (
+                isinstance(self._current_partition_id, (int, np.integer))
+                and self._current_partition_version is not None
+                and hasattr(embedder, "set_partition_context")
+            ):
                 embedder.set_partition_context(
-                    self._current_partition_id, self._current_partition_version
+                    int(self._current_partition_id), int(self._current_partition_version)
                 )
+
 
     def _notify_partition_end(self):
         finished = (self._current_partition_id, self._current_partition_version)
