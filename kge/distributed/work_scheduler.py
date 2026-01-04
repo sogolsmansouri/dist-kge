@@ -2433,12 +2433,27 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 self._glow_effective_partitions = len(partitions)
                 return partitions
             self._glow_log("Stratification pairs disabled.")
+        # IMPORTANT:
+        # If partition_assignment is shape (num_triples, 2) and stratification_pairs=False,
+        # we must NOT union both columns (partition_assignment == i), because that duplicates
+        # each triple into both of its two partition ids and nearly doubles epoch work.
+        #
+        # Instead, choose a single "primary" partition id per triple (column 0).
+        if self._glow_stratified_partitions:
+            primary = partition_assignment[:, 0]
+            partition_indexes = np.unique(primary)
+            partitions = [
+                torch.from_numpy(
+                    np.where(primary == i)[0].astype(np_type)
+                ).contiguous()
+                for i in partition_indexes
+            ]
+            return partitions
+
         partition_indexes = np.unique(partition_assignment)
         partitions = [
             torch.from_numpy(
-                np.unique(np.where(partition_assignment == i)[0]).astype(np_type)
-                if self._glow_stratified_partitions
-                else np.where(partition_assignment == i)[0].astype(np_type)
+                np.where(partition_assignment == i)[0].astype(np_type)
             ).contiguous()
             for i in partition_indexes
         ]
