@@ -1590,9 +1590,15 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._window_prefetch_key = prefetch_key
             return
         try:
-            self.model.get_s_embedder().localize(
-                extras.to(dtype=torch.long), asynchronous=True, make_unique=False
-            )
+            embedder = self.model.get_s_embedder()
+            if hasattr(embedder, "prefetch_window_pinned"):
+                embedder.prefetch_window_pinned(
+                    extras.to(dtype=torch.long), make_unique=False
+                )
+            else:
+                embedder.localize(
+                    extras.to(dtype=torch.long), asynchronous=True, make_unique=False
+                )
             if window_key is not None:
                 self.config.log(
                     f"Glow prelocalized {extras.numel()} overlapping entities for window {window_key}."

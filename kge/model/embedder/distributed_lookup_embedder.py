@@ -105,6 +105,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_enabled = False
         self._gpu_cache_max_entries = 0
         self._gpu_cache_max_insert_per_step = 50000
+        self._gpu_cache_pinned_max_entries = 0
+        self._gpu_cache_pinned_capacity = 0
+        self._gpu_cache_pinned_next_slot = 0
         self._gpu_cache_ids: Optional[torch.Tensor] = None
         self._gpu_cache_id_to_slot: Optional[torch.Tensor] = None
         self._gpu_cache_embeddings: Optional[torch.Tensor] = None
@@ -115,6 +118,8 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._active_partition_id: Optional[int] = None
         self._active_partition_version: Optional[int] = None
         self._init_gpu_cache_config()
+        # Optional: reserve a pinned cache segment for GLOW window prefetches.
+        # (Configured via job.distributed.gpu_cache.window_pinned_max[_entity|_relation])
 
     def to_device(self, move_optim_data=True):
         """Needs to be called after model.to(self.device)"""
@@ -133,12 +138,25 @@ class DistributedLookupEmbedder(LookupEmbedder):
             max_entries = int(
                 cache_cfg.get("max_entries_entity", cache_cfg.get("max_entries", 0))
             )
+            pinned_max = int(
+                cache_cfg.get(
+                    "window_pinned_max_entity",
+                    cache_cfg.get("window_pinned_max", 0),
+                )
+            )
         elif "relation" in self.configuration_key:
             max_entries = int(
                 cache_cfg.get("max_entries_relation", cache_cfg.get("max_entries", 0))
             )
+            pinned_max = int(
+                cache_cfg.get(
+                    "window_pinned_max_relation",
+                    cache_cfg.get("window_pinned_max", 0),
+                )
+            )
         else:
             max_entries = int(cache_cfg.get("max_entries", 0))
+            pinned_max = int(cache_cfg.get("window_pinned_max", 0))
         self._gpu_cache_max_insert_per_step = int(
             cache_cfg.get(
                 "max_insert_per_step",
@@ -151,6 +169,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
             return
         self._gpu_cache_enabled = True
         self._gpu_cache_max_entries = max_entries
+        self._gpu_cache_pinned_max_entries = max(0, pinned_max)
 
     def _setup_gpu_cache(self):
         if not self._gpu_cache_enabled:
@@ -183,7 +202,10 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_optimizer = torch.empty(
             (cache_size, self.optimizer_dim), device=self.optimizer_values.device
         )
-        self._gpu_cache_next_slot = 0
+        pinned_cap = int(getattr(self, "_gpu_cache_pinned_max_entries", 0) or 0)
+        self._gpu_cache_pinned_capacity = max(0, min(pinned_cap, cache_size))
+        self._gpu_cache_pinned_next_slot = 0
+        self._gpu_cache_next_slot = self._gpu_cache_pinned_capacity
         self._gpu_cache_hits = 0
         self._gpu_cache_misses = 0
 
@@ -209,16 +231,23 @@ class DistributedLookupEmbedder(LookupEmbedder):
             return
         if indexes_cpu.numel() == 0:
             return
-        cache_size = self._gpu_cache_max_entries
+        cache_size = int(self._gpu_cache_max_entries or 0)
         if cache_size <= 0:
             return
-        if indexes_cpu.numel() > cache_size:
-            indexes_cpu = indexes_cpu[-cache_size:]
-            emb_gpu = emb_gpu[-cache_size:]
-            opt_gpu = opt_gpu[-cache_size:]
+        pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
+        usable = cache_size - pinned
+        if usable <= 0:
+            return
+        if indexes_cpu.numel() > usable:
+            indexes_cpu = indexes_cpu[-usable:]
+            emb_gpu = emb_gpu[-usable:]
+            opt_gpu = opt_gpu[-usable:]
         n = int(indexes_cpu.numel())
-        start = self._gpu_cache_next_slot
-        slots = (torch.arange(n, device="cpu") + start) % cache_size
+        start = int(self._gpu_cache_next_slot or pinned)
+        if start < pinned:
+            start = pinned
+        rel_start = start - pinned
+        slots = (torch.arange(n, device="cpu") + rel_start) % usable + pinned
         evict_ids = self._gpu_cache_ids[slots]
         if evict_ids.numel() > 0:
             valid_evict = evict_ids >= 0
@@ -226,11 +255,112 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 self._gpu_cache_id_to_slot[evict_ids[valid_evict]] = -1
         self._gpu_cache_ids[slots] = indexes_cpu
         self._gpu_cache_id_to_slot[indexes_cpu] = slots
-        slots_device = slots.to(emb_gpu.device)
+        slots_device = slots.to(self._gpu_cache_embeddings.device, non_blocking=True)
         self._gpu_cache_embeddings[slots_device] = emb_gpu
-        if self._gpu_cache_optimizer is not None and opt_gpu is not None:
-            self._gpu_cache_optimizer[slots_device] = opt_gpu
-        self._gpu_cache_next_slot = int((start + n) % cache_size)
+        if self._gpu_cache_optimizer is not None and self.optimizer_dim > 0:
+            slots_opt = slots.to(self._gpu_cache_optimizer.device, non_blocking=True)
+            self._gpu_cache_optimizer[slots_opt] = opt_gpu
+        self._gpu_cache_next_slot = int(((rel_start + n) % usable) + pinned)
+
+    def _gpu_cache_clear_slots(self, slots_cpu: torch.Tensor) -> None:
+        if (
+            not self._gpu_cache_enabled
+            or self._gpu_cache_id_to_slot is None
+            or self._gpu_cache_ids is None
+        ):
+            return
+        if slots_cpu is None or slots_cpu.numel() == 0:
+            return
+        evict_ids = self._gpu_cache_ids[slots_cpu]
+        if evict_ids.numel() > 0:
+            valid_evict = evict_ids >= 0
+            if valid_evict.any():
+                self._gpu_cache_id_to_slot[evict_ids[valid_evict]] = -1
+        self._gpu_cache_ids[slots_cpu] = -1
+
+    def _gpu_cache_clear_pinned(self) -> None:
+        pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
+        if pinned <= 0:
+            return
+        slots = torch.arange(pinned, dtype=torch.long, device="cpu")
+        self._gpu_cache_clear_slots(slots)
+        self._gpu_cache_pinned_next_slot = 0
+
+    def prefetch_window_pinned(
+        self,
+        indexes: Tensor,
+        make_unique: bool = True,
+    ) -> None:
+        """Prefetch (and pin) a window's ids into the GPU cache."""
+        if not self._gpu_cache_enabled:
+            return
+        self._setup_gpu_cache()
+        pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
+        if pinned <= 0:
+            return
+        if indexes is None:
+            return
+        idx_cpu = indexes.detach()
+        if idx_cpu.device.type != "cpu":
+            idx_cpu = idx_cpu.cpu()
+        idx_cpu = idx_cpu.long()
+        if idx_cpu.numel() == 0:
+            return
+        if make_unique:
+            idx_cpu = torch.unique(idx_cpu)
+        if idx_cpu.numel() == 0:
+            return
+        if idx_cpu.numel() > pinned:
+            idx_cpu = idx_cpu[:pinned]
+        n = int(idx_cpu.numel())
+        if n <= 0:
+            return
+
+        self._gpu_cache_clear_pinned()
+
+        pull = self._get_free_pull_tensor()
+        if pull is None:
+            pull_tensor_index = None
+            pull_tensor = torch.empty(
+                (n, self.parameter_client.dim),
+                dtype=torch.float32,
+                device="cpu",
+                requires_grad=False,
+            )
+            if torch.cuda.is_available():
+                pull_tensor = pull_tensor.pin_memory()
+        else:
+            pull_tensor_index, pull_tensor_full = pull
+            pull_tensor = pull_tensor_full[:n]
+
+        self.parameter_client.pull(idx_cpu + self.lapse_offset, pull_tensor)
+
+        split_sizes = [self.dim, self.optimizer_dim]
+        if self.unnecessary_dim > 0:
+            split_sizes.append(self.unnecessary_dim)
+        parts = torch.split(pull_tensor, split_sizes, dim=1)
+        pulled_embeddings = parts[0]
+        pulled_optim_values = parts[1] if len(parts) > 1 else None
+
+        device = self._embeddings.weight.device
+        emb_gpu = pulled_embeddings.to(device, non_blocking=True)
+        opt_gpu = (
+            None
+            if pulled_optim_values is None or self.optimizer_dim <= 0
+            else pulled_optim_values.to(self.optimizer_values.device, non_blocking=True)
+        )
+
+        slots_cpu = torch.arange(n, dtype=torch.long, device="cpu")
+        self._gpu_cache_ids[slots_cpu] = idx_cpu
+        self._gpu_cache_id_to_slot[idx_cpu] = slots_cpu
+        self._gpu_cache_embeddings[slots_cpu.to(device, non_blocking=True)] = emb_gpu
+        if opt_gpu is not None and self._gpu_cache_optimizer is not None:
+            self._gpu_cache_optimizer[
+                slots_cpu.to(self._gpu_cache_optimizer.device, non_blocking=True)
+            ] = opt_gpu
+
+        if pull_tensor_index is not None:
+            self.pull_tensors[pull_tensor_index][0] = True
 
     def get_and_reset_gpu_cache_stats(self):
         if not self._gpu_cache_enabled:
