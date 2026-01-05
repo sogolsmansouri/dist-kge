@@ -740,8 +740,8 @@ class DistributedLookupEmbedder(LookupEmbedder):
             pass
 
         device = self._embeddings.weight.device
-        update_cols = int(getattr(self.parameter_client, "dim", 0))
-        opt_cols = int(getattr(self.parameter_client, "optimizer_dim", 0))
+        embed_cols = int(self.dim)
+        opt_cols = int(self.optimizer_dim)
 
         # Pull in chunks to keep temporary tensors bounded.
         chunk_size = 65536
@@ -763,11 +763,15 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 wait_value.wait()
 
             # Split pull payload into update + optimizer state.
-            emb_cpu = pull_tensor[:, :update_cols].contiguous()
+            emb_cpu = pull_tensor[:, :embed_cols].contiguous()
             if opt_cols > 0:
-                opt_cpu = pull_tensor[:, update_cols : update_cols + opt_cols].contiguous()
+                opt_cpu = pull_tensor[
+                    :, embed_cols : embed_cols + opt_cols
+                ].contiguous()
             else:
-                opt_cpu = torch.empty((chunk_keys.numel(), 0), dtype=emb_cpu.dtype)
+                opt_cpu = torch.empty(
+                    (chunk_keys.numel(), 0), dtype=emb_cpu.dtype
+                )
 
             # Move to GPU and insert into cache (use prefetch stream if available).
             if device.type == "cuda" and self._gpu_cache_prefetch_stream is not None:
