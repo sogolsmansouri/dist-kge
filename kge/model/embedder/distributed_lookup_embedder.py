@@ -108,6 +108,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_pinned_max_entries = 0
         self._gpu_cache_pinned_capacity = 0
         self._gpu_cache_pinned_next_slot = 0
+        self._gpu_cache_prefetch_stream = None
+        self._gpu_cache_prefetch_event = None
+        self._gpu_cache_last_pinned_ids = None
         self._gpu_cache_ids: Optional[torch.Tensor] = None
         self._gpu_cache_id_to_slot: Optional[torch.Tensor] = None
         self._gpu_cache_embeddings: Optional[torch.Tensor] = None
@@ -208,6 +211,10 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_next_slot = self._gpu_cache_pinned_capacity
         self._gpu_cache_hits = 0
         self._gpu_cache_misses = 0
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                self._gpu_cache_prefetch_stream = torch.cuda.Stream()
+                self._gpu_cache_prefetch_event = torch.cuda.Event()
 
     def _gpu_cache_lookup(self, indexes_cpu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self._gpu_cache_enabled or self._gpu_cache_id_to_slot is None:
@@ -320,6 +327,14 @@ class DistributedLookupEmbedder(LookupEmbedder):
             idx_cpu = torch.unique(idx_cpu)
         if idx_cpu.numel() == 0:
             return
+        try:
+            _, cold_mask = self._gpu_cache_lookup(idx_cpu)
+            if cold_mask is not None and torch.any(cold_mask):
+                idx_cpu = idx_cpu[cold_mask]
+            else:
+                return
+        except Exception:
+            pass
         if idx_cpu.numel() > pinned:
             idx_cpu = idx_cpu[:pinned]
         n = int(idx_cpu.numel())
@@ -346,21 +361,53 @@ class DistributedLookupEmbedder(LookupEmbedder):
         pulled_optim_values = parts[1] if len(parts) > 1 else None
 
         device = self._embeddings.weight.device
-        emb_gpu = pulled_embeddings.to(device, non_blocking=True)
-        opt_gpu = (
-            None
-            if pulled_optim_values is None or self.optimizer_dim <= 0
-            else pulled_optim_values.to(self.optimizer_values.device, non_blocking=True)
-        )
-
-        slots_cpu = torch.arange(n, dtype=torch.long, device="cpu")
-        self._gpu_cache_ids[slots_cpu] = idx_cpu
-        self._gpu_cache_id_to_slot[idx_cpu] = slots_cpu
-        self._gpu_cache_embeddings[slots_cpu.to(device, non_blocking=True)] = emb_gpu
-        if opt_gpu is not None and self._gpu_cache_optimizer is not None:
-            self._gpu_cache_optimizer[
-                slots_cpu.to(self._gpu_cache_optimizer.device, non_blocking=True)
-            ] = opt_gpu
+        if device.type == "cuda" and self._gpu_cache_prefetch_stream is not None:
+            with torch.cuda.stream(self._gpu_cache_prefetch_stream):
+                emb_gpu = pulled_embeddings.to(device, non_blocking=True)
+                opt_gpu = (
+                    None
+                    if pulled_optim_values is None or self.optimizer_dim <= 0
+                    else pulled_optim_values.to(
+                        self.optimizer_values.device, non_blocking=True
+                    )
+                )
+                slots_cpu = torch.arange(n, dtype=torch.long, device="cpu")
+                self._gpu_cache_ids[slots_cpu] = idx_cpu
+                self._gpu_cache_id_to_slot[idx_cpu] = slots_cpu
+                self._gpu_cache_embeddings[
+                    slots_cpu.to(device, non_blocking=True)
+                ] = emb_gpu
+                if opt_gpu is not None and self._gpu_cache_optimizer is not None:
+                    self._gpu_cache_optimizer[
+                        slots_cpu.to(
+                            self._gpu_cache_optimizer.device, non_blocking=True
+                        )
+                    ] = opt_gpu
+            if self._gpu_cache_prefetch_event is not None:
+                self._gpu_cache_prefetch_stream.record_event(
+                    self._gpu_cache_prefetch_event
+                )
+        else:
+            emb_gpu = pulled_embeddings.to(device, non_blocking=True)
+            opt_gpu = (
+                None
+                if pulled_optim_values is None or self.optimizer_dim <= 0
+                else pulled_optim_values.to(
+                    self.optimizer_values.device, non_blocking=True
+                )
+            )
+            slots_cpu = torch.arange(n, dtype=torch.long, device="cpu")
+            self._gpu_cache_ids[slots_cpu] = idx_cpu
+            self._gpu_cache_id_to_slot[idx_cpu] = slots_cpu
+            self._gpu_cache_embeddings[
+                slots_cpu.to(device, non_blocking=True)
+            ] = emb_gpu
+            if opt_gpu is not None and self._gpu_cache_optimizer is not None:
+                self._gpu_cache_optimizer[
+                    slots_cpu.to(
+                        self._gpu_cache_optimizer.device, non_blocking=True
+                    )
+                ] = opt_gpu
 
         # Remember what we pinned so we can clear it efficiently next time.
         self._gpu_cache_last_pinned_ids = idx_cpu.clone()
@@ -590,6 +637,13 @@ class DistributedLookupEmbedder(LookupEmbedder):
         if self._gpu_cache_enabled and self._gpu_cache_id_to_slot is not None:
             cache_slots, cache_mask = self._gpu_cache_lookup(indexes_cpu)
             if cache_mask is not None and cache_mask.any():
+                if (
+                    device.type == "cuda"
+                    and self._gpu_cache_prefetch_event is not None
+                ):
+                    torch.cuda.current_stream(device).wait_event(
+                        self._gpu_cache_prefetch_event
+                    )
                 if hot_mask is not None:
                     cache_mask = cache_mask & cold_mask
                 cache_rows = output_rows[cache_mask]
