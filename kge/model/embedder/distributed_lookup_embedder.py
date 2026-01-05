@@ -531,6 +531,17 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
     @torch.no_grad()
     def pre_pull(self, indexes):
+        if getattr(self, "_gpu_cache_enabled", False):
+            # Skip pre-pull when all ids are already cached to avoid redundant PS pulls.
+            self._setup_gpu_cache()
+            if self._gpu_cache_id_to_slot is not None:
+                try:
+                    indexes_cpu = indexes.detach().cpu().long()
+                    _, cache_mask = self._gpu_cache_lookup(indexes_cpu)
+                    if cache_mask is not None and torch.all(cache_mask):
+                        return
+                except Exception:
+                    pass
         pull_indexes = (indexes + self.lapse_offset).cpu()
         result = self._get_free_pull_tensor()
         if result is None:
