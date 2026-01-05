@@ -2682,6 +2682,51 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 push_stats = self.parameter_client.get_and_reset_push_stats()
             except Exception:
                 push_stats = None
+        # --- add near end of epoch, before trace is written ---
+        def _log_gpu_cache_stats(self):
+            stats = {}
+            for tag, getter in [("s", getattr(self.model, "get_s_embedder", None)),
+                                ("o", getattr(self.model, "get_o_embedder", None))]:
+                if getter is None:
+                    continue
+                try:
+                    emb = getter()
+                except Exception:
+                    continue
+
+                if not getattr(emb, "_gpu_cache_enabled", False):
+                    continue
+
+                hits = int(getattr(emb, "_gpu_cache_hits", 0))
+                misses = int(getattr(emb, "_gpu_cache_misses", 0))
+                total = hits + misses
+                hit_rate = (hits / total) if total > 0 else 0.0
+
+                stats[f"gpu_cache_{tag}_hits"] = hits
+                stats[f"gpu_cache_{tag}_misses"] = misses
+                stats[f"gpu_cache_{tag}_hit_rate"] = float(hit_rate)
+
+                # optional: reset per epoch so next epoch is clean
+                try:
+                    emb._gpu_cache_hits = 0
+                    emb._gpu_cache_misses = 0
+                except Exception:
+                    pass
+
+            if stats:
+                # put into trace.yaml
+                self.current_trace["epoch"].update(stats)
+
+                # also print to kge.log
+                msg = " | ".join(
+                    f"{k}={v:.4f}" if k.endswith("hit_rate") else f"{k}={v}"
+                    for k, v in stats.items()
+                )
+                self.config.log(f"GPU-cache stats: {msg}")
+
+        # call it once per epoch at the end:
+        self._log_gpu_cache_stats()
+
         self.current_trace["epoch"].update(
             dict(
                 scope="epoch",

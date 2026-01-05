@@ -726,10 +726,10 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
         # Avoid refetching rows already in cache.
         try:
-            _, cold_mask = self._gpu_cache_lookup(raw_ids_cpu)
-            if torch.any(cold_mask):
-                raw_ids_cpu = raw_ids_cpu[cold_mask]
-            else:
+            _, cache_mask = self._gpu_cache_lookup(raw_ids_cpu)
+            if cache_mask is not None and torch.any(cache_mask):
+                raw_ids_cpu = raw_ids_cpu[~cache_mask]
+            if raw_ids_cpu.numel() == 0:
                 return
         except Exception:
             # If anything goes wrong, fall back to prefetching all provided ids.
@@ -765,10 +765,20 @@ class DistributedLookupEmbedder(LookupEmbedder):
             else:
                 opt_cpu = torch.empty((chunk_keys.numel(), 0), dtype=emb_cpu.dtype)
 
-            # Move to GPU and insert into cache.
-            emb_gpu = emb_cpu.to(device, non_blocking=True)
-            opt_gpu = opt_cpu.to(device, non_blocking=True)
-            self._gpu_cache_insert(chunk_raw, emb_gpu, opt_gpu)
+            # Move to GPU and insert into cache (use prefetch stream if available).
+            if device.type == "cuda" and self._gpu_cache_prefetch_stream is not None:
+                with torch.cuda.stream(self._gpu_cache_prefetch_stream):
+                    emb_gpu = emb_cpu.to(device, non_blocking=True)
+                    opt_gpu = opt_cpu.to(device, non_blocking=True)
+                    self._gpu_cache_insert(chunk_raw, emb_gpu, opt_gpu)
+                if self._gpu_cache_prefetch_event is not None:
+                    self._gpu_cache_prefetch_stream.record_event(
+                        self._gpu_cache_prefetch_event
+                    )
+            else:
+                emb_gpu = emb_cpu.to(device, non_blocking=True)
+                opt_gpu = opt_cpu.to(device, non_blocking=True)
+                self._gpu_cache_insert(chunk_raw, emb_gpu, opt_gpu)
 
     def _embed(self, indexes: Tensor) -> Tensor:
         long_indexes = indexes.long()
