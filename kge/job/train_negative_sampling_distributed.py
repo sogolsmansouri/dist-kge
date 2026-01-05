@@ -1589,16 +1589,35 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if extras.numel() == 0:
             self._window_prefetch_key = prefetch_key
             return
+        self._dbg_glow_prefetch_calls = getattr(self, "_dbg_glow_prefetch_calls", 0) + 1
+        if self._dbg_glow_prefetch_calls % 50 == 0:
+            self.config.log(f"[DBG] glow_prefetch_calls={self._dbg_glow_prefetch_calls} extras_device={extras.device} extras_numel={extras.numel()}")
+
         try:
-            embedder = self.model.get_s_embedder()
-            if hasattr(embedder, "prefetch_window_pinned"):
-                embedder.prefetch_window_pinned(
-                    extras.to(dtype=torch.long), make_unique=False
-                )
-            else:
-                embedder.localize(
-                    extras.to(dtype=torch.long), asynchronous=True, make_unique=False
-                )
+            # Ensure CPU ids to avoid GPU->CPU sync inside embedder.prefetch_window_pinned()
+            extras_ids = extras.detach()
+            if extras_ids.device.type != "cpu":
+                extras_ids = extras_ids.cpu()
+            extras_ids = extras_ids.to(dtype=torch.long)
+
+            embedders = []
+            try:
+                embedders.append(self.model.get_s_embedder())
+            except Exception:
+                pass
+            try:
+                oemb = self.model.get_o_embedder()
+                if len(embedders) == 0 or oemb is not embedders[0]:
+                    embedders.append(oemb)
+            except Exception:
+                pass
+
+            for embedder in embedders:
+                if hasattr(embedder, "prefetch_window_pinned"):
+                    embedder.prefetch_window_pinned(extras_ids, make_unique=False)
+                else:
+                    embedder.localize(extras_ids, asynchronous=True, make_unique=False)
+
             if window_key is not None:
                 self.config.log(
                     f"Glow prelocalized {extras.numel()} overlapping entities for window {window_key}."

@@ -279,12 +279,22 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_ids[slots_cpu] = -1
 
     def _gpu_cache_clear_pinned(self) -> None:
+
+        # Clear only what we pinned last time, not the whole pinned region.
         pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
         if pinned <= 0:
             return
-        slots = torch.arange(pinned, dtype=torch.long, device="cpu")
-        self._gpu_cache_clear_slots(slots)
-        self._gpu_cache_pinned_next_slot = 0
+        last_ids = getattr(self, "_gpu_cache_last_pinned_ids", None)
+        if last_ids is None or last_ids.numel() == 0:
+            return
+        n = int(last_ids.numel())
+        slots = torch.arange(n, dtype=torch.long, device="cpu")
+        try:
+            self._gpu_cache_id_to_slot[last_ids] = -1
+        except Exception:
+            pass
+        self._gpu_cache_ids[slots] = -1
+        self._gpu_cache_last_pinned_ids = None
 
     def prefetch_window_pinned(
         self,
@@ -320,18 +330,11 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
         pull = self._get_free_pull_tensor()
         if pull is None:
-            pull_tensor_index = None
-            pull_tensor = torch.empty(
-                (n, self.parameter_client.dim),
-                dtype=torch.float32,
-                device="cpu",
-                requires_grad=False,
-            )
-            if torch.cuda.is_available():
-                pull_tensor = pull_tensor.pin_memory()
-        else:
-            pull_tensor_index, pull_tensor_full = pull
-            pull_tensor = pull_tensor_full[:n]
+            # Best-effort: if no free pull tensor is available, skip prefetch.
+            # Allocating + pinning huge CPU tensors here causes major slowdowns.
+            return
+        pull_tensor_index, pull_tensor_full = pull
+        pull_tensor = pull_tensor_full[:n]
 
         self.parameter_client.pull(idx_cpu + self.lapse_offset, pull_tensor)
 
@@ -358,6 +361,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
             self._gpu_cache_optimizer[
                 slots_cpu.to(self._gpu_cache_optimizer.device, non_blocking=True)
             ] = opt_gpu
+
+        # Remember what we pinned so we can clear it efficiently next time.
+        self._gpu_cache_last_pinned_ids = idx_cpu.clone()
 
         if pull_tensor_index is not None:
             self.pull_tensors[pull_tensor_index][0] = True
