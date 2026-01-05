@@ -720,6 +720,10 @@ class DistributedLookupEmbedder(LookupEmbedder):
         # If GPU cache isn't enabled, nothing more to do.
         if not getattr(self, "_gpu_cache_enabled", False):
             return
+        # Ensure cache tables are initialized before attempting inserts.
+        self._setup_gpu_cache()
+        if self._gpu_cache_id_to_slot is None:
+            return
 
         # Work on CPU ids (RAW ids without lapse_offset) for cache bookkeeping.
         raw_ids_cpu = indexes.detach().to("cpu", dtype=torch.long)

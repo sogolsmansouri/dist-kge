@@ -178,6 +178,12 @@ job:
       window_work: False
       concurrent_windows: False
       prefetch_window_entities: True
+      # Prefetch only if overlap is high enough (0 disables check).
+      prefetch_min_overlap_ratio: 0.0
+      # Prefetch every N windows (1 disables throttling).
+      prefetch_every_n_windows: 1
+      # Cap prefetch size to avoid large GPU copies.
+      max_window_prefetch: 200000
       lookahead_negatives: True
       overlap_negative_sampling: False
       swap_aware:

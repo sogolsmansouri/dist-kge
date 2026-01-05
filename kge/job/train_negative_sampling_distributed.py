@@ -1579,6 +1579,31 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             except Exception:
                 self._window_prefetch_key = prefetch_key
                 return
+        # Skip prefetch when overlap is too low.
+        try:
+            union_count = int(self._current_window_entities.numel())
+        except Exception:
+            union_count = 0
+        extras_count = int(extras.numel())
+        overlap_ratio = (
+            1.0 - (extras_count / max(1, union_count)) if union_count > 0 else 0.0
+        )
+        min_overlap = float(
+            self.config.get("job.distributed.glow.prefetch_min_overlap_ratio", 0.0)
+        )
+        if min_overlap > 0.0 and overlap_ratio < min_overlap:
+            self._window_prefetch_key = prefetch_key
+            return
+        # Throttle prefetch to every N windows.
+        every_n = int(
+            self.config.get("job.distributed.glow.prefetch_every_n_windows", 1)
+        )
+        self._glow_prefetch_window_count = getattr(
+            self, "_glow_prefetch_window_count", 0
+        ) + 1
+        if every_n > 1 and (self._glow_prefetch_window_count % every_n) != 0:
+            self._window_prefetch_key = prefetch_key
+            return
         max_prefetch = int(
             self.config.get(
                 "job.distributed.glow.max_window_prefetch", 200000
