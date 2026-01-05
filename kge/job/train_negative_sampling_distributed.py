@@ -2682,11 +2682,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 push_stats = self.parameter_client.get_and_reset_push_stats()
             except Exception:
                 push_stats = None
-        # --- add near end of epoch, before trace is written ---
-        def _log_gpu_cache_stats(self):
+        # --- GPU cache stats (best-effort; never crash training) ---
+        try:
             stats = {}
-            for tag, getter in [("s", getattr(self.model, "get_s_embedder", None)),
-                                ("o", getattr(self.model, "get_o_embedder", None))]:
+            for tag, getter_name in [("s", "get_s_embedder"), ("o", "get_o_embedder")]:
+                getter = getattr(self.model, getter_name, None)
                 if getter is None:
                     continue
                 try:
@@ -2706,7 +2706,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 stats[f"gpu_cache_{tag}_misses"] = misses
                 stats[f"gpu_cache_{tag}_hit_rate"] = float(hit_rate)
 
-                # optional: reset per epoch so next epoch is clean
+                # reset per-epoch (optional)
                 try:
                     emb._gpu_cache_hits = 0
                     emb._gpu_cache_misses = 0
@@ -2714,18 +2714,24 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     pass
 
             if stats:
-                # put into trace.yaml
-                self.current_trace["epoch"].update(stats)
+                # put into trace
+                try:
+                    self.current_trace["epoch"].update(stats)
+                except Exception:
+                    pass
 
-                # also print to kge.log
+                # log
                 msg = " | ".join(
                     f"{k}={v:.4f}" if k.endswith("hit_rate") else f"{k}={v}"
                     for k, v in stats.items()
                 )
-                self.config.log(f"GPU-cache stats: {msg}")
-
-        # call it once per epoch at the end:
-        self._log_gpu_cache_stats()
+                try:
+                    self.config.log(f"GPU-cache stats: {msg}")
+                except Exception:
+                    print(f"GPU-cache stats: {msg}")
+        except Exception as _exc:
+            # never fail training due to stats
+            pass
 
         self.current_trace["epoch"].update(
             dict(
