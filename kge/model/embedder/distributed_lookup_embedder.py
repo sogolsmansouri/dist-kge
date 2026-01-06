@@ -47,8 +47,12 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self.lapse_offset = lapse_offset
         self.pulled_ids = None
         # global to local mapper only used in sync level partition
+        if "relation" in configuration_key:
+            mapper_size = self.dataset.num_relations()
+        else:
+            mapper_size = self.dataset.num_entities()
         self.global_to_local_mapper = torch.full(
-            (self.dataset.num_entities(),), -1, dtype=torch.long, device="cpu"
+            (mapper_size,), -1, dtype=torch.long, device="cpu"
         )
 
         # maps the local embeddings to the embeddings in lapse
@@ -105,11 +109,17 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_enabled = False
         self._gpu_cache_max_entries = 0
         self._gpu_cache_max_insert_per_step = 50000
+        self._gpu_cache_eviction_policy = "fifo"
+        self._gpu_cache_lru_max_scan = 0
+        self._gpu_cache_access_clock = 0
+        self._gpu_cache_last_access: Optional[torch.Tensor] = None
+        self._gpu_cache_pinned_persist = False
         self._gpu_cache_pinned_max_entries = 0
         self._gpu_cache_pinned_capacity = 0
         self._gpu_cache_pinned_next_slot = 0
         self._gpu_cache_prefetch_stream = None
         self._gpu_cache_prefetch_event = None
+        self._gpu_cache_prefetch_pending = None
         self._gpu_cache_last_pinned_ids = None
         self._gpu_cache_ids: Optional[torch.Tensor] = None
         self._gpu_cache_id_to_slot: Optional[torch.Tensor] = None
@@ -168,6 +178,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
         )
         if self._gpu_cache_max_insert_per_step < 0:
             self._gpu_cache_max_insert_per_step = 0
+        eviction_policy = str(cache_cfg.get("eviction_policy", "fifo")).lower()
+        if eviction_policy not in ("fifo", "lru"):
+            eviction_policy = "fifo"
+        self._gpu_cache_eviction_policy = eviction_policy
+        self._gpu_cache_lru_max_scan = int(cache_cfg.get("lru_max_scan", 0) or 0)
+        if self._gpu_cache_lru_max_scan < 0:
+            self._gpu_cache_lru_max_scan = 0
+        self._gpu_cache_pinned_persist = bool(
+            cache_cfg.get("window_pinned_persist", False)
+        )
         if max_entries <= 0:
             return
         self._gpu_cache_enabled = True
@@ -199,6 +219,10 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_ids = torch.full(
             (cache_size,), -1, dtype=torch.long, device="cpu"
         )
+        self._gpu_cache_last_access = torch.full(
+            (cache_size,), -1, dtype=torch.long, device="cpu"
+        )
+        self._gpu_cache_access_clock = 0
         self._gpu_cache_embeddings = torch.empty(
             (cache_size, self.dim), device=device
         )
@@ -216,18 +240,90 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 self._gpu_cache_prefetch_stream = torch.cuda.Stream()
                 self._gpu_cache_prefetch_event = torch.cuda.Event()
 
-    def _gpu_cache_lookup(self, indexes_cpu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _gpu_cache_lookup(
+        self, indexes_cpu: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if not self._gpu_cache_enabled or self._gpu_cache_id_to_slot is None:
             return None, None
         slots = self._gpu_cache_id_to_slot[indexes_cpu]
         mask = slots >= 0
+        if (
+            self._gpu_cache_eviction_policy == "lru"
+            and self._gpu_cache_last_access is not None
+            and mask is not None
+            and torch.any(mask)
+        ):
+            self._gpu_cache_access_clock += 1
+            self._gpu_cache_last_access[slots[mask]] = self._gpu_cache_access_clock
         return slots, mask
+
+    def _gpu_cache_select_lru_slots(self, n, start, end):
+        if self._gpu_cache_ids is None or self._gpu_cache_last_access is None:
+            return None
+        if n <= 0 or start >= end:
+            return None
+        slots = torch.arange(start, end, dtype=torch.long, device="cpu")
+        ids = self._gpu_cache_ids[slots]
+        empty_mask = ids < 0
+        selected = []
+        if empty_mask.any():
+            empty_slots = slots[empty_mask]
+            take = min(int(empty_slots.numel()), n)
+            if take > 0:
+                selected.append(empty_slots[:take])
+                n -= take
+        if n <= 0:
+            return torch.cat(selected) if selected else None
+        candidates = slots[~empty_mask] if empty_mask.any() else slots
+        if candidates.numel() == 0:
+            return torch.cat(selected) if selected else None
+        last_access = self._gpu_cache_last_access[candidates]
+        if (
+            self._gpu_cache_lru_max_scan
+            and candidates.numel() > self._gpu_cache_lru_max_scan
+        ):
+            perm = torch.randperm(candidates.numel())[: self._gpu_cache_lru_max_scan]
+            candidates = candidates[perm]
+            last_access = last_access[perm]
+        _, idx = torch.topk(last_access, k=min(n, candidates.numel()), largest=False)
+        selected.append(candidates[idx])
+        return torch.cat(selected) if selected else None
+
+    def _dedupe_cache_inputs(
+        self,
+        indexes_cpu: torch.Tensor,
+        emb_gpu: torch.Tensor,
+        opt_gpu: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        if indexes_cpu is None or indexes_cpu.numel() <= 1:
+            return indexes_cpu, emb_gpu, opt_gpu
+        unique_ids, inverse = torch.unique(indexes_cpu, return_inverse=True)
+        if unique_ids.numel() == indexes_cpu.numel():
+            return indexes_cpu, emb_gpu, opt_gpu
+        n = int(indexes_cpu.numel())
+        idx = torch.arange(n, dtype=torch.long, device="cpu")
+        first = torch.full((unique_ids.numel(),), n, dtype=torch.long, device="cpu")
+        try:
+            first.scatter_reduce_(0, inverse, idx, reduce="amin", include_self=True)
+        except Exception:
+            inv_np = inverse.cpu().numpy()
+            first_np = np.full(unique_ids.numel(), n, dtype=np.int64)
+            for i, g in enumerate(inv_np):
+                if i < first_np[g]:
+                    first_np[g] = i
+            first = torch.from_numpy(first_np)
+        first = first[first < n]
+        indexes_cpu = indexes_cpu[first]
+        emb_gpu = emb_gpu[first.to(emb_gpu.device)]
+        if opt_gpu is not None:
+            opt_gpu = opt_gpu[first.to(opt_gpu.device)]
+        return indexes_cpu, emb_gpu, opt_gpu
 
     def _gpu_cache_insert(
         self,
         indexes_cpu: torch.Tensor,
         emb_gpu: torch.Tensor,
-        opt_gpu: torch.Tensor,
+        opt_gpu: Optional[torch.Tensor],
     ) -> None:
         if (
             not self._gpu_cache_enabled
@@ -238,6 +334,8 @@ class DistributedLookupEmbedder(LookupEmbedder):
             return
         if indexes_cpu.numel() == 0:
             return
+        if opt_gpu is None and self.optimizer_dim > 0:
+            return
         cache_size = int(self._gpu_cache_max_entries or 0)
         if cache_size <= 0:
             return
@@ -245,16 +343,29 @@ class DistributedLookupEmbedder(LookupEmbedder):
         usable = cache_size - pinned
         if usable <= 0:
             return
+        indexes_cpu, emb_gpu, opt_gpu = self._dedupe_cache_inputs(
+            indexes_cpu, emb_gpu, opt_gpu
+        )
+        if indexes_cpu.numel() == 0:
+            return
         if indexes_cpu.numel() > usable:
             indexes_cpu = indexes_cpu[-usable:]
             emb_gpu = emb_gpu[-usable:]
-            opt_gpu = opt_gpu[-usable:]
+            if opt_gpu is not None:
+                opt_gpu = opt_gpu[-usable:]
         n = int(indexes_cpu.numel())
-        start = int(self._gpu_cache_next_slot or pinned)
-        if start < pinned:
-            start = pinned
-        rel_start = start - pinned
-        slots = (torch.arange(n, device="cpu") + rel_start) % usable + pinned
+        if self._gpu_cache_eviction_policy == "lru" and self._gpu_cache_last_access is not None:
+            slots = self._gpu_cache_select_lru_slots(n, pinned, cache_size)
+            if slots is None or slots.numel() == 0:
+                return
+            slots = slots[:n]
+            rel_start = None
+        else:
+            start = int(self._gpu_cache_next_slot or pinned)
+            if start < pinned:
+                start = pinned
+            rel_start = start - pinned
+            slots = (torch.arange(n, device="cpu") + rel_start) % usable + pinned
         evict_ids = self._gpu_cache_ids[slots]
         if evict_ids.numel() > 0:
             valid_evict = evict_ids >= 0
@@ -264,10 +375,18 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._gpu_cache_id_to_slot[indexes_cpu] = slots
         slots_device = slots.to(self._gpu_cache_embeddings.device, non_blocking=True)
         self._gpu_cache_embeddings[slots_device] = emb_gpu
-        if self._gpu_cache_optimizer is not None and self.optimizer_dim > 0:
+        if (
+            self._gpu_cache_optimizer is not None
+            and self.optimizer_dim > 0
+            and opt_gpu is not None
+        ):
             slots_opt = slots.to(self._gpu_cache_optimizer.device, non_blocking=True)
             self._gpu_cache_optimizer[slots_opt] = opt_gpu
-        self._gpu_cache_next_slot = int(((rel_start + n) % usable) + pinned)
+        if self._gpu_cache_eviction_policy == "lru" and self._gpu_cache_last_access is not None:
+            self._gpu_cache_access_clock += 1
+            self._gpu_cache_last_access[slots] = self._gpu_cache_access_clock
+        else:
+            self._gpu_cache_next_slot = int(((rel_start + n) % usable) + pinned)
 
     def _gpu_cache_clear_slots(self, slots_cpu: torch.Tensor) -> None:
         if (
@@ -284,9 +403,10 @@ class DistributedLookupEmbedder(LookupEmbedder):
             if valid_evict.any():
                 self._gpu_cache_id_to_slot[evict_ids[valid_evict]] = -1
         self._gpu_cache_ids[slots_cpu] = -1
+        if self._gpu_cache_last_access is not None:
+            self._gpu_cache_last_access[slots_cpu] = -1
 
     def _gpu_cache_clear_pinned(self) -> None:
-
         # Clear only what we pinned last time, not the whole pinned region.
         pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
         if pinned <= 0:
@@ -301,7 +421,104 @@ class DistributedLookupEmbedder(LookupEmbedder):
         except Exception:
             pass
         self._gpu_cache_ids[slots] = -1
+        if self._gpu_cache_last_access is not None:
+            self._gpu_cache_last_access[slots] = -1
         self._gpu_cache_last_pinned_ids = None
+
+    def _gpu_cache_insert_pinned(
+        self,
+        indexes_cpu: torch.Tensor,
+        emb_gpu: torch.Tensor,
+        opt_gpu: Optional[torch.Tensor],
+    ) -> None:
+        pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
+        if pinned <= 0 or indexes_cpu is None:
+            return
+        n = int(indexes_cpu.numel())
+        if n <= 0:
+            return
+        if n > pinned:
+            indexes_cpu = indexes_cpu[:pinned]
+            emb_gpu = emb_gpu[:pinned]
+            if opt_gpu is not None:
+                opt_gpu = opt_gpu[:pinned]
+            n = int(indexes_cpu.numel())
+        if n <= 0:
+            return
+        if opt_gpu is None and self.optimizer_dim > 0:
+            return
+        indexes_cpu, emb_gpu, opt_gpu = self._dedupe_cache_inputs(
+            indexes_cpu, emb_gpu, opt_gpu
+        )
+        if indexes_cpu.numel() == 0:
+            return
+        n = int(indexes_cpu.numel())
+        if not self._gpu_cache_pinned_persist:
+            self._gpu_cache_clear_pinned()
+            slots = torch.arange(n, dtype=torch.long, device="cpu")
+        else:
+            if self._gpu_cache_eviction_policy == "lru" and self._gpu_cache_last_access is not None:
+                slots = self._gpu_cache_select_lru_slots(n, 0, pinned)
+                if slots is None or slots.numel() == 0:
+                    return
+                slots = slots[:n]
+            else:
+                start = int(self._gpu_cache_pinned_next_slot or 0)
+                slots = (torch.arange(n, device="cpu") + start) % pinned
+                self._gpu_cache_pinned_next_slot = int((start + n) % pinned)
+        evict_ids = self._gpu_cache_ids[slots]
+        if evict_ids.numel() > 0:
+            valid_evict = evict_ids >= 0
+            if valid_evict.any():
+                self._gpu_cache_id_to_slot[evict_ids[valid_evict]] = -1
+        self._gpu_cache_ids[slots] = indexes_cpu
+        self._gpu_cache_id_to_slot[indexes_cpu] = slots
+        slots_device = slots.to(self._gpu_cache_embeddings.device, non_blocking=True)
+        self._gpu_cache_embeddings[slots_device] = emb_gpu
+        if opt_gpu is not None and self._gpu_cache_optimizer is not None:
+            slots_opt = slots.to(self._gpu_cache_optimizer.device, non_blocking=True)
+            self._gpu_cache_optimizer[slots_opt] = opt_gpu
+        if self._gpu_cache_eviction_policy == "lru" and self._gpu_cache_last_access is not None:
+            self._gpu_cache_access_clock += 1
+            self._gpu_cache_last_access[slots] = self._gpu_cache_access_clock
+        if not self._gpu_cache_pinned_persist:
+            self._gpu_cache_last_pinned_ids = indexes_cpu.clone()
+
+    def _gpu_cache_complete_prefetch(self):
+        entry = getattr(self, "_gpu_cache_prefetch_pending", None)
+        if entry is None:
+            return
+        self._gpu_cache_prefetch_pending = None
+        self.parameter_client.wait(entry.get("pull_future"))
+        pull_tensor = entry.get("pull_tensor")
+        pull_tensor_index = entry.get("pull_tensor_index")
+        idx_cpu = entry.get("indexes_cpu")
+        if pull_tensor is None or idx_cpu is None or idx_cpu.numel() == 0:
+            if pull_tensor_index is not None:
+                self.pull_tensors[pull_tensor_index][0] = True
+            return
+        pulled_embeddings = pull_tensor[:, : self.dim]
+        pulled_optim_values = pull_tensor[:, self.dim : (self.dim + self.optimizer_dim)]
+        device = self._embeddings.weight.device
+        if device.type == "cuda" and self._gpu_cache_prefetch_stream is not None:
+            with torch.cuda.stream(self._gpu_cache_prefetch_stream):
+                emb_gpu = pulled_embeddings.to(device, non_blocking=True)
+                opt_gpu = pulled_optim_values.to(
+                    self.optimizer_values.device, non_blocking=True
+                )
+                self._gpu_cache_insert_pinned(idx_cpu, emb_gpu, opt_gpu)
+            if self._gpu_cache_prefetch_event is not None:
+                self._gpu_cache_prefetch_stream.record_event(
+                    self._gpu_cache_prefetch_event
+                )
+        else:
+            emb_gpu = pulled_embeddings.to(device, non_blocking=True)
+            opt_gpu = pulled_optim_values.to(
+                self.optimizer_values.device, non_blocking=True
+            )
+            self._gpu_cache_insert_pinned(idx_cpu, emb_gpu, opt_gpu)
+        if pull_tensor_index is not None:
+            self.pull_tensors[pull_tensor_index][0] = True
 
     def prefetch_window_pinned(
         self,
@@ -315,6 +532,8 @@ class DistributedLookupEmbedder(LookupEmbedder):
         pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
         if pinned <= 0:
             return
+        # Complete the previous async prefetch to keep the pipeline moving.
+        self._gpu_cache_complete_prefetch()
         if indexes is None:
             return
         idx_cpu = indexes.detach()
@@ -328,11 +547,13 @@ class DistributedLookupEmbedder(LookupEmbedder):
         if idx_cpu.numel() == 0:
             return
         try:
-            _, cold_mask = self._gpu_cache_lookup(idx_cpu)
-            if cold_mask is not None and torch.any(cold_mask):
-                idx_cpu = idx_cpu[cold_mask]
-            else:
-                return
+            _, hit_mask = self._gpu_cache_lookup(idx_cpu)
+            if hit_mask is not None:
+                miss_mask = ~hit_mask
+                if torch.any(miss_mask):
+                    idx_cpu = idx_cpu[miss_mask]
+                else:
+                    return
         except Exception:
             pass
         if idx_cpu.numel() > pinned:
@@ -341,79 +562,22 @@ class DistributedLookupEmbedder(LookupEmbedder):
         if n <= 0:
             return
 
-        self._gpu_cache_clear_pinned()
-
-        pull = self._get_free_pull_tensor()
+        pull = self._get_free_pull_tensor(allow_none=True)
         if pull is None:
             # Best-effort: if no free pull tensor is available, skip prefetch.
             # Allocating + pinning huge CPU tensors here causes major slowdowns.
             return
         pull_tensor_index, pull_tensor_full = pull
         pull_tensor = pull_tensor_full[:n]
-
-        self.parameter_client.pull(idx_cpu + self.lapse_offset, pull_tensor)
-
-        split_sizes = [self.dim, self.optimizer_dim]
-        if self.unnecessary_dim > 0:
-            split_sizes.append(self.unnecessary_dim)
-        parts = torch.split(pull_tensor, split_sizes, dim=1)
-        pulled_embeddings = parts[0]
-        pulled_optim_values = parts[1] if len(parts) > 1 else None
-
-        device = self._embeddings.weight.device
-        if device.type == "cuda" and self._gpu_cache_prefetch_stream is not None:
-            with torch.cuda.stream(self._gpu_cache_prefetch_stream):
-                emb_gpu = pulled_embeddings.to(device, non_blocking=True)
-                opt_gpu = (
-                    None
-                    if pulled_optim_values is None or self.optimizer_dim <= 0
-                    else pulled_optim_values.to(
-                        self.optimizer_values.device, non_blocking=True
-                    )
-                )
-                slots_cpu = torch.arange(n, dtype=torch.long, device="cpu")
-                self._gpu_cache_ids[slots_cpu] = idx_cpu
-                self._gpu_cache_id_to_slot[idx_cpu] = slots_cpu
-                self._gpu_cache_embeddings[
-                    slots_cpu.to(device, non_blocking=True)
-                ] = emb_gpu
-                if opt_gpu is not None and self._gpu_cache_optimizer is not None:
-                    self._gpu_cache_optimizer[
-                        slots_cpu.to(
-                            self._gpu_cache_optimizer.device, non_blocking=True
-                        )
-                    ] = opt_gpu
-            if self._gpu_cache_prefetch_event is not None:
-                self._gpu_cache_prefetch_stream.record_event(
-                    self._gpu_cache_prefetch_event
-                )
-        else:
-            emb_gpu = pulled_embeddings.to(device, non_blocking=True)
-            opt_gpu = (
-                None
-                if pulled_optim_values is None or self.optimizer_dim <= 0
-                else pulled_optim_values.to(
-                    self.optimizer_values.device, non_blocking=True
-                )
-            )
-            slots_cpu = torch.arange(n, dtype=torch.long, device="cpu")
-            self._gpu_cache_ids[slots_cpu] = idx_cpu
-            self._gpu_cache_id_to_slot[idx_cpu] = slots_cpu
-            self._gpu_cache_embeddings[
-                slots_cpu.to(device, non_blocking=True)
-            ] = emb_gpu
-            if opt_gpu is not None and self._gpu_cache_optimizer is not None:
-                self._gpu_cache_optimizer[
-                    slots_cpu.to(
-                        self._gpu_cache_optimizer.device, non_blocking=True
-                    )
-                ] = opt_gpu
-
-        # Remember what we pinned so we can clear it efficiently next time.
-        self._gpu_cache_last_pinned_ids = idx_cpu.clone()
-
-        if pull_tensor_index is not None:
-            self.pull_tensors[pull_tensor_index][0] = True
+        pull_future = self.parameter_client.pull(
+            idx_cpu + self.lapse_offset, pull_tensor, asynchronous=True
+        )
+        self._gpu_cache_prefetch_pending = {
+            "indexes_cpu": idx_cpu,
+            "pull_tensor": pull_tensor,
+            "pull_future": pull_future,
+            "pull_tensor_index": pull_tensor_index,
+        }
 
     def get_and_reset_gpu_cache_stats(self):
         if not self._gpu_cache_enabled:
@@ -464,7 +628,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 (
                     self._embeddings.weight.detach().cpu(),
                     self.optimizer_values.cpu(),
-                    torch.empty(
+                    torch.zeros(
                         [len(self.optimizer_values), self.unnecessary_dim],
                         device="cpu",
                         dtype=self.optimizer_values.dtype,
@@ -482,12 +646,12 @@ class DistributedLookupEmbedder(LookupEmbedder):
         )
 
     def pull_all(self):
-        self._pull_embeddings(torch.arange(self.complete_vocab_size))
+        self._pull_embeddings(torch.arange(self.vocab_size))
 
     def set_embeddings(self):
         # storing set_indexes and set_tensors in self to keep them alive until async
         #  set is finished
-        self.set_indexes = self.pulled_ids + self.lapse_offset
+        self.set_indexes = (self.pulled_ids + self.lapse_offset).cpu()
         num_pulled = len(self.set_indexes)
         # move tensors to cpu before cat to reduce gpu memory usage
         if self.unnecessary_dim > 0:
@@ -495,7 +659,11 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 (
                     self._embeddings.weight[:num_pulled].detach().cpu(),
                     self.optimizer_values[:num_pulled].cpu(),
-                    torch.empty((num_pulled, self.unnecessary_dim), device="cpu"),
+                    torch.zeros(
+                        (num_pulled, self.unnecessary_dim),
+                        dtype=self.optimizer_values.dtype,
+                        device="cpu",
+                    ),
                 ),
                 dim=1,
             )
@@ -509,12 +677,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
             )
         self.parameter_client.set(self.set_indexes, self.set_tensor, asynchronous=True)
 
-    def _get_free_pull_tensor(self):
+    def _get_free_pull_tensor(self, allow_none: bool = False):
         for i, (free, pull_tensor) in enumerate(self.pull_tensors):
             if free:
                 self.pull_tensors[i][0] = False
                 return i, pull_tensor
-        return None
+        if allow_none:
+            return None
+        raise RuntimeError(
+            "No free pull tensor; increase pool size or reduce prefetch depth."
+        )
 
     def _async_copy_to_device(self, tensor):
         device = self._embeddings.weight.device
@@ -531,55 +703,55 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
     @torch.no_grad()
     def pre_pull(self, indexes):
+        indexes_cpu = indexes.detach().cpu().long()
+        if indexes_cpu.numel() == 0:
+            return
         if getattr(self, "_gpu_cache_enabled", False):
-            # Skip pre-pull when all ids are already cached to avoid redundant PS pulls.
+            # Skip/trim pre-pull when ids are already cached to avoid redundant PS pulls.
             self._setup_gpu_cache()
             if self._gpu_cache_id_to_slot is not None:
                 try:
-                    indexes_cpu = indexes.detach().cpu().long()
                     _, cache_mask = self._gpu_cache_lookup(indexes_cpu)
-                    if cache_mask is not None and torch.all(cache_mask):
-                        return
+                    if cache_mask is not None:
+                        if torch.all(cache_mask):
+                            return
                 except Exception:
                     pass
-        pull_indexes = (indexes + self.lapse_offset).cpu()
-        result = self._get_free_pull_tensor()
-        if result is None:
-            return
-        pull_tensor_index, pull_tensor = result
-        num_indexes = len(indexes)
-        pull_tensor = pull_tensor[:num_indexes]
+        full_len = int(indexes_cpu.numel())
+        pull_indexes = (indexes_cpu + self.lapse_offset).cpu()
+        pull_len = full_len
+        pull_tensor_index, pull_tensor = self._get_free_pull_tensor()
+        pull_tensor = pull_tensor[:pull_len]
         pull_future = self.parameter_client.pull(
             pull_indexes, pull_tensor, asynchronous=True
         )
         self.pre_pulled.append(
             {
                 "indexes": indexes,
-                "num_indexes": num_indexes,
+                "num_indexes": full_len,
+                "pull_len": pull_len,
                 "pull_indexes": pull_indexes,
                 "pull_tensor": pull_tensor,
                 "pull_future": pull_future,
                 "pull_tensor_index": pull_tensor_index,
+                "cold_mask": None,
+                "cold_rows": None,
+                "cold_indexes_cpu": None,
             }
         )
 
     def pre_pulled_to_device(self):
-        if len(self.pre_pulled) > 2:
-            # id 0 is from the batch currently processed
-            # last one is the one pulled from ps
-            # we are moving the second last
-            entry = self.pre_pulled[-2]
-            if entry.get("device_tensor") is None:
-                self.parameter_client.wait(entry["pull_future"])
-                device_tensor, event = self._async_copy_to_device(entry["pull_tensor"])
-                entry["device_tensor"] = device_tensor
-                entry["copy_event"] = event
+        # Intentional no-op: keep pre-pulled tensors in pinned CPU memory and
+        # copy directly into destination buffers on consumption.
+        return
 
     @torch.no_grad()
     def _pull_embeddings(self, indexes):
         cpu_gpu_time = 0.0
         pull_time = 0.0
         device = self._embeddings.weight.device
+        if self._gpu_cache_enabled:
+            self._setup_gpu_cache()
         use_prefetch = len(self.pre_pulled) > 0
         if use_prefetch:
             # todo: add workaround for relations here as well
@@ -587,25 +759,119 @@ class DistributedLookupEmbedder(LookupEmbedder):
             pre_pulled = self.pre_pulled.popleft()
             indexes = pre_pulled["indexes"]
             len_indexes = pre_pulled.get("num_indexes", len(indexes))
-            pull_indexes = pre_pulled["pull_indexes"][:len_indexes]
             self.pulled_ids = indexes
+            output_rows = torch.arange(len_indexes, dtype=torch.long)
+            indexes_cpu = indexes.detach().cpu().long()
             self.parameter_client.wait(pre_pulled["pull_future"])
-            self.local_to_lapse_mapper[:len_indexes] = pull_indexes
-            tensor = pre_pulled.get("device_tensor")
-            event = pre_pulled.get("copy_event")
-            if tensor is None:
-                cpu_gpu_time -= time.time()
-                tensor = pre_pulled["pull_tensor"].to(device, non_blocking=True)
+            self.local_to_lapse_mapper[:len_indexes] = indexes_cpu + self.lapse_offset
+            pre_pulled_tensor = pre_pulled["pull_tensor"]
+            cold_rows = pre_pulled.get("cold_rows")
+            cold_indexes_cpu = pre_pulled.get("cold_indexes_cpu")
+
+            pulled_embeddings, pulled_optim_values, _ = torch.split(
+                pre_pulled_tensor,
+                [self.dim, self.optimizer_dim, self.unnecessary_dim],
+                dim=1,
+            )
+
+            cpu_gpu_time -= time.time()
+            if cold_rows is None:
+                self._embeddings.weight.data[:len_indexes].copy_(
+                    pulled_embeddings, non_blocking=True
+                )
+                if self.optimizer_dim > 0:
+                    self.optimizer_values[:len_indexes].copy_(
+                        pulled_optim_values, non_blocking=True
+                    )
                 cpu_gpu_time += time.time()
             else:
-                if event is not None and device.type == "cuda":
-                    torch.cuda.current_stream(device).wait_event(event)
-            pre_pulled_tensor = tensor
-            pulled_embeddings, pulled_optim_values = torch.split(
-                pre_pulled_tensor, [self.dim, self.optimizer_dim], dim=1
-            )
-            self._embeddings.weight[:len_indexes] = pulled_embeddings
-            self.optimizer_values[:len_indexes] = pulled_optim_values
+                emb_device = self._embeddings.weight.device
+                opt_device = self.optimizer_values.device
+                cold_rows_emb = cold_rows.to(emb_device)
+                cold_rows_opt = cold_rows.to(opt_device)
+                if emb_device.type == "cuda":
+                    pulled_embeddings_gpu = pulled_embeddings.to(
+                        emb_device, non_blocking=True
+                    )
+                else:
+                    pulled_embeddings_gpu = pulled_embeddings
+                if self.optimizer_dim > 0:
+                    if opt_device.type == "cuda":
+                        pulled_optim_gpu = pulled_optim_values.to(
+                            opt_device, non_blocking=True
+                        )
+                    else:
+                        pulled_optim_gpu = pulled_optim_values
+                else:
+                    pulled_optim_gpu = None
+                self._embeddings.weight.data.index_copy_(
+                    0, cold_rows_emb, pulled_embeddings_gpu
+                )
+                if self.optimizer_dim > 0:
+                    self.optimizer_values.index_copy_(
+                        0, cold_rows_opt, pulled_optim_gpu
+                    )
+                cpu_gpu_time += time.time()
+
+                # Fill cached rows from GPU cache (hot IDs) if enabled
+                if getattr(self, "_gpu_cache_enabled", False):
+                    self._setup_gpu_cache()
+                    if self._gpu_cache_id_to_slot is not None:
+                        cache_slots, cache_mask = self._gpu_cache_lookup(indexes_cpu)
+                        if cache_mask is not None and cache_mask.any():
+                            cold_mask = pre_pulled.get("cold_mask")
+                            if cold_mask is None:
+                                cold_mask = torch.zeros_like(
+                                    cache_mask, dtype=torch.bool
+                                )
+
+                            cached_mask = cache_mask & ~cold_mask
+                            cached_rows = output_rows[cached_mask]
+                            if cached_rows.numel() > 0:
+                                if (
+                                    device.type == "cuda"
+                                    and self._gpu_cache_prefetch_event is not None
+                                ):
+                                    torch.cuda.current_stream(device).wait_event(
+                                        self._gpu_cache_prefetch_event
+                                    )
+
+                                cached_rows_device = cached_rows.to(device)
+                                slots_device = cache_slots[cached_mask].to(device)
+                                self._embeddings.weight.data[cached_rows_device] = (
+                                    self._gpu_cache_embeddings[slots_device]
+                                )
+                                self.optimizer_values[cached_rows_device] = (
+                                    self._gpu_cache_optimizer[slots_device]
+                                )
+                                self._gpu_cache_hits += int(cached_rows.numel())
+
+                        # Optionally insert cold pulls into GPU cache
+                        if cold_indexes_cpu is not None and cold_indexes_cpu.numel() > 0:
+                            self._gpu_cache_misses += int(cold_rows.numel())
+                            cold_n = int(cold_rows.numel())
+                            if (
+                                not self._gpu_cache_max_insert_per_step
+                                or cold_n <= self._gpu_cache_max_insert_per_step
+                            ):
+                                emb_cache = (
+                                    pulled_embeddings_gpu
+                                    if device.type == "cuda"
+                                    else self._embeddings.weight.data[cold_rows_emb]
+                                )
+                                if self.optimizer_dim > 0:
+                                    opt_cache = (
+                                        pulled_optim_gpu
+                                        if self.optimizer_values.device.type == "cuda"
+                                        else self.optimizer_values[cold_rows_opt]
+                                    )
+                                else:
+                                    opt_cache = None
+                                self._gpu_cache_insert(
+                                    cold_indexes_cpu,
+                                    emb_cache,
+                                    opt_cache,
+                                )
             self.pull_tensors[pre_pulled["pull_tensor_index"]][0] = True
             return pull_time, cpu_gpu_time
 
@@ -788,7 +1054,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
             if device.type == "cuda" and self._gpu_cache_prefetch_stream is not None:
                 with torch.cuda.stream(self._gpu_cache_prefetch_stream):
                     emb_gpu = emb_cpu.to(device, non_blocking=True)
-                    opt_gpu = opt_cpu.to(device, non_blocking=True)
+                    opt_gpu = opt_cpu.to(
+                        self.optimizer_values.device, non_blocking=True
+                    )
                     self._gpu_cache_insert(chunk_raw, emb_gpu, opt_gpu)
                 if self._gpu_cache_prefetch_event is not None:
                     self._gpu_cache_prefetch_stream.record_event(
@@ -796,7 +1064,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
                     )
             else:
                 emb_gpu = emb_cpu.to(device, non_blocking=True)
-                opt_gpu = opt_cpu.to(device, non_blocking=True)
+                opt_gpu = opt_cpu.to(
+                    self.optimizer_values.device, non_blocking=True
+                )
                 self._gpu_cache_insert(chunk_raw, emb_gpu, opt_gpu)
 
     def _embed(self, indexes: Tensor) -> Tensor:

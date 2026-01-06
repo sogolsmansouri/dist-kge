@@ -5,7 +5,7 @@ import itertools
 import multiprocessing as mp
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 from pathlib import Path
 
 import numpy as np
@@ -53,17 +53,16 @@ class SCHEDULER_CMDS(IntEnum):
 
 @dataclass
 class WorkPackage:
-
-    partition_id = None
-    partition_version = None
-    partition_data = None
-    entities_in_partition = None
-    relations_in_partition = None
-    window_members = None
-    window_entities = None
-    window_versions = None
-    wait = False
-    reuse_partition_version = False
+    partition_id: Any = None
+    partition_version: Optional[int] = None
+    partition_data: Optional[torch.Tensor] = None
+    entities_in_partition: Optional[torch.Tensor] = None
+    relations_in_partition: Optional[torch.Tensor] = None
+    window_members: Optional[Sequence[int]] = None
+    window_entities: Optional[torch.Tensor] = None
+    window_versions: Optional[Sequence[int]] = None
+    wait: bool = False
+    reuse_partition_version: bool = False
 
 
 class WorkScheduler(mp.get_context("fork").Process):
@@ -86,7 +85,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         self.work_to_do = deque(list(range(self.num_partitions)))
         self.wait_time = 0.4
         self.repartition_epoch = config.get("job.distributed.repartition_epoch")
-        self.init_up_to_entity = -1
+        self.init_up_to_entity = 0
         self.num_processed_partitions = 0
         self.eval_hists = []
         self.active_partition_per_worker = dict()
@@ -249,14 +248,20 @@ class WorkScheduler(mp.get_context("fork").Process):
             out = []
             for x in pid:
                 try:
-                    out.append(int(x))
+                    xi = int(x)
                 except Exception:
                     pass
+                else:
+                    if xi >= 0:
+                        out.append(xi)
             return out
         try:
-            return [int(pid)]
+            xi = int(pid)
         except Exception:
             return []
+        if xi < 0:
+            return []
+        return [xi]
 
     
     def _serialize_partition_key(self, partition_id):
@@ -378,7 +383,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         initialize_worker_groups(self.config, self.rank)
         barrier_count = 0
         shutdown_count = 0
-        epoch_time = None
+        epoch_start_time = None
         if self.repartition_epoch:
             if self.repartition_worker_pool is None:
                 self.repartition_worker_pool = mp.Pool(processes=1)
@@ -390,14 +395,21 @@ class WorkScheduler(mp.get_context("fork").Process):
 
             # refill work and distribute to all asking workers
             if self._effective_done_workers() == self.num_clients:
-                epoch_time += time.time()
-                self.config.log(f"complete_epoch_time: {epoch_time}")
-                epoch_time = None
+                if epoch_start_time is not None:
+                    elapsed = time.time() - epoch_start_time
+                    self.config.log(f"complete_epoch_time: {elapsed}")
+                    epoch_start_time = None
                 self.num_processed_partitions = 0
                 self._refill_work()
                 self._on_epoch_completed()
                 for worker, machine_id in self.asking_workers:
                     work_package = self._next_work(worker, machine_id)
+                    if (
+                        epoch_start_time is None
+                        and work_package.partition_data is not None
+                        and not work_package.wait
+                    ):
+                        epoch_start_time = time.time()
                     self._send_work(worker, cmd_buffer, work_package)
                 self.done_workers = []
                 self.asking_workers = []
@@ -408,8 +420,6 @@ class WorkScheduler(mp.get_context("fork").Process):
             self._worker_last_seen[rank] = time.time()
             cmd = cmd_buffer[0].item()
             if cmd == SCHEDULER_CMDS.GET_WORK:
-                if epoch_time is None:
-                    epoch_time = -time.time()
                 machine_id = cmd_buffer[1].item()
                 if rank in self._disabled_workers:
                     work_package = WorkPackage()
@@ -419,6 +429,12 @@ class WorkScheduler(mp.get_context("fork").Process):
                     self.asking_workers.append((rank, machine_id))
                     continue
                 work_package = self._next_work(rank, machine_id)
+                if (
+                    epoch_start_time is None
+                    and work_package.partition_data is not None
+                    and not work_package.wait
+                ):
+                    epoch_start_time = time.time()
                 self._send_work(rank, cmd_buffer, work_package)
             elif cmd == SCHEDULER_CMDS.WORK_DONE:
                 self._handle_work_done(rank)
@@ -576,6 +592,18 @@ class WorkScheduler(mp.get_context("fork").Process):
                     if window_entities is None:
                         window_entities = self.local_entities.get(rank)
                     work_package.entities_in_partition = window_entities
+                if (
+                    getattr(self, "_send_window_entities", False)
+                    and work_package.window_entities is None
+                ):
+                    window_entities = None
+                    if hasattr(self, "_get_window_entities"):
+                        window_entities = self._get_window_entities(
+                            tuple(window_members)
+                        )
+                    if window_entities is None:
+                        window_entities = work_package.entities_in_partition
+                    work_package.window_entities = window_entities
                 if getattr(self, "_glow_debug", False):
                     self._glow_log(
                         "Rebuilt window work in _send_work for "
@@ -640,19 +668,22 @@ class WorkScheduler(mp.get_context("fork").Process):
             work_package.partition_version = None
         if partition_payload is not None:
             if not pre_localize and work_package.partition_id is not None:
-                if work_package.reuse_partition_version:
-                    if work_package.partition_version is None:
-                        work_package.partition_version = self.partition_issue_versions[
+                if work_package.window_versions is None:
+                    if work_package.reuse_partition_version:
+                        if work_package.partition_version is None:
+                            work_package.partition_version = self.partition_issue_versions[
+                                work_package.partition_id
+                            ]
+                    else:
+                        current_version = self.partition_issue_versions[
                             work_package.partition_id
                         ]
+                        work_package.partition_version = current_version
+                        self.partition_issue_versions[work_package.partition_id] = (
+                            current_version + 1
+                        )
                 else:
-                    current_version = self.partition_issue_versions[
-                        work_package.partition_id
-                    ]
-                    work_package.partition_version = current_version
-                    self.partition_issue_versions[work_package.partition_id] = (
-                        current_version + 1
-                    )
+                    work_package.partition_version = None
             cmd_buffer[0] = SCHEDULER_CMDS.WORK
             cmd_buffer[1] = len(partition_payload)
             dist.send(cmd_buffer, dst=rank)
@@ -723,6 +754,17 @@ class WorkScheduler(mp.get_context("fork").Process):
                 cmd_buffer[1] = len(window_tensor)
                 dist.send(cmd_buffer, dst=rank)
                 dist.send(window_tensor, dst=rank)
+                if (
+                    getattr(self, "_send_window_entities", False)
+                    and work_package.window_entities is None
+                ):
+                    window_key = tuple(int(x) for x in work_package.window_members)
+                    window_entities = None
+                    if hasattr(self, "_get_window_entities"):
+                        window_entities = self._get_window_entities(window_key)
+                    if window_entities is None:
+                        window_entities = work_package.entities_in_partition
+                    work_package.window_entities = window_entities
             window_entities_data = work_package.window_entities
             if (
                 window_entities_data is None
@@ -755,9 +797,14 @@ class WorkScheduler(mp.get_context("fork").Process):
                 cmd_buffer[1] = len(window_versions)
                 dist.send(cmd_buffer, dst=rank)
                 dist.send(window_versions, dst=rank)
+            if work_package.window_members:
+                self._last_window_per_worker[rank] = tuple(
+                    int(x) for x in work_package.window_members
+                )
         elif work_package.wait:
             cmd_buffer[0] = SCHEDULER_CMDS.WAIT
-            cmd_buffer[1] = self.wait_time
+            # cmd_buffer is integer-typed; send milliseconds to avoid truncation.
+            cmd_buffer[1] = int(self.wait_time * 1000)
             dist.send(cmd_buffer, dst=rank)
         else:
             if not pre_localize:
@@ -781,20 +828,22 @@ class WorkScheduler(mp.get_context("fork").Process):
         dist.send(init_data, dst=rank)
 
     def _handle_get_init_work(self, rank, embedding_layer_size):
-        if self.init_up_to_entity == -1:
+        if self.init_up_to_entity == 0:
             print("initialize parameter server")
-        self.init_up_to_entity += 1
-        if self.init_up_to_entity >= self.dataset.num_entities():
+        start = self.init_up_to_entity
+        if start >= self.dataset.num_entities():
             return_buffer = torch.tensor([-1, -1], dtype=self.data_type)
         else:
             entity_range_end = min(
                 self.dataset.num_entities(),
-                self.init_up_to_entity + embedding_layer_size,
+                start + embedding_layer_size,
             )
             if entity_range_end == self.dataset.num_entities():
                 print("parameter server initialized")
-            return_buffer = torch.tensor([self.init_up_to_entity, entity_range_end], dtype=self.data_type)
-        self.init_up_to_entity += embedding_layer_size
+            return_buffer = torch.tensor(
+                [start, entity_range_end], dtype=self.data_type
+            )
+            self.init_up_to_entity = entity_range_end
         dist.send(return_buffer, dst=rank)
 
     def _handle_get_local_entities(self, rank):
@@ -933,7 +982,10 @@ class WorkScheduler(mp.get_context("fork").Process):
             if pid_int == -1:
                 return
             if pid_int < -1:
-                partition_id = self._decode_partition_id(pid_int)
+                decoded = self._decode_partition_id(pid_int)
+                if isinstance(decoded, (int, np.integer)) and int(decoded) < 0:
+                    return
+                partition_id = decoded
 
         # normalize partition_id into a list of *int* base partition ids
         base_pids = []
@@ -993,10 +1045,23 @@ class WorkScheduler(mp.get_context("fork").Process):
             stats = self.relation_gradient_stats[rel_id]
             stats["sum"] += float(rel_sum)
             stats["count"] += int(rel_count)
-                # Normalize partition_id to base int pids before touching the gradient graph
+        # Normalize partition_id to base int pids before touching the gradient graph.
         base_pids = self._base_partition_ids(partition_id)
         if not base_pids:
             return
+
+        for pid in base_pids:
+            rel_map = self.partition_relation_gradient_stats[pid]
+            for rel_id, rel_sum, rel_count in zip(
+                rel_ids_list, rel_sums_list, rel_counts_list
+            ):
+                rel_id = int(rel_id)
+                rel_count = int(rel_count)
+                if rel_id < 0 or rel_count <= 0:
+                    continue
+                entry = rel_map[rel_id]
+                entry["sum"] += float(rel_sum)
+                entry["count"] += rel_count
 
         try:
             for pid in base_pids:
@@ -1429,6 +1494,8 @@ class WorkScheduler(mp.get_context("fork").Process):
         if reported_chunk_size and reported_chunk_size > 0:
             chunk_size = reported_chunk_size
         expected_version = self.active_partition_versions.get(rank)
+        if isinstance(expected_version, dict):
+            expected_version = None
         conflict = (
             reported_version is not None
             and expected_version is not None
@@ -1721,9 +1788,11 @@ class RandomWorkScheduler(AdaptiveWorkScheduler):
     def _load_partitions(self, num_partitions):
         num_triples = len(self.dataset.split("train"))
         # Use long indices for safe tensor indexing.
-        permuted_triple_index = torch.randperm(num_triples)
+        permuted_triple_index = torch.randperm(
+            num_triples, device="cpu"
+        ).to(dtype=self.data_type)
         partitions = list(torch.chunk(permuted_triple_index, num_partitions))
-        partitions = [p.clone() for p in partitions]
+        partitions = [p.clone().to(dtype=self.data_type) for p in partitions]
         return partitions
 
     def _refill_work(self):
@@ -2287,6 +2356,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._window_swap_costs = {}
         self._partition_to_window = {}
         self._window_work_key_map = {}
+        self._last_window_per_worker = {}
         self._partition_entities_map = None
         self._max_partition_entities = 0
         self._partition_relations_map = None
@@ -2392,9 +2462,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if base_type == "random":
             num_triples = len(self.dataset.split("train"))
             # Use long indices for safe tensor indexing.
-            permuted_triple_index = torch.randperm(num_triples)
+            permuted_triple_index = torch.randperm(
+                num_triples, device="cpu"
+            ).to(dtype=self.data_type)
             partitions = list(torch.chunk(permuted_triple_index, num_partitions))
-            partitions = [p.clone() for p in partitions]
+            partitions = [p.clone().to(dtype=self.data_type) for p in partitions]
             return partitions
         reordered = self._load_reordered_partitions(num_partitions)
         if reordered is not None:
@@ -2750,6 +2822,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._causal_overlap_queue.clear()
         self._causal_overlap_versions.clear()
         self._causal_overlap_active.clear()
+        self._last_window_per_worker.clear()
 
     def _register_window_result(
         self,
@@ -3124,6 +3197,108 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     f"from key={window_key}."
                 )
             return tuple(remaining)
+
+    def _estimate_incremental_window_cost(self, window_key, last_window):
+        if (
+            self._partition_entities_map is None
+            or not window_key
+            or not last_window
+        ):
+            return None
+        last_set = {int(pid) for pid in last_window}
+        count = 0
+        for pid in window_key:
+            pid = int(pid)
+            if pid in last_set:
+                continue
+            entries = self._partition_entities_map.get(pid)
+            if entries is None:
+                continue
+            count += int(entries.numel())
+        return count * self.glow_swap_bytes_per_entity
+
+    def _pop_next_window_for_worker(self, rank):
+        if not self.glow_windows_enabled or not self._glow_windows:
+            return None
+        if not self.glow_swap_aware:
+            return self._pop_next_window()
+        last_window = self._last_window_per_worker.get(rank)
+        if not last_window:
+            return self._pop_next_window()
+        if self._partition_entities_map is None:
+            return self._pop_next_window()
+
+        candidates = []
+        entries = list(self._glow_windows)
+        for idx, entry in enumerate(entries):
+            window_key = entry.get("key")
+            if not window_key:
+                continue
+            invalid = [
+                pid
+                for pid in window_key
+                if not (0 <= int(pid) < len(self.partitions))
+            ]
+            if invalid and self._glow_debug:
+                self._glow_log(
+                    "Glow window contains invalid partition ids "
+                    f"{invalid}; partitions_len={len(self.partitions)}."
+                )
+            remaining = [
+                pid
+                for pid in window_key
+                if pid not in self._served_partitions
+                and (0 <= int(pid) < len(self.partitions))
+            ]
+            if not remaining:
+                continue
+            cost = self._estimate_incremental_window_cost(remaining, last_window)
+            if cost is None:
+                return self._pop_next_window()
+            bandit_score = self._window_scores.get(window_key, 0.0)
+            candidates.append(
+                {
+                    "idx": idx,
+                    "entry": entry,
+                    "remaining": remaining,
+                    "window_key": window_key,
+                    "bandit_score": bandit_score,
+                    "cost": cost,
+                }
+            )
+
+        if not candidates:
+            return self._pop_next_window()
+
+        costs = [c["cost"] for c in candidates]
+        min_cost = min(costs)
+        max_cost = max(costs)
+        denom = max(1.0, max_cost - min_cost)
+
+        def combined_score(candidate):
+            swap_score = 1.0 - ((candidate["cost"] - min_cost) / denom)
+            if self.glow_bandit_enabled:
+                return candidate["bandit_score"] + self.glow_swap_weight * swap_score
+            return swap_score
+
+        best = max(candidates, key=combined_score)
+        # Remove selected entry from the window queue.
+        entries.pop(best["idx"])
+        self._glow_windows = deque(entries)
+
+        remaining = best["remaining"]
+        for pid in remaining:
+            self._served_partitions.add(pid)
+        if self.glow_window_work:
+            remaining_key = tuple(int(pid) for pid in remaining)
+            full_key = tuple(int(pid) for pid in best["window_key"])
+            self._window_work_key_map[remaining_key] = full_key
+        if self._glow_debug:
+            self._glow_log(
+                f"Selected window {tuple(remaining)} "
+                f"from key={best['window_key']} for rank {rank}."
+            )
+        return tuple(remaining)
 
     def _after_partition_result(self, partition_id, avg_time, **kwargs):
         super(GlowWorkScheduler, self)._after_partition_result(
@@ -3834,7 +4009,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         try:
             while True:
                 if self.glow_window_work:
-                    window_members = self._pop_next_window()
+                    window_members = self._pop_next_window_for_worker(rank)
                     if window_members is None:
                         if self.active_partition_per_worker:
                             if self._glow_debug:
@@ -3882,6 +4057,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                             f"Dispatching window work {tuple(window_members)} "
                             f"size={size} to rank {rank}."
                         )
+                    self._last_window_per_worker[rank] = tuple(window_members)
                     return work_package
                 if (
                     self._causal_overlap_enabled
@@ -4715,8 +4891,10 @@ class SchedulerClient:
             if cmd[0] == SCHEDULER_CMDS.WORK:
                 return self._receive_work(cmd)
             elif cmd[0] == SCHEDULER_CMDS.WAIT:
-                wait = max(0.0, float(cmd[1].item()))
-                if wait > 0:
+                wait_raw = float(cmd[1].item())
+                if wait_raw > 0:
+                    # New protocol sends milliseconds; keep backward-compat for seconds.
+                    wait = wait_raw / 1000.0 if wait_raw > 10 else wait_raw
                     time.sleep(wait)
             else:
                 return None, None, None, None, None, None, None, None
@@ -5009,21 +5187,24 @@ class LocalSchedulerClient:
         if work_package is None or work_package.partition_data is None:
             return None, None, None, None, None, None, None, None
         if work_package.partition_id is not None:
-            if work_package.reuse_partition_version:
-                if work_package.partition_version is None:
-                    work_package.partition_version = (
-                        self.scheduler.partition_issue_versions[
-                            work_package.partition_id
-                        ]
+            if work_package.window_versions is None:
+                if work_package.reuse_partition_version:
+                    if work_package.partition_version is None:
+                        work_package.partition_version = (
+                            self.scheduler.partition_issue_versions[
+                                work_package.partition_id
+                            ]
+                        )
+                else:
+                    current_version = self.scheduler.partition_issue_versions[
+                        work_package.partition_id
+                    ]
+                    work_package.partition_version = current_version
+                    self.scheduler.partition_issue_versions[work_package.partition_id] = (
+                        current_version + 1
                     )
             else:
-                current_version = self.scheduler.partition_issue_versions[
-                    work_package.partition_id
-                ]
-                work_package.partition_version = current_version
-                self.scheduler.partition_issue_versions[work_package.partition_id] = (
-                    current_version + 1
-                )
+                work_package.partition_version = None
         if not pre_localize:
             self.scheduler.active_partition_per_worker[self.rank] = (
                 work_package.partition_id
@@ -5170,19 +5351,18 @@ class LocalSchedulerClient:
         return self.scheduler._get_max_entities(), self.scheduler._get_max_relations()
 
     def get_init_work(self, entity_embedder_size):
-        if self.scheduler.init_up_to_entity == -1:
+        if self.scheduler.init_up_to_entity == 0:
             self.scheduler.config.log("initialize parameter server")
-        self.scheduler.init_up_to_entity += 1
-        if self.scheduler.init_up_to_entity >= self.scheduler.dataset.num_entities():
-            return None
         start = self.scheduler.init_up_to_entity
+        if start >= self.scheduler.dataset.num_entities():
+            return None
         end = min(
             self.scheduler.dataset.num_entities(),
-            self.scheduler.init_up_to_entity + entity_embedder_size,
+            start + entity_embedder_size,
         )
         if end == self.scheduler.dataset.num_entities():
             self.scheduler.config.log("parameter server initialized")
-        self.scheduler.init_up_to_entity += entity_embedder_size
+        self.scheduler.init_up_to_entity = end
         return torch.arange(start, end, dtype=self.data_type)
 
     def get_local_entities(self):

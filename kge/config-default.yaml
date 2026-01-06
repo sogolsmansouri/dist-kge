@@ -43,6 +43,12 @@ job:
       window_pinned_max_relation: 0
       # Upper bound on how many *new* ids we insert per step (0 => unlimited).
       max_insert_per_step: 50000
+      # Eviction policy for the non-pinned GPU cache.
+      eviction_policy: fifo  # fifo | lru
+      # Max slots to scan when selecting LRU victims (0 => full scan).
+      lru_max_scan: 0
+      # Keep pinned window entries across windows (evict within pinned segment instead of clearing).
+      window_pinned_persist: false
     # number of workers over all machines
     num_workers: 1
 
