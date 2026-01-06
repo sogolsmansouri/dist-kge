@@ -135,64 +135,52 @@ class DistributedLookupEmbedder(LookupEmbedder):
         # (Configured via job.distributed.gpu_cache.window_pinned_max[_entity|_relation])
 
     def to_device(self, move_optim_data=True):
-        """Needs to be called after model.to(self.device)"""
         if move_optim_data:
-            self.optimizer_values = self.optimizer_values.to(
-                self._embeddings.weight.device
-            )
+            self.optimizer_values = self.optimizer_values.to(self._embeddings.weight.device)
+
+        device = self._embeddings.weight.device
+        if device.type == "cuda":
+            # pin pull buffers (CPU tensors)
+            for i in range(len(self.pull_tensors)):
+                self.pull_tensors[i][1] = self.pull_tensors[i][1].pin_memory()
+
+            # create copy stream
+            self.copy_stream = torch.cuda.Stream(device=device)
+
         self._setup_gpu_cache()
 
+
     def _init_gpu_cache_config(self):
-        cache_cfg = self.config.get("job.distributed.gpu_cache") or {}
-        enabled = bool(cache_cfg.get("enable", False))
+        enabled = bool(self.config.get("job.distributed.gpu_cache.enable", False))
         if not enabled:
             return
+
         if "entity" in self.configuration_key:
-            max_entries = int(
-                cache_cfg.get("max_entries_entity", cache_cfg.get("max_entries", 0))
-            )
-            pinned_max = int(
-                cache_cfg.get(
-                    "window_pinned_max_entity",
-                    cache_cfg.get("window_pinned_max", 0),
-                )
-            )
+            max_entries = int(self.config.get("job.distributed.gpu_cache.max_entries_entity", 0))
+            pinned_max  = int(self.config.get("job.distributed.gpu_cache.window_pinned_max_entity", 0))
         elif "relation" in self.configuration_key:
-            max_entries = int(
-                cache_cfg.get("max_entries_relation", cache_cfg.get("max_entries", 0))
-            )
-            pinned_max = int(
-                cache_cfg.get(
-                    "window_pinned_max_relation",
-                    cache_cfg.get("window_pinned_max", 0),
-                )
-            )
+            max_entries = int(self.config.get("job.distributed.gpu_cache.max_entries_relation", 0))
+            pinned_max  = int(self.config.get("job.distributed.gpu_cache.window_pinned_max_relation", 0))
         else:
-            max_entries = int(cache_cfg.get("max_entries", 0))
-            pinned_max = int(cache_cfg.get("window_pinned_max", 0))
+            max_entries = int(self.config.get("job.distributed.gpu_cache.max_entries", 0))
+            pinned_max  = int(self.config.get("job.distributed.gpu_cache.window_pinned_max", 0))
+
         self._gpu_cache_max_insert_per_step = int(
-            cache_cfg.get(
-                "max_insert_per_step",
-                self._gpu_cache_max_insert_per_step,
-            )
+            self.config.get("job.distributed.gpu_cache.max_insert_per_step", self._gpu_cache_max_insert_per_step)
         )
-        if self._gpu_cache_max_insert_per_step < 0:
-            self._gpu_cache_max_insert_per_step = 0
-        eviction_policy = str(cache_cfg.get("eviction_policy", "fifo")).lower()
+        eviction_policy = str(self.config.get("job.distributed.gpu_cache.eviction_policy", "fifo")).lower()
         if eviction_policy not in ("fifo", "lru"):
             eviction_policy = "fifo"
         self._gpu_cache_eviction_policy = eviction_policy
-        self._gpu_cache_lru_max_scan = int(cache_cfg.get("lru_max_scan", 0) or 0)
-        if self._gpu_cache_lru_max_scan < 0:
-            self._gpu_cache_lru_max_scan = 0
-        self._gpu_cache_pinned_persist = bool(
-            cache_cfg.get("window_pinned_persist", False)
-        )
+        self._gpu_cache_lru_max_scan = int(self.config.get("job.distributed.gpu_cache.lru_max_scan", 0) or 0)
+        self._gpu_cache_pinned_persist = bool(self.config.get("job.distributed.gpu_cache.window_pinned_persist", False))
+
         if max_entries <= 0:
             return
         self._gpu_cache_enabled = True
         self._gpu_cache_max_entries = max_entries
         self._gpu_cache_pinned_max_entries = max(0, pinned_max)
+
 
     def _setup_gpu_cache(self):
         if not self._gpu_cache_enabled:
