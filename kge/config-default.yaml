@@ -203,6 +203,7 @@ job:
       debug_log_verbose: False
       debug_log_interval: 50
       debug_log_window_limit: 10
+      debug_trace: False
       affinity_alpha: 0.3
       bandit:
         enable: True
