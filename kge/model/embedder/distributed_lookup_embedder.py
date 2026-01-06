@@ -720,7 +720,11 @@ class DistributedLookupEmbedder(LookupEmbedder):
         full_len = int(indexes_cpu.numel())
         pull_indexes = (indexes_cpu + self.lapse_offset).cpu()
         pull_len = full_len
-        pull_tensor_index, pull_tensor = self._get_free_pull_tensor()
+        pull = self._get_free_pull_tensor(allow_none=True)
+        if pull is None:
+            # Best-effort prefetch: skip if no free pull tensor is available.
+            return
+        pull_tensor_index, pull_tensor = pull
         pull_tensor = pull_tensor[:pull_len]
         pull_future = self.parameter_client.pull(
             pull_indexes, pull_tensor, asynchronous=True
