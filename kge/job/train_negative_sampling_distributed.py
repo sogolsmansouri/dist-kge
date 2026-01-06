@@ -548,7 +548,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._force_overlap_pool = False
         self._overlap_sampling_logged = False
         self._window_prefetch_key = None
-        self._window_work = bool(glow_cfg.get("window_work", False)) if self._use_glow_features else False
+        self._window_work = (
+            bool(glow_cfg.get("window_work", False)) if self._use_glow_features else False
+        )
+        self._glow_debug_trace = (
+            bool(glow_cfg.get("debug_trace", False)) if self._use_glow_features else False
+        )
+        self._glow_trace_stats = None
         try:
             self._debug_window_versions_remaining = int(
                 glow_cfg.get("debug_window_versions", 0)
@@ -1545,6 +1551,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         return summary
 
     def _prefetch_glow_window_entities(self, work_entities: torch.Tensor):
+        stats = self._glow_trace_stats if self._glow_debug_trace else None
+        if stats is not None:
+            stats["prefetch_invocations"] += 1
         if (
             not self._prefetch_window_entities
             or not self.entity_localize
@@ -1552,6 +1561,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             or self._current_window_entities is None
             or self._current_window_entities.numel() == 0
         ):
+            if stats is not None:
+                stats["prefetch_skipped_disabled"] += 1
             self._window_prefetch_key = None
             return
         window_key = None
@@ -1565,6 +1576,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
             prefetch_key = (self._current_partition_id, window_key)
             if prefetch_key == self._window_prefetch_key:
+                if stats is not None:
+                    stats["prefetch_skipped_repeat"] += 1
                 return
         extras = self._current_window_entities
         if extras.device.type != "cpu":
@@ -1588,10 +1601,25 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         overlap_ratio = (
             1.0 - (extras_count / max(1, union_count)) if union_count > 0 else 0.0
         )
+        if stats is not None:
+            stats["prefetch_overlap_samples"] += 1
+            stats["prefetch_overlap_sum"] += overlap_ratio
+            if stats["prefetch_overlap_min"] is None:
+                stats["prefetch_overlap_min"] = overlap_ratio
+                stats["prefetch_overlap_max"] = overlap_ratio
+            else:
+                stats["prefetch_overlap_min"] = min(
+                    stats["prefetch_overlap_min"], overlap_ratio
+                )
+                stats["prefetch_overlap_max"] = max(
+                    stats["prefetch_overlap_max"], overlap_ratio
+                )
         min_overlap = float(
             self.config.get("job.distributed.glow.prefetch_min_overlap_ratio", 0.0)
         )
         if min_overlap > 0.0 and overlap_ratio < min_overlap:
+            if stats is not None:
+                stats["prefetch_skipped_overlap"] += 1
             self._window_prefetch_key = prefetch_key
             return
         # Throttle prefetch to every N windows.
@@ -1602,6 +1630,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self, "_glow_prefetch_window_count", 0
         ) + 1
         if every_n > 1 and (self._glow_prefetch_window_count % every_n) != 0:
+            if stats is not None:
+                stats["prefetch_skipped_throttle"] += 1
             self._window_prefetch_key = prefetch_key
             return
         max_prefetch = int(
@@ -1609,11 +1639,23 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 "job.distributed.glow.max_window_prefetch", 200000
             )
         )
-        if extras.numel() > max_prefetch:
+        raw_extras = int(extras.numel())
+        if raw_extras > max_prefetch:
+            if stats is not None:
+                stats["prefetch_capped_total"] += raw_extras - max_prefetch
             extras = extras[:max_prefetch]
         if extras.numel() == 0:
+            if stats is not None:
+                stats["prefetch_skipped_empty"] += 1
             self._window_prefetch_key = prefetch_key
             return
+        if stats is not None:
+            stats["prefetch_calls"] += 1
+            stats["prefetch_extras_raw_total"] += raw_extras
+            stats["prefetch_extras_total"] += int(extras.numel())
+            stats["prefetch_extras_max"] = max(
+                stats["prefetch_extras_max"], int(extras.numel())
+            )
         self._dbg_glow_prefetch_calls = getattr(self, "_dbg_glow_prefetch_calls", 0) + 1
         if self._dbg_glow_prefetch_calls % 50 == 0:
             self.config.log(f"[DBG] glow_prefetch_calls={self._dbg_glow_prefetch_calls} extras_device={extras.device} extras_numel={extras.numel()}")
@@ -1658,6 +1700,30 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         ):
             return None
         return tuple(int(x) for x in self._current_window_members.cpu().tolist())
+
+    def _init_glow_trace_stats(self):
+        self._glow_trace_stats = {
+            "windows_total": 0,
+            "windows_multi": 0,
+            "window_members_total": 0,
+            "window_entities_total": 0,
+            "window_entities_max": 0,
+            "prefetch_invocations": 0,
+            "prefetch_calls": 0,
+            "prefetch_skipped_disabled": 0,
+            "prefetch_skipped_repeat": 0,
+            "prefetch_skipped_overlap": 0,
+            "prefetch_skipped_throttle": 0,
+            "prefetch_skipped_empty": 0,
+            "prefetch_extras_raw_total": 0,
+            "prefetch_extras_total": 0,
+            "prefetch_extras_max": 0,
+            "prefetch_capped_total": 0,
+            "prefetch_overlap_samples": 0,
+            "prefetch_overlap_sum": 0.0,
+            "prefetch_overlap_min": None,
+            "prefetch_overlap_max": None,
+        }
 
     def _validate_lookahead_payload(self, payload):
         if not payload:
@@ -1878,6 +1944,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         profile_stats = defaultdict(float)
         profile_batch_counter = 0
         profile_total_batches = 0
+        if self._glow_debug_trace:
+            self._init_glow_trace_stats()
 
         def maybe_log_profile(force=False):
             nonlocal profile_stats, profile_batch_counter, profile_total_batches
@@ -2536,6 +2604,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 if self._current_window_entities is not None
                 else 0
             )
+            if self._glow_debug_trace and self._glow_trace_stats is not None:
+                stats = self._glow_trace_stats
+                if chunk_window_members_count > 0:
+                    stats["windows_total"] += 1
+                    stats["window_members_total"] += int(chunk_window_members_count)
+                    stats["window_entities_total"] += int(chunk_window_entities_count)
+                    stats["window_entities_max"] = max(
+                        stats["window_entities_max"], int(chunk_window_entities_count)
+                    )
+                    if chunk_window_members_count > 1:
+                        stats["windows_multi"] += 1
             chunk_grad_summary = self._flush_partition_gradient_trace()
             window_members = self._current_window_members
             window_versions = self._current_window_versions
@@ -2762,6 +2841,73 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         except Exception as _exc:
             # never fail training due to stats
             pass
+
+        if self._glow_debug_trace and self._glow_trace_stats is not None:
+            stats = self._glow_trace_stats
+            windows_total = stats["windows_total"]
+            prefetch_calls = stats["prefetch_calls"]
+            overlap_samples = stats["prefetch_overlap_samples"]
+            avg_members = (
+                stats["window_members_total"] / max(1, windows_total)
+                if windows_total > 0
+                else 0.0
+            )
+            avg_entities = (
+                stats["window_entities_total"] / max(1, windows_total)
+                if windows_total > 0
+                else 0.0
+            )
+            avg_overlap = (
+                stats["prefetch_overlap_sum"] / max(1, overlap_samples)
+                if overlap_samples > 0
+                else 0.0
+            )
+            avg_extras = (
+                stats["prefetch_extras_total"] / max(1, prefetch_calls)
+                if prefetch_calls > 0
+                else 0.0
+            )
+            glow_trace = {
+                "glow_window_count": windows_total,
+                "glow_window_multi_count": stats["windows_multi"],
+                "glow_window_avg_members": float(avg_members),
+                "glow_window_avg_entities": float(avg_entities),
+                "glow_window_max_entities": int(stats["window_entities_max"]),
+                "glow_prefetch_invocations": stats["prefetch_invocations"],
+                "glow_prefetch_calls": prefetch_calls,
+                "glow_prefetch_skipped_disabled": stats["prefetch_skipped_disabled"],
+                "glow_prefetch_skipped_repeat": stats["prefetch_skipped_repeat"],
+                "glow_prefetch_skipped_overlap": stats["prefetch_skipped_overlap"],
+                "glow_prefetch_skipped_throttle": stats["prefetch_skipped_throttle"],
+                "glow_prefetch_skipped_empty": stats["prefetch_skipped_empty"],
+                "glow_prefetch_extras_avg": float(avg_extras),
+                "glow_prefetch_extras_max": int(stats["prefetch_extras_max"]),
+                "glow_prefetch_extras_total": int(stats["prefetch_extras_total"]),
+                "glow_prefetch_capped_total": int(stats["prefetch_capped_total"]),
+                "glow_prefetch_overlap_avg": float(avg_overlap),
+                "glow_prefetch_overlap_min": stats["prefetch_overlap_min"],
+                "glow_prefetch_overlap_max": stats["prefetch_overlap_max"],
+            }
+            try:
+                self.current_trace["epoch"].update(glow_trace)
+            except Exception:
+                pass
+            self.config.log(
+                "Glow trace: "
+                f"windows={windows_total} "
+                f"multi={stats['windows_multi']} "
+                f"avg_members={avg_members:.2f} "
+                f"avg_entities={avg_entities:.0f} "
+                f"max_entities={stats['window_entities_max']} "
+                f"prefetch_calls={prefetch_calls} "
+                f"skipped(disabled={stats['prefetch_skipped_disabled']},"
+                f"repeat={stats['prefetch_skipped_repeat']},"
+                f"overlap={stats['prefetch_skipped_overlap']},"
+                f"throttle={stats['prefetch_skipped_throttle']},"
+                f"empty={stats['prefetch_skipped_empty']}) "
+                f"extras_avg={avg_extras:.0f} "
+                f"overlap_avg={avg_overlap:.4f}"
+            )
 
         self.current_trace["epoch"].update(
             dict(

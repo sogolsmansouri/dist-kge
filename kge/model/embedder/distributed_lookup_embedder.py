@@ -84,6 +84,11 @@ class DistributedLookupEmbedder(LookupEmbedder):
                     ),
                 ]
             )
+        if number_of_pre_pulls > 0 and len(self.pull_tensors) == 1:
+            self.config.log(
+                "Prefetch enabled but only one pull tensor available; "
+                "prefetch will be skipped."
+            )
 
         if "cuda" in config.get("job.device"):
             # only pin tensors if we are using gpu
@@ -553,7 +558,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
         if n <= 0:
             return
 
-        pull = self._get_free_pull_tensor(allow_none=True)
+        pull = self._get_free_pull_tensor(allow_none=True, start_idx=1)
         if pull is None:
             # Best-effort: if no free pull tensor is available, skip prefetch.
             # Allocating + pinning huge CPU tensors here causes major slowdowns.
@@ -668,8 +673,12 @@ class DistributedLookupEmbedder(LookupEmbedder):
             )
         self.parameter_client.set(self.set_indexes, self.set_tensor, asynchronous=True)
 
-    def _get_free_pull_tensor(self, allow_none: bool = False):
-        for i, (free, pull_tensor) in enumerate(self.pull_tensors):
+    def _get_free_pull_tensor(self, allow_none: bool = False, start_idx: int = 0):
+        # Reserve index 0 for synchronous pulls used by _pull_embeddings().
+        if start_idx < 0:
+            start_idx = 0
+        for i in range(start_idx, len(self.pull_tensors)):
+            free, pull_tensor = self.pull_tensors[i]
             if free:
                 self.pull_tensors[i][0] = False
                 return i, pull_tensor
@@ -726,7 +735,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
         else:
             pull_indexes = (indexes_cpu + self.lapse_offset).cpu()
             pull_len = full_len
-        pull = self._get_free_pull_tensor(allow_none=True)
+        pull = self._get_free_pull_tensor(allow_none=True, start_idx=1)
         if pull is None:
             # Best-effort prefetch: skip if no free pull tensor is available.
             return
