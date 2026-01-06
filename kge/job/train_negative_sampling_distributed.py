@@ -1870,6 +1870,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         total_grad_sum = 0.0
         total_grad_samples = 0
         total_relation_grad_samples = 0
+        total_gpu_cache_s_hits = 0
+        total_gpu_cache_s_misses = 0
+        total_gpu_cache_o_hits = 0
+        total_gpu_cache_o_misses = 0
         profile_interval_batches = self.config.get("train.profile_interval_batches")
         profile_stats = defaultdict(float)
         profile_batch_counter = 0
@@ -2629,9 +2633,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 )
             )
             gpu_cache_stats = None
-            embedder = self.model.get_s_embedder()
-            if hasattr(embedder, "get_and_reset_gpu_cache_stats"):
-                gpu_cache_stats = embedder.get_and_reset_gpu_cache_stats()
+            embedder_s = self.model.get_s_embedder()
+            if hasattr(embedder_s, "get_and_reset_gpu_cache_stats"):
+                gpu_cache_stats = embedder_s.get_and_reset_gpu_cache_stats()
             if gpu_cache_stats:
                 chunk_trace.update(
                     dict(
@@ -2639,6 +2643,22 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         gpu_cache_misses=gpu_cache_stats.get("misses", 0),
                     )
                 )
+                total_gpu_cache_s_hits += int(gpu_cache_stats.get("hits", 0))
+                total_gpu_cache_s_misses += int(gpu_cache_stats.get("misses", 0))
+            # Collect o-embedder stats if it is a distinct embedder.
+            try:
+                embedder_o = self.model.get_o_embedder()
+            except Exception:
+                embedder_o = None
+            if (
+                embedder_o is not None
+                and embedder_o is not embedder_s
+                and hasattr(embedder_o, "get_and_reset_gpu_cache_stats")
+            ):
+                o_stats = embedder_o.get_and_reset_gpu_cache_stats()
+                if o_stats:
+                    total_gpu_cache_o_hits += int(o_stats.get("hits", 0))
+                    total_gpu_cache_o_misses += int(o_stats.get("misses", 0))
             if chunk_grad_summary:
                 chunk_trace.update(
                     dict(
@@ -2710,33 +2730,18 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         # --- GPU cache stats (best-effort; never crash training) ---
         try:
             stats = {}
-            for tag, getter_name in [("s", "get_s_embedder"), ("o", "get_o_embedder")]:
-                getter = getattr(self.model, getter_name, None)
-                if getter is None:
-                    continue
-                try:
-                    emb = getter()
-                except Exception:
-                    continue
-
-                if not getattr(emb, "_gpu_cache_enabled", False):
-                    continue
-
-                hits = int(getattr(emb, "_gpu_cache_hits", 0))
-                misses = int(getattr(emb, "_gpu_cache_misses", 0))
-                total = hits + misses
-                hit_rate = (hits / total) if total > 0 else 0.0
-
-                stats[f"gpu_cache_{tag}_hits"] = hits
-                stats[f"gpu_cache_{tag}_misses"] = misses
-                stats[f"gpu_cache_{tag}_hit_rate"] = float(hit_rate)
-
-                # reset per-epoch (optional)
-                try:
-                    emb._gpu_cache_hits = 0
-                    emb._gpu_cache_misses = 0
-                except Exception:
-                    pass
+            if total_gpu_cache_s_hits or total_gpu_cache_s_misses:
+                total = total_gpu_cache_s_hits + total_gpu_cache_s_misses
+                hit_rate = (total_gpu_cache_s_hits / total) if total > 0 else 0.0
+                stats["gpu_cache_s_hits"] = total_gpu_cache_s_hits
+                stats["gpu_cache_s_misses"] = total_gpu_cache_s_misses
+                stats["gpu_cache_s_hit_rate"] = float(hit_rate)
+            if total_gpu_cache_o_hits or total_gpu_cache_o_misses:
+                total = total_gpu_cache_o_hits + total_gpu_cache_o_misses
+                hit_rate = (total_gpu_cache_o_hits / total) if total > 0 else 0.0
+                stats["gpu_cache_o_hits"] = total_gpu_cache_o_hits
+                stats["gpu_cache_o_misses"] = total_gpu_cache_o_misses
+                stats["gpu_cache_o_hit_rate"] = float(hit_rate)
 
             if stats:
                 # put into trace
