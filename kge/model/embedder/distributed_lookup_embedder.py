@@ -516,6 +516,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
         """Prefetch (and pin) a window's ids into the GPU cache."""
         if not self._gpu_cache_enabled:
             return
+        if int(getattr(self, "_gpu_cache_pinned_max_entries", 0) or 0) <= 0:
+            # Avoid cache setup/prefetch overhead when pinned cache is disabled.
+            return
         self._setup_gpu_cache()
         pinned = int(getattr(self, "_gpu_cache_pinned_capacity", 0) or 0)
         if pinned <= 0:
@@ -694,6 +697,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
         indexes_cpu = indexes.detach().cpu().long()
         if indexes_cpu.numel() == 0:
             return
+        cold_mask = None
+        cold_rows = None
+        cold_indexes_cpu = None
         if getattr(self, "_gpu_cache_enabled", False):
             # Skip/trim pre-pull when ids are already cached to avoid redundant PS pulls.
             self._setup_gpu_cache()
@@ -703,11 +709,23 @@ class DistributedLookupEmbedder(LookupEmbedder):
                     if cache_mask is not None:
                         if torch.all(cache_mask):
                             return
+                        cold_mask = ~cache_mask
+                        if torch.any(cold_mask):
+                            cold_rows = torch.arange(
+                                indexes_cpu.numel(), dtype=torch.long, device="cpu"
+                            )[cold_mask]
+                            cold_indexes_cpu = indexes_cpu[cold_mask]
                 except Exception:
-                    pass
+                    cold_mask = None
+                    cold_rows = None
+                    cold_indexes_cpu = None
         full_len = int(indexes_cpu.numel())
-        pull_indexes = (indexes_cpu + self.lapse_offset).cpu()
-        pull_len = full_len
+        if cold_indexes_cpu is not None:
+            pull_indexes = (cold_indexes_cpu + self.lapse_offset).cpu()
+            pull_len = int(cold_indexes_cpu.numel())
+        else:
+            pull_indexes = (indexes_cpu + self.lapse_offset).cpu()
+            pull_len = full_len
         pull = self._get_free_pull_tensor(allow_none=True)
         if pull is None:
             # Best-effort prefetch: skip if no free pull tensor is available.
@@ -726,9 +744,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 "pull_tensor": pull_tensor,
                 "pull_future": pull_future,
                 "pull_tensor_index": pull_tensor_index,
-                "cold_mask": None,
-                "cold_rows": None,
-                "cold_indexes_cpu": None,
+                "cold_mask": cold_mask,
+                "cold_rows": cold_rows,
+                "cold_indexes_cpu": cold_indexes_cpu,
             }
         )
 
@@ -842,18 +860,23 @@ class DistributedLookupEmbedder(LookupEmbedder):
                         if cold_indexes_cpu is not None and cold_indexes_cpu.numel() > 0:
                             self._gpu_cache_misses += int(cold_rows.numel())
                             cold_n = int(cold_rows.numel())
-                            if (
-                                not self._gpu_cache_max_insert_per_step
-                                or cold_n <= self._gpu_cache_max_insert_per_step
-                            ):
+                            max_insert = int(self._gpu_cache_max_insert_per_step or 0)
+                            insert_n = cold_n
+                            if max_insert > 0 and cold_n > max_insert:
+                                insert_n = max_insert
+                            if insert_n > 0:
+                                if insert_n < cold_n:
+                                    cold_indexes_cpu = cold_indexes_cpu[:insert_n]
+                                    cold_rows_emb = cold_rows_emb[:insert_n]
+                                    cold_rows_opt = cold_rows_opt[:insert_n]
                                 emb_cache = (
-                                    pulled_embeddings_gpu
+                                    pulled_embeddings_gpu[:insert_n]
                                     if device.type == "cuda"
                                     else self._embeddings.weight.data[cold_rows_emb]
                                 )
                                 if self.optimizer_dim > 0:
                                     opt_cache = (
-                                        pulled_optim_gpu
+                                        pulled_optim_gpu[:insert_n]
                                         if self.optimizer_values.device.type == "cuda"
                                         else self.optimizer_values[cold_rows_opt]
                                     )
@@ -953,12 +976,15 @@ class DistributedLookupEmbedder(LookupEmbedder):
             if self._gpu_cache_enabled:
                 self._gpu_cache_misses += int(num_cold)
                 cold_n = int(num_cold)
-                if (
-                    self._gpu_cache_max_insert_per_step
-                    and cold_n > self._gpu_cache_max_insert_per_step
-                ):
-                    pass
-                else:
+                max_insert = int(self._gpu_cache_max_insert_per_step or 0)
+                insert_n = cold_n
+                if max_insert > 0 and cold_n > max_insert:
+                    insert_n = max_insert
+                if insert_n > 0:
+                    if insert_n < cold_n:
+                        cold_indexes = cold_indexes[:insert_n]
+                        pulled_embeddings_gpu = pulled_embeddings_gpu[:insert_n]
+                        pulled_optim_gpu = pulled_optim_gpu[:insert_n]
                     self._gpu_cache_insert(
                         cold_indexes, pulled_embeddings_gpu, pulled_optim_gpu
                     )
