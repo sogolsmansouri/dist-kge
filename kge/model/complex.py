@@ -16,6 +16,11 @@ class ComplExScorer(RelationalScorer):
         super().__init__(config, dataset, configuration_key)
         self._use_fused = fused_complex_requested()
         self._use_triton = has_triton_complex()
+        if self.config is not None:
+            self.config.log(
+                "ComplEx fused path: "
+                f"requested={self._use_fused} triton_available={self._use_triton}"
+            )
 
     def score_emb(self, s_emb, p_emb, o_emb, combine: str):
         if self._use_fused:
