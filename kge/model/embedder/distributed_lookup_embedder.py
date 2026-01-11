@@ -70,13 +70,20 @@ class DistributedLookupEmbedder(LookupEmbedder):
             number_of_pre_pulls = self.config.get("job.distributed.entity_pre_pull")
         elif "relation" in self.configuration_key:
             number_of_pre_pulls = self.config.get("job.distributed.relation_pre_pull")
+        # Pull buffers must be large enough to hold arbitrary global ids, not just the
+        # local vocab. Use the full vocab if available to avoid undersized tensors.
+        pull_buffer_rows = max(
+            vocab_size,
+            int(complete_vocab_size or 0),
+            self.dataset.num_entities() if "entity" in self.configuration_key else self.dataset.num_relations(),
+        )
         self.pull_tensors = []
         for i in range(number_of_pre_pulls + 1):
             self.pull_tensors.append(
                 [
                     True,
                     torch.empty(
-                        (self.vocab_size, self.parameter_client.dim),
+                        (pull_buffer_rows, self.parameter_client.dim),
                         # (self.vocab_size, self.dim + self.optimizer_dim),
                         dtype=torch.float32,
                         device="cpu",
@@ -740,7 +747,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
             # Best-effort prefetch: skip if no free pull tensor is available.
             return
         pull_tensor_index, pull_tensor = pull
-        pull_tensor = pull_tensor[:pull_len]
+        if pull_len <= pull_tensor.size(0):
+            pull_tensor = pull_tensor[:pull_len]
+        else:
+            pull_tensor = torch.empty(
+                (pull_len, self.parameter_client.dim),
+                dtype=torch.float32,
+                device="cpu",
+            )
+            if self._embeddings.weight.device.type == "cuda":
+                pull_tensor = pull_tensor.pin_memory()
         pull_future = self.parameter_client.pull(
             pull_indexes, pull_tensor, asynchronous=True
         )
@@ -1057,8 +1073,18 @@ class DistributedLookupEmbedder(LookupEmbedder):
             # Keys into the PS include the lapse offset.
             chunk_keys = (chunk_raw + self.lapse_offset).to(dtype=torch.long)
 
-            # Reuse the pinned CPU pull tensor.
-            pull_tensor = self.pull_tensors[0][1][: chunk_keys.numel()]
+            # Reuse the pinned CPU pull tensor when large enough; otherwise allocate a
+            # temporary buffer sized to the request to avoid resize errors.
+            if chunk_keys.numel() <= self.pull_tensors[0][1].size(0):
+                pull_tensor = self.pull_tensors[0][1][: chunk_keys.numel()]
+            else:
+                pull_tensor = torch.empty(
+                    (chunk_keys.numel(), self.parameter_client.dim),
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                if self._embeddings.weight.device.type == "cuda":
+                    pull_tensor = pull_tensor.pin_memory()
 
             # Pull is CPU-side; we keep it synchronous here because the warmup is typically
             # called at window boundaries. (Async would need completion tracking.)

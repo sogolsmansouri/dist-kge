@@ -152,13 +152,15 @@ job:
         reward_scale: 0.001
       base_partition_type: stratification
       causal_overlap:
+        duplicate_partitions: false
         enable: false
         max_workers_per_partition: 2
-      concurrent_windows: true
-      debug_log: true
-      debug_log_interval: 1
-      debug_log_verbose: true
+      concurrent_windows: false
+      debug_log: false
+      debug_log_interval: 2000
+      debug_log_verbose: false
       debug_log_window_limit: 10
+      debug_trace: false
       debug_window_versions: 0
       enable_windows: true
       force_pooled_negatives: false
@@ -169,8 +171,11 @@ job:
         min_shared_relations: 1
         top_relations: 64
       lookahead_negatives: true
+      max_window_prefetch: 200000
       min_gradient_count: 1
       overlap_negative_sampling: false
+      prefetch_every_n_windows: 1
+      prefetch_min_overlap_ratio: 0.0
       prefetch_window_entities: true
       reshape:
         check_interval: 200
@@ -178,10 +183,26 @@ job:
         enable: false
         hot_splits: 1
         min_partition_size: 2048
-      stratification_pairs: true
+      stratification_pairs: false
+      swap_aware:
+        bytes_per_entity: 0
+        enable: false
+        weight: 1.0
       window_overlap: 1
       window_size: 2
       window_work: true
+    gpu_cache:
+      enable: false
+      eviction_policy: fifo
+      lru_max_scan: 0
+      max_entries: 0
+      max_entries_entity: 0
+      max_entries_relation: 0
+      max_insert_per_step: 50000
+      window_pinned_max: 0
+      window_pinned_max_entity: 0
+      window_pinned_max_relation: 0
+      window_pinned_persist: false
     gradient_graph:
       clustering:
         enable: false
@@ -192,7 +213,7 @@ job:
         top_relations: 64
         update_interval: 0
       enable: true
-      export_interval: 1
+      export_interval: 2000
       repartition:
         enable: false
         max_moves_per_partition: 0
@@ -200,8 +221,8 @@ job:
         max_relations: 0
         min_partition_size: 2048
       top_relations: 64
-    gradient_snapshot_interval: 1
-    gradient_trace_log_interval: 1
+    gradient_snapshot_interval: 2000
+    gradient_trace_log_interval: 2000
     gradient_trace_top_relations: 32
     graph_cut:
       chunk_warmup_epochs: 0
@@ -260,7 +281,13 @@ job:
     stratification:
       active_only: true
       combine_mirror: true
+      cover:
+        enable: false
+        log_groups: false
+        q: 4
     unique_on_gpu: false
+    worker_stall_action: fail
+    worker_stall_timeout: 0
   type: train
 lookup_embedder:
   class_name: LookupEmbedder
@@ -298,8 +325,8 @@ manual_search:
 model: distributed_model
 modules:
 - kge.model.embedder
-- kge.job
 - kge.model
+- kge.job
 nary_negative_sampling:
   class_name: TrainingJobNaryNegativeSampling
   corrupt_all_arguments: false

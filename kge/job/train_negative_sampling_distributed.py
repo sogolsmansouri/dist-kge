@@ -1551,6 +1551,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         return summary
 
     def _prefetch_glow_window_entities(self, work_entities: torch.Tensor):
+        start_time = time.time()
         stats = self._glow_trace_stats if self._glow_debug_trace else None
         if stats is not None:
             stats["prefetch_invocations"] += 1
@@ -1564,7 +1565,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if stats is not None:
                 stats["prefetch_skipped_disabled"] += 1
             self._window_prefetch_key = None
-            return
+            return time.time() - start_time
         window_key = None
         prefetch_key = None
         if (
@@ -1578,7 +1579,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if prefetch_key == self._window_prefetch_key:
                 if stats is not None:
                     stats["prefetch_skipped_repeat"] += 1
-                return
+                return time.time() - start_time
         extras = self._current_window_entities
         if extras.device.type != "cpu":
             extras = extras.cpu()
@@ -1591,7 +1592,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 extras = extras[mask]
             except Exception:
                 self._window_prefetch_key = prefetch_key
-                return
+                return time.time() - start_time
         # Skip prefetch when overlap is too low.
         try:
             union_count = int(self._current_window_entities.numel())
@@ -1621,7 +1622,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if stats is not None:
                 stats["prefetch_skipped_overlap"] += 1
             self._window_prefetch_key = prefetch_key
-            return
+            return time.time() - start_time
         # Throttle prefetch to every N windows.
         every_n = int(
             self.config.get("job.distributed.glow.prefetch_every_n_windows", 1)
@@ -1633,7 +1634,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if stats is not None:
                 stats["prefetch_skipped_throttle"] += 1
             self._window_prefetch_key = prefetch_key
-            return
+            return time.time() - start_time
         max_prefetch = int(
             self.config.get(
                 "job.distributed.glow.max_window_prefetch", 200000
@@ -1648,7 +1649,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if stats is not None:
                 stats["prefetch_skipped_empty"] += 1
             self._window_prefetch_key = prefetch_key
-            return
+            return time.time() - start_time
         if stats is not None:
             stats["prefetch_calls"] += 1
             stats["prefetch_extras_raw_total"] += raw_extras
@@ -1692,6 +1693,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         except Exception as exc:
             self.config.log(f"Glow window prefetch failed: {exc}")
         self._window_prefetch_key = prefetch_key
+        return time.time() - start_time
 
     def _current_window_key(self):
         if (
@@ -1940,6 +1942,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         total_gpu_cache_s_misses = 0
         total_gpu_cache_o_hits = 0
         total_gpu_cache_o_misses = 0
+        total_glow_window_union_time = 0.0
+        total_glow_prefetch_time = 0.0
+        total_glow_gradient_trace_time = 0.0
+        total_glow_register_result_time = 0.0
+        total_glow_conflict_time = 0.0
         profile_interval_batches = self.config.get("train.profile_interval_batches")
         profile_stats = defaultdict(float)
         profile_batch_counter = 0
@@ -2030,6 +2037,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             ps_set_time = 0.0
             dataloader_time = 0.0
             scheduler_time = -time.time()
+            glow_window_union_time = 0.0
+            glow_prefetch_time = 0.0
+            glow_gradient_trace_time = 0.0
+            glow_register_result_time = 0.0
+            glow_conflict_time = 0.0
 
             # load new work package
             (
@@ -2144,11 +2156,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     + self._current_window_entities.numel()
                     <= max_pool_entities
                 ):
+                    union_start = time.time()
                     pool_entities = torch.unique(
                         torch.cat(
                             (work_entities, self._current_window_entities)
                         )
                     )
+                    glow_window_union_time += time.time() - union_start
                 else:
                     pool_entities = work_entities
                 if self.entity_sync_level == "partition":
@@ -2232,7 +2246,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         "syncing relations on a partition level"
                     )
 
-            self._prefetch_glow_window_entities(work_entities)
+            glow_prefetch_time += (
+                self._prefetch_glow_window_entities(work_entities) or 0.0
+            )
 
             if (
                 work_entities is not None
@@ -2615,7 +2631,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     )
                     if chunk_window_members_count > 1:
                         stats["windows_multi"] += 1
+            grad_trace_start = time.time()
             chunk_grad_summary = self._flush_partition_gradient_trace()
+            glow_gradient_trace_time += time.time() - grad_trace_start
             window_members = self._current_window_members
             window_versions = self._current_window_versions
             finished_context = self._notify_partition_end()
@@ -2640,20 +2658,28 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                             f"Glow window versions debug failed: {exc}"
                         )
                     self._debug_window_versions_remaining -= 1
+                register_start = time.time()
                 conflicts = self.work_scheduler_client.register_window_result(
                     partition_duration,
                     window_members,
                     window_versions,
                     chunk_partition_size,
                 )
+                glow_register_result_time += time.time() - register_start
+                conflict_start = time.time()
                 self._handle_window_conflicts(conflicts)
+                glow_conflict_time += time.time() - conflict_start
             else:
+                register_start = time.time()
                 status, replay_version = self.work_scheduler_client.register_partition_result(
                     partition_duration,
                     self._current_partition_version,
                     self._current_partition_size,
                 )
+                glow_register_result_time += time.time() - register_start
+                conflict_start = time.time()
                 self._handle_partition_conflict(status, replay_version, finished_context)
+                glow_conflict_time += time.time() - conflict_start
             self._last_finished_partition = None
             self._current_partition_id = None
             self._current_partition_version = None
@@ -2706,6 +2732,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     optimizer_time=optimizer_time,
                     scheduler_time=scheduler_time,
                     other_time=other_time,
+                    glow_window_union_time=glow_window_union_time,
+                    glow_prefetch_time=glow_prefetch_time,
+                    glow_gradient_trace_time=glow_gradient_trace_time,
+                    glow_register_result_time=glow_register_result_time,
+                    glow_conflict_time=glow_conflict_time,
                     embedding_mapping_time=chunk_embedding_mapping_time,
                     batches=chunk_batches_total,
                     dataloader_time=dataloader_time,
@@ -2780,6 +2811,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 total_relation_grad_samples += chunk_grad_summary.get(
                     "relation_grad_count", 0
                 )
+            total_glow_window_union_time += glow_window_union_time
+            total_glow_prefetch_time += glow_prefetch_time
+            total_glow_gradient_trace_time += glow_gradient_trace_time
+            total_glow_register_result_time += glow_register_result_time
+            total_glow_conflict_time += glow_conflict_time
             chunk_count += 1
             self.model.get_p_embedder().mapping_time = 0.0
             self.model.get_s_embedder().mapping_time = 0.0
@@ -2940,6 +2976,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 backward_time=total_backward_time,
                 optimizer_time=total_optimizer_time,
                 scheduler_time=total_scheduler_time,
+                glow_window_union_time=total_glow_window_union_time,
+                glow_prefetch_time=total_glow_prefetch_time,
+                glow_gradient_trace_time=total_glow_gradient_trace_time,
+                glow_register_result_time=total_glow_register_result_time,
+                glow_conflict_time=total_glow_conflict_time,
                 other_time=epoch_time
                 - total_prepare_time
                 - total_forward_time

@@ -195,6 +195,14 @@ class WorkScheduler(mp.get_context("fork").Process):
         self._gradient_graph_cluster_members = {}
         self._gradient_updates = 0
         self._last_gradient_snapshot = 0
+
+    def _record_glow_time(self, key: str, elapsed: float):
+        timing = getattr(self, "_glow_timing", None)
+        counts = getattr(self, "_glow_timing_counts", None)
+        if timing is None or counts is None:
+            return
+        timing[key] += float(elapsed)
+        counts[key] += 1
         self.partition_issue_versions = defaultdict(int)
         self.partition_committed_versions = defaultdict(lambda: -1)
         self.active_partition_versions = dict()
@@ -1077,6 +1085,7 @@ class WorkScheduler(mp.get_context("fork").Process):
     def _export_gradient_statistics(self, final: bool = False):
         if not self.partition_gradient_stats:
             return
+        export_start = time.time()
         output_folder = Path(self.config.folder) / "gradient_snapshots"
         try:
             output_folder.mkdir(parents=True, exist_ok=True)
@@ -1112,6 +1121,7 @@ class WorkScheduler(mp.get_context("fork").Process):
             )
         except Exception as exc:
             self.config.log(f"Failed to export gradient snapshot: {exc}")
+        self._record_glow_time("gradient_snapshot_export", time.time() - export_start)
         self._export_relation_gradient_statistics(output_folder, final=final)
         self._export_gradient_graph(final=final)
 
@@ -1171,6 +1181,7 @@ class WorkScheduler(mp.get_context("fork").Process):
                 "Glow gradient graph clustering skipped: no relation stats available."
             )
             return
+        cluster_start = time.time()
         allowed_relations = None
         top_relations = self._gradient_graph_cluster_top_relations
         if (
@@ -1286,6 +1297,9 @@ class WorkScheduler(mp.get_context("fork").Process):
             f"{len(cluster_members)} clusters "
             f"(min_size={min_size}, max_size={max_size})."
         )
+        self._record_glow_time(
+            "gradient_graph_cluster", time.time() - cluster_start
+        )
 
     def _update_gradient_graph(
         self, partition_id, rel_ids_list, rel_sums_list, rel_counts_list
@@ -1352,6 +1366,7 @@ class WorkScheduler(mp.get_context("fork").Process):
             or not self._gradient_graph_partitions
         ):
             return
+        export_start = time.time()
         if self._gradient_graph_cluster_enabled:
             self._maybe_update_gradient_graph_clusters(force=final)
         output_folder = Path(self.config.folder) / "gradient_graph"
@@ -1439,10 +1454,12 @@ class WorkScheduler(mp.get_context("fork").Process):
             )
         except Exception as exc:
             self.config.log(f"Failed to export gradient graph: {exc}")
+        self._record_glow_time("gradient_graph_export", time.time() - export_start)
 
     def _export_relation_gradient_statistics(self, output_folder, final: bool = False):
         if not self.partition_relation_gradient_stats:
             return
+        export_start = time.time()
         if final:
             snapshot_path = output_folder / "relation_gradient_snapshot_final.json"
         else:
@@ -1483,6 +1500,9 @@ class WorkScheduler(mp.get_context("fork").Process):
             )
         except Exception as exc:
             self.config.log(f"Failed to export relation gradient snapshot: {exc}")
+        self._record_glow_time(
+            "relation_gradient_export", time.time() - export_start
+        )
 
     def _register_partition_result(
         self, rank, step_time, reported_version=None, reported_chunk_size=0
@@ -2396,6 +2416,8 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             0, int(repartition_cfg.get("max_relations", 0))
         )
         self._train_triples_cache = None
+        self._glow_timing = defaultdict(float)
+        self._glow_timing_counts = defaultdict(int)
 
     def _glow_log(self, message: str):
         if self._glow_debug:
@@ -2404,6 +2426,18 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
     def _glow_log_verbose(self, message: str):
         if self._glow_debug_verbose:
             self.config.log(f"Glow debug: {message}")
+
+    def _log_glow_timing(self):
+        if not self._glow_timing:
+            return
+        parts = []
+        for key in sorted(self._glow_timing.keys()):
+            total = self._glow_timing[key]
+            count = self._glow_timing_counts.get(key, 0)
+            parts.append(f"{key}={total:.4f}s/{count}")
+        self.config.log("Glow timing: " + " ".join(parts))
+        self._glow_timing.clear()
+        self._glow_timing_counts.clear()
 
     def _init_in_started_process(self):
         super(GlowWorkScheduler, self)._init_in_started_process()
@@ -2453,6 +2487,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             self.work_to_do = deque(list(range(self.num_partitions)))
         self._current_window_entry = None
         self._rebuild_glow_windows(list(range(self.num_partitions)))
+
+    def _on_epoch_completed(self):
+        super(GlowWorkScheduler, self)._on_epoch_completed()
+        self._log_glow_timing()
 
     def _load_partitions(self, num_partitions):
         base_type = getattr(self.dataset, "_partition_type", "random")
@@ -3308,8 +3346,11 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             window_key = tuple(int(x) for x in partition_id)
         else:
             window_key = self._partition_to_window.pop(partition_id, None)
+        affinity_start = time.time()
         self._update_window_affinity(window_key)
+        self._record_glow_time("window_affinity", time.time() - affinity_start)
         if self.glow_bandit_enabled and partition_id is not None and window_key is not None:
+            bandit_start = time.time()
             chunk_size = kwargs.get("chunk_size") or 0
             if chunk_size <= 0:
                 chunk_size = self._adaptive_get_partition_length(partition_id) or 0
@@ -3354,6 +3395,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                     f"(reward={reward:.4f}, count={count})."
                 )
             self._sort_glow_windows()
+            self._record_glow_time("bandit_update", time.time() - bandit_start)
         if self.reshape_enabled:
             self._reshape_counter += 1
             if self._reshape_counter >= self.reshape_interval:
@@ -3362,7 +3404,9 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
 
         # Gradient-graph repartitioning should not depend on reshape being enabled.
         # Try it periodically based on gradient snapshot / export cadence.
+        repart_start = time.time()
         self._maybe_run_gradient_repartition()
+        self._record_glow_time("gradient_repartition", time.time() - repart_start)
 
     def _maybe_run_gradient_repartition(self, force: bool = False):
         """Periodically apply small repartition moves using the gradient graph.
@@ -3530,6 +3574,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             or self._partition_entities_map is None
         ):
             return None
+        start_time = time.time()
         tensors = []
         for pid in window_key:
             entries = self._partition_entities_map.get(pid)
@@ -3539,8 +3584,12 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if not tensors:
             return None
         if len(tensors) == 1:
+            self._record_glow_time("window_entities", time.time() - start_time)
             return tensors[0]
+        dedup_start = time.time()
         result = torch.unique(torch.cat(tensors))
+        self._record_glow_time("window_entities", time.time() - start_time)
+        self._record_glow_time("window_entities_dedup", time.time() - dedup_start)
         if self._glow_debug_verbose:
             self._glow_log_verbose(
                 f"Window entities key={tuple(window_key)} "
@@ -3572,6 +3621,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
     def _estimate_window_entity_count(self, window_key):
         if self._partition_entities_map is None or not window_key:
             return 0
+        start_time = time.time()
         tensors = []
         for pid in window_key:
             entries = self._partition_entities_map.get(pid)
@@ -3581,12 +3631,23 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if not tensors:
             return 0
         if len(tensors) == 1:
-            return int(tensors[0].numel())
-        return int(torch.unique(torch.cat(tensors)).numel())
+            result = int(tensors[0].numel())
+            self._record_glow_time(
+                "window_entity_estimate", time.time() - start_time
+            )
+            return result
+        dedup_start = time.time()
+        result = int(torch.unique(torch.cat(tensors)).numel())
+        self._record_glow_time("window_entity_estimate", time.time() - start_time)
+        self._record_glow_time(
+            "window_entity_estimate_dedup", time.time() - dedup_start
+        )
+        return result
 
     def _estimate_window_entity_overlap(self, window_key):
         if self._partition_entities_map is None or not window_key:
             return 0, 0, 0.0
+        start_time = time.time()
         tensors = []
         total_count = 0
         for pid in window_key:
@@ -3600,10 +3661,17 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if len(tensors) == 1:
             unique_count = int(tensors[0].numel())
         else:
+            dedup_start = time.time()
             unique_count = int(torch.unique(torch.cat(tensors)).numel())
+            self._record_glow_time(
+                "window_entity_overlap_dedup", time.time() - dedup_start
+            )
         if total_count <= 0:
             return unique_count, total_count, 0.0
         overlap_ratio = max(0.0, 1.0 - unique_count / total_count)
+        self._record_glow_time(
+            "window_entity_overlap_estimate", time.time() - start_time
+        )
         return unique_count, total_count, overlap_ratio
 
     def _maybe_reshape_partitions(self):
