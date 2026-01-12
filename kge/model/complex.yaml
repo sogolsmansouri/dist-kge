@@ -2,8 +2,8 @@ import: [lookup_embedder]
 
 complex:
   class_name: ComplEx
-  reduce_by_key: false
-  reduce_by_key_row_grads: false
+  reduce_by_key: true
+  reduce_by_key_row_grads: true
   entity_embedder:
     type: lookup_embedder
     +++: +++
