@@ -21,11 +21,12 @@ def get_min_rank(config: Config):
 
 def get_optimizer_dim(config: Config, dim):
     optimizer = config.get("train.optimizer.default.type")
-    if optimizer == "dist_sgd":
+    optimizer_key = str(optimizer).lower()
+    if optimizer_key in ["dist_sgd", "sgd"]:
         optimizer_dim = -1
-    elif optimizer == "dist_adagrad":
+    elif optimizer_key in ["dist_adagrad", "adagrad"]:
         optimizer_dim = dim
-    elif optimizer == "dist_rowadagrad":
+    elif optimizer_key in ["dist_rowadagrad", "rowadagrad"]:
         optimizer_dim = 1
     else:
         raise NotImplementedError(f"Optimizer {optimizer} not implemented in distributed setting")
@@ -34,9 +35,12 @@ def get_optimizer_dim(config: Config, dim):
 
 def get_num_meta_keys(config: Config):
     num_meta_keys = 3
-    if config.get("train.optimizer.default.type") in [
+    optimizer_key = str(config.get("train.optimizer.default.type")).lower()
+    if optimizer_key in [
         "dist_adagrad",
+        "adagrad",
         "dist_rowadagrad",
+        "rowadagrad",
     ]:
         num_meta_keys += 2
     return num_meta_keys

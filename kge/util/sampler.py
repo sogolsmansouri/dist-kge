@@ -67,6 +67,10 @@ class KgeSampler(Configurable):
         """Returns True if the sampler can operate directly on the triples' device."""
         return False
 
+    def uses_pool(self) -> bool:
+        """Returns True if the sampler relies on a resident entity pool."""
+        return False
+
     @staticmethod
     def create(
         config: Config, configuration_key: str, dataset: Dataset
@@ -92,6 +96,8 @@ class KgeSampler(Configurable):
             return KgePooledSampler(config, configuration_key, dataset)
         elif sampling_type == "batch":
             return KgeBatchSampler(config, configuration_key, dataset)
+        elif sampling_type == "cache_aware":
+            return KgeCacheAwareSampler(config, configuration_key, dataset)
         else:
             # perhaps TODO: try class with specified name -> extensibility
             raise ValueError(configuration_key + ".sampling_type")
@@ -1209,13 +1215,8 @@ class KgeHierarchicalFrequencySampler(KgeSampler):
             self._h2_sorted_indices.append(sorted_indices)
             self._h2_group_offsets.append(h2_group_offsets)
             self._h2_group_counts.append(h2_counts_counts)
-            if self.with_replacement:
-                raise NotImplementedError(
-                    "with replacement sampling not yet supported with hierarchical frequency sampling"
-                )
-            else:
-                probs = h2_counts_counts.float() / h2_counts_counts.sum()
-                self._h2_multinomials.append(probs)
+            probs = h2_counts_counts.float() / h2_counts_counts.sum()
+            self._h2_multinomials.append(probs)
 
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
         if num_samples is None:
@@ -1224,21 +1225,18 @@ class KgeHierarchicalFrequencySampler(KgeSampler):
         if num_samples == 0:
             result = torch.empty([positive_triples.size(0), num_samples])
         else:
-            if self.with_replacement:
-                raise NotImplementedError()
-            else:
-                result_1 = torch.multinomial(
-                    self._h2_multinomials[slot],
-                    positive_triples.size(0) * num_samples,
-                    replacement=True,
-                ).view(positive_triples.size(0), num_samples)
-                flat_groups = result_1.view(-1)
-                group_counts = self._h2_group_counts[slot][flat_groups]
-                group_offsets = self._h2_group_offsets[slot][flat_groups]
-                rand = torch.rand(group_counts.numel()) * group_counts.float()
-                within = rand.to(torch.long)
-                flat_result = self._h2_sorted_indices[slot][group_offsets + within]
-                result = flat_result.view(positive_triples.size(0), num_samples)
+            result_1 = torch.multinomial(
+                self._h2_multinomials[slot],
+                positive_triples.size(0) * num_samples,
+                replacement=True,
+            ).view(positive_triples.size(0), num_samples)
+            flat_groups = result_1.view(-1)
+            group_counts = self._h2_group_counts[slot][flat_groups]
+            group_offsets = self._h2_group_offsets[slot][flat_groups]
+            rand = torch.rand(group_counts.numel()) * group_counts.float()
+            within = rand.to(torch.long)
+            flat_result = self._h2_sorted_indices[slot][group_offsets + within]
+            result = flat_result.view(positive_triples.size(0), num_samples)
 
         return result
 
@@ -1385,6 +1383,9 @@ class KgeCombinedSampler(KgeSampler):
             and self.sampler_2.supports_device_sampling(positive_triples)
         )
 
+    def uses_pool(self) -> bool:
+        return self.sampler_1.uses_pool() or self.sampler_2.uses_pool()
+
     def _create_second_sampler_config(self):
         """
         Creates config object for the second sampler based on the options defined
@@ -1477,6 +1478,160 @@ class KgeCombinedSampler(KgeSampler):
             self.sampler_2.set_pool(pool, slot)
 
 
+class KgeCacheAwareSampler(KgeSampler):
+    def __init__(self, config, configuration_key, dataset):
+        super().__init__(config, configuration_key, dataset)
+        resident_fraction = float(self.get_option("cache_aware.resident_fraction"))
+        if resident_fraction < 0.0 or resident_fraction > 1.0:
+            raise ValueError(
+                "negative_sampling.cache_aware.resident_fraction must be in [0, 1]"
+            )
+        self.resident_fraction = resident_fraction
+        self.resident_sampling_type = self.get_option(
+            "cache_aware.resident_sampling_type"
+        )
+        self.background_sampling_type = self.get_option(
+            "cache_aware.background_sampling_type"
+        )
+        if (
+            config.get("job.distributed.entity_sync_level") == "partition"
+            and self.background_sampling_type != "pooled"
+        ):
+            raise ValueError(
+                "cache_aware sampling with partition sync requires "
+                "cache_aware.background_sampling_type == 'pooled'."
+            )
+        self.resident_sampler = KgeSampler._create(
+            self._create_sampler_config(self.resident_sampling_type),
+            configuration_key,
+            dataset,
+        )
+        self.background_sampler = KgeSampler._create(
+            self._create_sampler_config(self.background_sampling_type),
+            configuration_key,
+            dataset,
+        )
+
+    def _create_sampler_config(self, sampling_type: str) -> Config:
+        sampler_config = Config()
+        sampler_options = {
+            self.configuration_key: self.config.get(self.configuration_key)
+        }
+        sampler_options[self.configuration_key]["sampling_type"] = sampling_type
+        sampler_options[self.configuration_key]["combined"] = False
+        sampler_config.set_all(sampler_options, create=True)
+        return sampler_config
+
+    def supports_device_sampling(self, positive_triples: torch.Tensor) -> bool:
+        return (
+            self.resident_sampler.supports_device_sampling(positive_triples)
+            and self.background_sampler.supports_device_sampling(positive_triples)
+        )
+
+    def uses_pool(self) -> bool:
+        return self.resident_sampler.uses_pool() or self.background_sampler.uses_pool()
+
+    def _sample(
+        self, positive_triples: torch.Tensor, slot: int, num_samples: int
+    ) -> torch.Tensor:
+        num_resident = int(num_samples * self.resident_fraction)
+        num_background = num_samples - num_resident
+        if num_resident <= 0:
+            return self.background_sampler._sample(
+                positive_triples, slot, num_background
+            )
+        if num_background <= 0:
+            return self.resident_sampler._sample(
+                positive_triples, slot, num_resident
+            )
+        negatives_resident = self.resident_sampler._sample(
+            positive_triples, slot, num_resident
+        )
+        negatives_background = self.background_sampler._sample(
+            positive_triples, slot, num_background
+        )
+        return torch.cat((negatives_resident, negatives_background), dim=1)
+
+    def _sample_shared(
+        self, positive_triples: torch.Tensor, slot: int, num_samples: int
+    ) -> "BatchNegativeSample":
+        num_resident = int(num_samples * self.resident_fraction)
+        num_background = num_samples - num_resident
+        if num_resident <= 0:
+            return self.background_sampler._sample_shared(
+                positive_triples, slot, num_background
+            )
+        if num_background <= 0:
+            return self.resident_sampler._sample_shared(
+                positive_triples, slot, num_resident
+            )
+        batch_negative_resident = self.resident_sampler._sample_shared(
+            positive_triples, slot, num_resident
+        )
+        batch_negative_background = self.background_sampler._sample_shared(
+            positive_triples, slot, num_background
+        )
+        return CombinedSharedBatchNegativeSample(
+            config=self.config,
+            configuration_key=self.configuration_key,
+            positive_triples=positive_triples,
+            slot=slot,
+            num_samples=num_samples,
+            batch_negative_sample_1=batch_negative_resident,
+            batch_negative_sample_2=batch_negative_background,
+        )
+
+    def _filter_and_resample(
+        self, negative_samples: torch.Tensor, slot: int, positive_triples: torch.Tensor
+    ) -> torch.Tensor:
+        return self._handle_filtering(
+            negative_samples, slot, positive_triples, implementation="standard"
+        )
+
+    def _filter_and_resample_fast(
+        self, negative_samples: torch.Tensor, slot: int, positive_triples: torch.Tensor
+    ) -> torch.Tensor:
+        return self._handle_filtering(
+            negative_samples, slot, positive_triples, implementation="fast"
+        )
+
+    def _handle_filtering(
+        self,
+        negative_samples: torch.Tensor,
+        slot: int,
+        positive_triples: torch.Tensor,
+        implementation="standard",
+    ) -> torch.Tensor:
+        if implementation == "fast":
+            filter_function_name = "_filter_and_resample_fast"
+        else:
+            filter_function_name = "_filter_and_resample"
+        num_samples = negative_samples.shape[1]
+        num_resident = int(num_samples * self.resident_fraction)
+        num_background = num_samples - num_resident
+        if num_resident <= 0:
+            return self.background_sampler.__getattribute__(filter_function_name)(
+                negative_samples, slot, positive_triples
+            )
+        if num_background <= 0:
+            return self.resident_sampler.__getattribute__(filter_function_name)(
+                negative_samples, slot, positive_triples
+            )
+        negative_resident = self.resident_sampler.__getattribute__(filter_function_name)(
+            negative_samples[:, :num_resident], slot, positive_triples
+        )
+        negative_background = self.background_sampler.__getattribute__(
+            filter_function_name
+        )(negative_samples[:, num_resident:], slot, positive_triples)
+        return torch.cat((negative_resident, negative_background), dim=1)
+
+    def set_pool(self, pool: torch.Tensor, slot: int):
+        if hasattr(self.resident_sampler, "set_pool"):
+            self.resident_sampler.set_pool(pool, slot)
+        if hasattr(self.background_sampler, "set_pool"):
+            self.background_sampler.set_pool(pool, slot)
+
+
 class KgePooledSampler(KgeSampler):
     def __init__(self, config, configuration_key, dataset):
         super().__init__(config, configuration_key, dataset)
@@ -1506,6 +1661,9 @@ class KgePooledSampler(KgeSampler):
                 continue
             if self.sample_pools_device.get(slot) is None:
                 return False
+        return True
+
+    def uses_pool(self) -> bool:
         return True
 
     def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):

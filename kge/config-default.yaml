@@ -560,6 +560,7 @@ negative_sampling:
   #              frequency in the corresponding slot in the training data
   # - batch    : samples entities/relations for corruption from the corresponding slot
   #              inside the batch
+  # - cache_aware: mix resident (pooled) negatives with a background sampler
   sampling_type: uniform
 
   # Options for sampling type frequency (negative_sampling.sampling_type=="frequency")
@@ -627,6 +628,15 @@ negative_sampling:
     shared_type: naive
     # Whether sampling should be performed with replacement
     with_replacement: True
+
+  # Cache-aware negative sampling options (sampling_type == "cache_aware")
+  cache_aware:
+    # Fraction of negatives drawn from the resident (pooled) sampler.
+    resident_fraction: 0.5
+    # Sampling type used for resident entities (usually pooled).
+    resident_sampling_type: pooled
+    # Sampling type for the remaining negatives (uniform or pooled).
+    background_sampling_type: uniform
 
   # Implementation to use for the negative sampling job. Possible values are:
   # - triple: Scores every positive and negative triple in the batch separately.

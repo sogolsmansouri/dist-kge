@@ -195,6 +195,28 @@ class WorkScheduler(mp.get_context("fork").Process):
         self._gradient_graph_cluster_members = {}
         self._gradient_updates = 0
         self._last_gradient_snapshot = 0
+        self.partition_issue_versions = defaultdict(int)
+        self.partition_committed_versions = defaultdict(lambda: -1)
+        self.active_partition_versions = dict()
+        if config.get("job.distributed.scheduler_data_type") not in [
+            "int",
+            "int32",
+            "int64",
+            "long",
+        ]:
+            raise ValueError(
+                "Only long and int is supported as dtype for the scheduler communication"
+            )
+        self.data_type = getattr(
+            torch, config.get("job.distributed.scheduler_data_type")
+        )
+        if self.repartition_epoch:
+            self.repartition_future = None
+            self.repartition_worker_pool = None
+        # map complex partition identifiers (e.g., tuples) to scalar aliases for IPC
+        self._partition_alias_lookup = {}
+        self._alias_to_partition = {}
+        self._next_partition_alias = -2
 
     def _record_glow_time(self, key: str, elapsed: float):
         timing = getattr(self, "_glow_timing", None)
@@ -203,19 +225,6 @@ class WorkScheduler(mp.get_context("fork").Process):
             return
         timing[key] += float(elapsed)
         counts[key] += 1
-        self.partition_issue_versions = defaultdict(int)
-        self.partition_committed_versions = defaultdict(lambda: -1)
-        self.active_partition_versions = dict()
-        if config.get("job.distributed.scheduler_data_type") not in ["int", "int32", "int64", "long"]:
-            raise ValueError("Only long and int is supported as dtype for the scheduler communication")
-        self.data_type = getattr(torch, config.get("job.distributed.scheduler_data_type"))
-        if self.repartition_epoch:
-            self.repartition_future = None
-            self.repartition_worker_pool = None
-        # map complex partition identifiers (e.g., tuples) to scalar aliases for IPC
-        self._partition_alias_lookup = {}
-        self._alias_to_partition = {}
-        self._next_partition_alias = -2
 
     def _init_in_started_process(self):
         self.partitions = self._load_partitions(self.num_partitions)
@@ -348,9 +357,22 @@ class WorkScheduler(mp.get_context("fork").Process):
         return True
 
     def _config_check(self, config):
-        if (
+        sampling_type = config.get("negative_sampling.sampling_type")
+        if sampling_type == "cache_aware":
+            background = config.get(
+                "negative_sampling.cache_aware.background_sampling_type"
+            )
+            if (
+                config.get("job.distributed.entity_sync_level") == "partition"
+                and background != "pooled"
+            ):
+                raise ValueError(
+                    "entity sync level 'partition' only supports cache_aware "
+                    "sampling when background_sampling_type == 'pooled'."
+                )
+        elif (
             config.get("job.distributed.entity_sync_level") == "partition"
-            and not config.get("negative_sampling.sampling_type") == "pooled"
+            and sampling_type != "pooled"
         ):
             raise ValueError(
                 "entity sync level 'partition' only supported with 'pooled' sampling."
@@ -2255,7 +2277,10 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._send_window_entities = bool(
             glow_cfg.get("prefetch_window_entities", False)
             or self.glow_overlap_sampling
-            or (ns_sampling_type == "pooled" and entity_sync_level != "partition")
+            or (
+                ns_sampling_type in ("pooled", "cache_aware")
+                and entity_sync_level != "partition"
+            )
         )
         self.glow_affinity_alpha = float(glow_cfg.get("affinity_alpha", 0.3))
         self.glow_affinity_alpha = min(0.999, max(0.0, self.glow_affinity_alpha))

@@ -19,6 +19,9 @@ class ReciprocalRelationsModel(KgeModel):
         dataset: Dataset,
         configuration_key=None,
         init_for_load_only=False,
+        create_embedders=True,
+        parameter_client=None,
+        max_partition_entities=0,
     ):
         self._init_configuration(config, configuration_key)
 
@@ -35,6 +38,9 @@ class ReciprocalRelationsModel(KgeModel):
             dataset=alt_dataset,
             configuration_key=self.configuration_key + ".base_model",
             init_for_load_only=init_for_load_only,
+            create_embedders=True,
+            parameter_client=parameter_client,
+            max_partition_entities=max_partition_entities,
         )
 
         # Initialize this model
@@ -44,6 +50,8 @@ class ReciprocalRelationsModel(KgeModel):
             scorer=base_model.get_scorer(),
             create_embedders=False,
             init_for_load_only=init_for_load_only,
+            parameter_client=parameter_client,
+            max_partition_entities=max_partition_entities,
         )
         self._base_model = base_model
         # TODO change entity_embedder assignment to sub and obj embedders when support

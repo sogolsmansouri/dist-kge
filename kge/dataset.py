@@ -233,7 +233,17 @@ class Dataset(Configurable):
                 triples_np = triples_np.astype(np.int32, copy=False)
             if not triples_np.flags.writeable:
                 triples_np = np.array(triples_np, copy=True)
-            return torch.from_numpy(triples_np)
+            triples = torch.from_numpy(triples_np)
+            if use_pickle:
+                pickle_suffix = Dataset._to_valid_filename(f"-{delimiter}.pckl")
+                pickle_filename = filename + pickle_suffix
+                newest_mtime = Dataset._get_newest_mtime(None, filename)
+                if (
+                    not os.path.isfile(pickle_filename)
+                    or os.path.getmtime(pickle_filename) <= newest_mtime
+                ):
+                    Dataset._pickle_dump_atomic(triples, pickle_filename)
+            return triples
 
         if use_pickle:
             # check if there is a pickled, up-to-date version of the file

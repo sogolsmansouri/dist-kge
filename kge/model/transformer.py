@@ -114,6 +114,9 @@ class Transformer(KgeModel):
         dataset: Dataset,
         configuration_key=None,
         init_for_load_only=False,
+        create_embedders=True,
+        parameter_client=None,
+        max_partition_entities=0,
     ):
         self._init_configuration(config, configuration_key)
         super().__init__(
@@ -122,6 +125,9 @@ class Transformer(KgeModel):
             scorer=TransformerScorer(config, dataset, self.configuration_key),
             configuration_key=self.configuration_key,
             init_for_load_only=init_for_load_only,
+            create_embedders=create_embedders,
+            parameter_client=parameter_client,
+            max_partition_entities=max_partition_entities,
         )
 
     def score_spo(self, s: Tensor, p: Tensor, o: Tensor, direction=None) -> Tensor:

@@ -12,6 +12,7 @@ from pathlib import Path
 from collections import defaultdict, deque
 from typing import Dict, Any, Optional
 
+from kge import Config
 from kge.job import Job
 from kge.job.train import TrainingJob, _generate_worker_init_fn
 from kge.job.train_negative_sampling import TrainingJobNegativeSampling
@@ -257,8 +258,6 @@ class BatchDataset(torch.utils.data.Dataset):
         return self.triples[sample_indices, :]
 
     def fetch_triples_device(self, sample_indices: torch.Tensor):
-        if not self._staged_local_ids:
-            return None
         staged_device = self._slice_staged_view(sample_indices, on_device=True)
         if staged_device is not None:
             return staged_device
@@ -457,6 +456,23 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self.relation_sync_level = self.config.get(
             "job.distributed.relation_sync_level"
         )
+        if (
+            self.entity_sync_level == "partition"
+            and self.relation_sync_level != "partition"
+        ):
+            if self.config.get("train.auto_correct"):
+                self.config.set(
+                    "job.distributed.relation_sync_level",
+                    "partition",
+                    overwrite=Config.Overwrite.Yes,
+                    log=True,
+                )
+                self.relation_sync_level = "partition"
+            else:
+                self.config.log(
+                    "Relation sync level is not partition while entity sync is "
+                    "partition; relation updates will use the batch/PS path."
+                )
         # DistAdagrad pushes sparse updates per step only for batch-level sync.
         # When using partition-level sync, we must write back the pulled embeddings.
         has_partition_sync = (
@@ -796,7 +812,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
         # initializing dataloader as soon as we got the triples from work scheduler
         self.loader = None
-        if self.config.get("negative_sampling.sampling_type") == "pooled":
+        if self._sampler.uses_pool():
             if self.local_entities is None:
                 self.local_entities = self.work_scheduler_client.get_local_entities()
                 self.parameter_client.localize(self.local_entities)
@@ -2250,10 +2266,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self._prefetch_glow_window_entities(work_entities) or 0.0
             )
 
-            if (
-                work_entities is not None
-                and self.config.get("negative_sampling.sampling_type") == "pooled"
-            ):
+            if work_entities is not None and self._sampler.uses_pool():
                 pool_entities = (
                     pool_entities if pool_entities is not None else work_entities
                 )

@@ -5,6 +5,7 @@ from torch.optim.optimizer import Optimizer
 from copy import deepcopy
 
 from kge.util.triton_fused import fused_embedding_optimizer_update
+from kge.util.row_grad_cache import pop_row_grad
 
 
 class DistAdagrad(Optimizer):
@@ -38,7 +39,7 @@ class DistAdagrad(Optimizer):
         parameter_client=None,
         lapse_indexes=None,
         lapse_optimizer_index_offset=0,
-        async_write_back=[],
+        async_write_back=None,
         is_row=False,
         use_lr_scheduler=False,
         min_rank=-1,
@@ -66,7 +67,11 @@ class DistAdagrad(Optimizer):
         self.lapse_optimizer_index_offset = lapse_optimizer_index_offset
         self.lapse_indexes = lapse_indexes
         self.pulled_parameters = [None, None]
-        self.async_write_back = async_write_back
+        if async_write_back is None:
+            async_write_back = (False, False)
+        if len(async_write_back) < 2:
+            async_write_back = tuple(async_write_back) + (False, False)
+        self.async_write_back = tuple(async_write_back)
         self._async_write_back_map = {
             "entity": bool(async_write_back[0]) if len(async_write_back) > 0 else True,
             "relation": bool(async_write_back[1]) if len(async_write_back) > 1 else True,
@@ -159,10 +164,18 @@ class DistAdagrad(Optimizer):
 
         for group in self.param_groups:
             for i, p in enumerate(group["params"]):
-                if p.grad is None:
-                    continue
-
                 grad = p.grad
+                row_grad = None
+                cached = pop_row_grad(p)
+                if cached is not None and grad is not None:
+                    raise RuntimeError(
+                        "Found both cached row grads and p.grad for a parameter. "
+                        "Ensure cache_row_grads returns None grads."
+                    )
+                if cached is not None:
+                    row_grad = cached
+                elif grad is None:
+                    continue
                 state = self.state[p]
                 if group["lr_decay"] > 0:
                     # we only need to synchronize steps between workers if we actually
@@ -178,7 +191,7 @@ class DistAdagrad(Optimizer):
                     group["lr"] = self.parameter_client.get_lr(group["name"])
 
                 if group["weight_decay"] != 0:
-                    if p.grad.is_sparse:
+                    if grad is None or grad.is_sparse:
                         raise RuntimeError(
                             "weight_decay option is not compatible with sparse gradients"
                         )
@@ -186,94 +199,167 @@ class DistAdagrad(Optimizer):
 
                 clr = group["lr"] / (1 + (state["step"] - 1) * group["lr_decay"])
 
-                if grad.is_sparse:
-                    grad = (
-                        grad.coalesce()
-                    )  # the update is non-linear so indices must be unique
+                if row_grad is not None:
+                    grad_indices, grad_values = row_grad
+                    size = p.size()
+                else:
+                    if grad is None or not grad.is_sparse:
+                        raise ValueError(
+                            "Currently only sparse parameters supported with dist_adagrad and dist_rowadagrad"
+                        )
+                    if hasattr(grad, "is_coalesced") and not grad.is_coalesced():
+                        grad = grad.coalesce()
                     grad_indices = grad._indices()[0]
                     # grad_indices_flat = grad_indices.flatten()
                     grad_values = grad._values()
                     size = grad.size()
 
-                    # pull the current internal optimizer parameters
-                    state_sum = group["optimizer_values"][grad_indices]
-
-                    if not self.is_row:
-                        sum_update_values = grad_values.pow(2)
-                    else:
-                        sum_update_values = grad_values.pow(2).mean(1).view(-1, 1)
-                    state_sum.add_(sum_update_values)
-                    # std = state["sum"].sparse_mask(grad)
-                    # std_values = std._values().sqrt_().add_(group["eps"])
-                    std_values = state_sum.sqrt().add_(group["eps"])
-                    update_value = (grad_values / std_values).mul_(-clr)
-                    if group["sync_level"] == "batch":
-                        update_indexes = grad_indices.cpu()
-                        push_keys = group["local_to_lapse_mapper"][update_indexes]
-                        num_keys = getattr(self.parameter_client, "num_keys", None)
-                        if num_keys is None and hasattr(self.parameter_client, "parameters"):
-                            try:
-                                num_keys = int(self.parameter_client.parameters.size(0))
-                            except Exception:
-                                num_keys = None
-                        if num_keys is not None:
-                            valid_mask = (push_keys >= 0) & (push_keys < num_keys)
-                        else:
-                            valid_mask = push_keys >= 0
-                        if not torch.all(valid_mask):
-                            invalid_count = int((~valid_mask).sum().item())
-                            if invalid_count > 0 and not getattr(self, "_invalid_push_logged", False):
-                                msg = (
-                                    "Skipping optimizer updates with invalid PS keys "
-                                    f"(count={invalid_count})."
-                                )
-                                if hasattr(self.parameter_client, "config"):
-                                    self.parameter_client.config.log(msg)
-                                else:
-                                    print(msg)
-                                self._invalid_push_logged = True
-                            if not valid_mask.any():
-                                continue
-                            valid_idx = valid_mask.nonzero(as_tuple=False).view(-1)
-                            if update_value.is_cuda:
-                                valid_idx_dev = valid_idx.to(update_value.device)
-                            else:
-                                valid_idx_dev = valid_idx
-                            push_keys = push_keys[valid_idx]
-                            update_value = update_value[valid_idx_dev]
-                            sum_update_values = sum_update_values[valid_idx_dev]
-                        payload_buffer = self._acquire_push_buffer(
-                            group["name"], len(update_value)
-                        )
-                        payload = payload_buffer[: len(update_value)]
-                        self._pack_push_payload(
-                            payload, update_value, sum_update_values
-                        )
-                        wait_value = self._push_with_context(
-                            group["name"],
-                            push_keys,
-                            payload,
-                            asynchronous=self._async_write_back_map[group["name"]],
-                        )
-                        self._enqueue_wait(group["name"], wait_value, payload_buffer)
-                        self._record_partition_push(
-                            group["name"],
-                            push_keys.clone(),
-                            payload[: len(update_value)].clone(),
-                        )
-                    else:
-                        fused_embedding_optimizer_update(
-                            p.data,
-                            group["optimizer_values"],
-                            grad_indices,
-                            update_value,
-                            state_sum,
-                        )
-                    # p.add_(make_sparse(grad_values / std_values), alpha=-clr)
-                else:
-                    raise ValueError(
-                        "Currently only sparse parameters supported with dist_adagrad and dist_rowadagrad"
+                if grad_indices.numel() == 0:
+                    continue
+                opt_values = group["optimizer_values"]
+                if opt_values.device != grad_indices.device:
+                    raise RuntimeError(
+                        "optimizer_values and gradient indices must be on the same "
+                        f"device (optimizer_values={opt_values.device}, "
+                        f"grad_indices={grad_indices.device})."
                     )
+
+                # pull the current internal optimizer parameters
+                state_sum = opt_values[grad_indices]
+
+                if not self.is_row:
+                    sum_update_values = grad_values.pow(2)
+                else:
+                    sum_update_values = grad_values.pow(2).mean(1).view(-1, 1)
+                state_sum.add_(sum_update_values)
+                # std = state["sum"].sparse_mask(grad)
+                # std_values = std._values().sqrt_().add_(group["eps"])
+                std_values = state_sum.sqrt().add_(group["eps"])
+                update_value = (grad_values / std_values).mul_(-clr)
+                sync_level = group.get("sync_level", None)
+                if not hasattr(self, "_sync_level_logged"):
+                    self._sync_level_logged = set()
+                group_name = group.get("name", "unknown")
+                if group_name not in self._sync_level_logged:
+                    path = "ps_push" if sync_level == "batch" else "local_fused"
+                    print(
+                        f"DistAdagrad group={group_name} "
+                        f"sync_level={sync_level} path={path}"
+                    )
+                    self._sync_level_logged.add(group_name)
+                if sync_level == "batch":
+                    update_indexes = grad_indices
+                    if update_indexes.device.type != "cpu":
+                        update_indexes = update_indexes.cpu()
+                    mapper = group.get("_lapse_mapper_cpu")
+                    if mapper is None:
+                        mapper = group.get("local_to_lapse_mapper")
+                        if mapper is None:
+                            raise RuntimeError(
+                                "Missing local_to_lapse_mapper for batch sync."
+                            )
+                        if not isinstance(mapper, torch.Tensor):
+                            mapper = torch.as_tensor(
+                                mapper, dtype=torch.long, device="cpu"
+                            )
+                        else:
+                            if mapper.dtype != torch.long:
+                                mapper = mapper.long()
+                            if mapper.device.type != "cpu":
+                                mapper = mapper.cpu()
+                        group["_lapse_mapper_cpu"] = mapper
+                    if update_indexes.numel() == 0:
+                        continue
+                    mapper_size = int(mapper.numel())
+                    if mapper_size == 0:
+                        continue
+                    valid_idx_mask = update_indexes < mapper_size
+                    if not torch.all(valid_idx_mask):
+                        invalid_count = int((~valid_idx_mask).sum().item())
+                        if invalid_count > 0 and not getattr(
+                            self, "_invalid_mapper_logged", False
+                        ):
+                            msg = (
+                                "Skipping optimizer updates with out-of-range "
+                                f"local_to_lapse_mapper indices "
+                                f"(count={invalid_count})."
+                            )
+                            if hasattr(self.parameter_client, "config"):
+                                self.parameter_client.config.log(msg)
+                            else:
+                                print(msg)
+                            self._invalid_mapper_logged = True
+                        if not valid_idx_mask.any():
+                            continue
+                        valid_idx = valid_idx_mask.nonzero(as_tuple=False).view(-1)
+                        update_indexes = update_indexes.index_select(0, valid_idx)
+                        if update_value.is_cuda:
+                            valid_idx_dev = valid_idx.to(update_value.device)
+                        else:
+                            valid_idx_dev = valid_idx
+                        update_value = update_value.index_select(0, valid_idx_dev)
+                        sum_update_values = sum_update_values.index_select(
+                            0, valid_idx_dev
+                        )
+                    push_keys = mapper.index_select(0, update_indexes)
+                    num_keys = getattr(self.parameter_client, "num_keys", None)
+                    if num_keys is None and hasattr(self.parameter_client, "parameters"):
+                        try:
+                            num_keys = int(self.parameter_client.parameters.size(0))
+                        except Exception:
+                            num_keys = None
+                    if num_keys is not None:
+                        valid_mask = (push_keys >= 0) & (push_keys < num_keys)
+                    else:
+                        valid_mask = push_keys >= 0
+                    if not torch.all(valid_mask):
+                        invalid_count = int((~valid_mask).sum().item())
+                        if invalid_count > 0 and not getattr(self, "_invalid_push_logged", False):
+                            msg = (
+                                "Skipping optimizer updates with invalid PS keys "
+                                f"(count={invalid_count})."
+                            )
+                            if hasattr(self.parameter_client, "config"):
+                                self.parameter_client.config.log(msg)
+                            else:
+                                print(msg)
+                            self._invalid_push_logged = True
+                        if not valid_mask.any():
+                            continue
+                        valid_idx = valid_mask.nonzero(as_tuple=False).view(-1)
+                        if update_value.is_cuda:
+                            valid_idx_dev = valid_idx.to(update_value.device)
+                        else:
+                            valid_idx_dev = valid_idx
+                        push_keys = push_keys[valid_idx]
+                        update_value = update_value[valid_idx_dev]
+                        sum_update_values = sum_update_values[valid_idx_dev]
+                    payload_buffer = self._acquire_push_buffer(
+                        group["name"], len(update_value)
+                    )
+                    payload = payload_buffer[: len(update_value)]
+                    self._pack_push_payload(payload, update_value, sum_update_values)
+                    wait_value = self._push_with_context(
+                        group["name"],
+                        push_keys,
+                        payload,
+                        asynchronous=self._async_write_back_map[group["name"]],
+                    )
+                    self._enqueue_wait(group["name"], wait_value, payload_buffer)
+                    self._record_partition_push(
+                        group["name"],
+                        push_keys.clone(),
+                        payload[: len(update_value)].clone(),
+                    )
+                else:
+                    fused_embedding_optimizer_update(
+                        p.data,
+                        group["optimizer_values"],
+                        grad_indices,
+                        update_value,
+                        state_sum,
+                    )
+                # p.add_(make_sparse(grad_values / std_values), alpha=-clr)
 
         return loss
 
