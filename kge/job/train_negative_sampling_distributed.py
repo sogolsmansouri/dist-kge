@@ -188,6 +188,8 @@ class BatchDataset(torch.utils.data.Dataset):
             self._ensure_materialized_buffer(len(samples))
             dataset_indices = samples.to(self.triples.device)
             partition_triples = self.triples.index_select(0, dataset_indices)
+            if partition_triples.dtype != torch.long:
+                partition_triples = partition_triples.to(dtype=torch.long)
             if stage_local_ids and entity_mapper is not None:
                 partition_triples[:, S] = entity_mapper[partition_triples[:, S]]
                 partition_triples[:, O] = entity_mapper[partition_triples[:, O]]
