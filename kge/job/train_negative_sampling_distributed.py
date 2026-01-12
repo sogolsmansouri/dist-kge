@@ -460,19 +460,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.entity_sync_level == "partition"
             and self.relation_sync_level != "partition"
         ):
-            if self.config.get("train.auto_correct"):
-                self.config.set(
-                    "job.distributed.relation_sync_level",
-                    "partition",
-                    overwrite=Config.Overwrite.Yes,
-                    log=True,
-                )
-                self.relation_sync_level = "partition"
-            else:
-                self.config.log(
-                    "Relation sync level is not partition while entity sync is "
-                    "partition; relation updates will use the batch/PS path."
-                )
+            self.config.log(
+                "Relation sync level is not partition while entity sync is "
+                "partition; relation updates will use the batch/PS path. "
+                "If you want relation partitioning, set "
+                "job.distributed.relation_sync_level=partition before starting "
+                "the scheduler."
+            )
         # DistAdagrad pushes sparse updates per step only for batch-level sync.
         # When using partition-level sync, we must write back the pulled embeddings.
         has_partition_sync = (
