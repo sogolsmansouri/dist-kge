@@ -3,7 +3,7 @@ import: [lookup_embedder]
 complex:
   class_name: ComplEx
   reduce_by_key: true
-  reduce_by_key_row_grads: true
+  reduce_by_key_row_grads: false
   entity_embedder:
     type: lookup_embedder
     +++: +++

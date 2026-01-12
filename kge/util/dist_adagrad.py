@@ -167,11 +167,6 @@ class DistAdagrad(Optimizer):
                 grad = p.grad
                 row_grad = None
                 cached = pop_row_grad(p)
-                if cached is not None and grad is not None:
-                    raise RuntimeError(
-                        "Found both cached row grads and p.grad for a parameter. "
-                        "Ensure cache_row_grads returns None grads."
-                    )
                 if cached is not None:
                     row_grad = cached
                 elif grad is None:

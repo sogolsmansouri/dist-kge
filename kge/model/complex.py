@@ -133,13 +133,6 @@ class ComplEx(KgeModel):
             if self._reduce_by_key:
                 if reduce_by_key_row_grads:
                     self._cache_row_grads = True
-                else:
-                    try:
-                        opt_type = config.get("train.optimizer.default.type")
-                    except Exception:
-                        opt_type = None
-                    if opt_type in ("dist_adagrad", "dist_rowadagrad"):
-                        self._cache_row_grads = True
 
     def _reduce_by_key_enabled(self) -> bool:
         if not self._reduce_by_key:

@@ -197,9 +197,21 @@ class _ComplExScoreSpoReduceFn(torch.autograd.Function):
             store_row_grad(ctx.s_weight_ref, s_rows, s_values)
             store_row_grad(ctx.p_weight_ref, p_rows, p_values)
             store_row_grad(ctx.o_weight_ref, o_rows, o_values)
-            grad_s_weight = None
-            grad_p_weight = None
-            grad_o_weight = None
+            grad_s_weight = torch.sparse_coo_tensor(
+                s_rows.unsqueeze(0),
+                s_values,
+                size=ctx.s_weight_shape,
+            ).coalesce()
+            grad_p_weight = torch.sparse_coo_tensor(
+                p_rows.unsqueeze(0),
+                p_values,
+                size=ctx.p_weight_shape,
+            ).coalesce()
+            grad_o_weight = torch.sparse_coo_tensor(
+                o_rows.unsqueeze(0),
+                o_values,
+                size=ctx.o_weight_shape,
+            ).coalesce()
         else:
             grad_s_weight = _reduce_by_key(s_idx, grad_s, ctx.s_weight_shape[0])
             grad_p_weight = _reduce_by_key(p_idx, grad_p, ctx.p_weight_shape[0])
@@ -333,9 +345,21 @@ class _ComplExScoreSpReduceFn(torch.autograd.Function):
             store_row_grad(ctx.s_weight_ref, s_rows, s_values)
             store_row_grad(ctx.p_weight_ref, p_rows, p_values)
             store_row_grad(ctx.o_weight_ref, o_rows, o_values)
-            grad_s_weight = None
-            grad_p_weight = None
-            grad_o_weight = None
+            grad_s_weight = torch.sparse_coo_tensor(
+                s_rows.unsqueeze(0),
+                s_values,
+                size=ctx.s_weight_shape,
+            ).coalesce()
+            grad_p_weight = torch.sparse_coo_tensor(
+                p_rows.unsqueeze(0),
+                p_values,
+                size=ctx.p_weight_shape,
+            ).coalesce()
+            grad_o_weight = torch.sparse_coo_tensor(
+                o_rows.unsqueeze(0),
+                o_values,
+                size=ctx.o_weight_shape,
+            ).coalesce()
         else:
             grad_s_weight = _reduce_by_key(s_idx, grad_s, ctx.s_weight_shape[0])
             grad_p_weight = _reduce_by_key(p_idx, grad_p, ctx.p_weight_shape[0])
@@ -471,9 +495,21 @@ class _ComplExScorePoReduceFn(torch.autograd.Function):
             store_row_grad(ctx.p_weight_ref, p_rows, p_values)
             store_row_grad(ctx.o_weight_ref, o_rows, o_values)
             store_row_grad(ctx.s_weight_ref, s_rows, s_values)
-            grad_p_weight = None
-            grad_o_weight = None
-            grad_s_weight = None
+            grad_p_weight = torch.sparse_coo_tensor(
+                p_rows.unsqueeze(0),
+                p_values,
+                size=ctx.p_weight_shape,
+            ).coalesce()
+            grad_o_weight = torch.sparse_coo_tensor(
+                o_rows.unsqueeze(0),
+                o_values,
+                size=ctx.o_weight_shape,
+            ).coalesce()
+            grad_s_weight = torch.sparse_coo_tensor(
+                s_rows.unsqueeze(0),
+                s_values,
+                size=ctx.s_weight_shape,
+            ).coalesce()
         else:
             grad_p_weight = _reduce_by_key(p_idx, grad_p, ctx.p_weight_shape[0])
             grad_o_weight = _reduce_by_key(o_idx, grad_o, ctx.o_weight_shape[0])
