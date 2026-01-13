@@ -104,6 +104,7 @@ class ComplEx(KgeModel):
         )
         self._reduce_by_key = False
         self._cache_row_grads = False
+        self._reduce_by_key_logged = False
         if config is not None:
             try:
                 self._reduce_by_key = bool(config.get("complex.reduce_by_key"))
@@ -148,6 +149,12 @@ class ComplEx(KgeModel):
             return False
         if not getattr(o_embedder, "sparse", False):
             return False
+        if not self._reduce_by_key_logged and self.config is not None:
+            self.config.log(
+                "ComplEx reduce_by_key active "
+                f"(cache_row_grads={self._cache_row_grads})."
+            )
+            self._reduce_by_key_logged = True
         return True
 
     def score_spo(self, s: torch.Tensor, p: torch.Tensor, o: torch.Tensor, direction=None) -> torch.Tensor:

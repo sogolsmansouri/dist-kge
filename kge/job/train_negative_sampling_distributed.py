@@ -3144,7 +3144,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 f(self)
 
         epoch_time = time.time() - epoch_start_time
-        epoch_loss_divisor = max(1, total_examples)
+        epoch_loss_divisor = max(1, self.num_examples)
         epoch_penalty_divisor = max(1, total_batches)
         duplication_factor = (
             (total_examples / self.num_examples) if self.num_examples > 0 else 0.0
