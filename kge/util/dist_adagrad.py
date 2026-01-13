@@ -367,7 +367,8 @@ class DistAdagrad(Optimizer):
                         group["name"], len(update_value)
                     )
                     payload = payload_buffer[: len(update_value)]
-                    self._pack_push_payload(payload, update_value, state_sum)
+                    # Push accumulator delta since PS applies updates additively.
+                    self._pack_push_payload(payload, update_value, sum_update_values)
                     wait_value = self._push_with_context(
                         group["name"],
                         push_keys,

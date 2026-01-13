@@ -499,6 +499,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         )
         self._gradient_log_interval = 0
         self._gradient_log_top_relations = 0
+        self._neg_sample_log_interval = 0
+        self._other_time_log_interval = 0
         try:
             self._gradient_log_interval = int(
                 self.config.get("job.distributed.gradient_trace_log_interval")
@@ -517,6 +519,22 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
         except KeyError:
             self._gradient_log_top_relations = 0
+        try:
+            self._neg_sample_log_interval = int(
+                self.config.get("job.distributed.negative_sampling_log_interval")
+            )
+        except KeyError:
+            self._neg_sample_log_interval = 0
+        if 0 < self._neg_sample_log_interval < 1:
+            self._neg_sample_log_interval = 1
+        try:
+            self._other_time_log_interval = int(
+                self.config.get("job.distributed.other_time_log_interval")
+            )
+        except KeyError:
+            self._other_time_log_interval = 0
+        if 0 < self._other_time_log_interval < 1:
+            self._other_time_log_interval = 1
         self._last_partition_grad_summary = None
         self._relation_grad_sum = None
         self._relation_grad_count = None
@@ -2276,6 +2294,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self._reset_partition_gradient_trace()
             local_partition_counter += 1
             chunk_index = local_partition_counter
+            hook_time = 0.0
+            trace_time = 0.0
+            push_back_time = 0.0
+            grad_accum_time = 0.0
             self.work_pre_localized = False
             partition_start_time = time.time()
             entity_pull_ids = work_entities
@@ -2420,6 +2442,49 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self._sampler.vocabulary_size[O] = local_entities_count
                 if work_relations is not None:
                     self._sampler.vocabulary_size[P] = len(work_relations)
+            if (
+                self._neg_sample_log_interval > 0
+                and local_partition_counter % self._neg_sample_log_interval == 0
+            ):
+                window_members = None
+                if self._current_window_members is not None:
+                    try:
+                        window_members = [
+                            int(x) for x in self._current_window_members.tolist()
+                        ]
+                    except Exception:
+                        window_members = str(self._current_window_members)
+                window_entities_count = (
+                    int(self._current_window_entities.numel())
+                    if self._current_window_entities is not None
+                    else 0
+                )
+                work_entities_count = (
+                    int(work_entities.numel()) if work_entities is not None else 0
+                )
+                pool_entities_count = (
+                    int(pool_entities.numel()) if pool_entities is not None else 0
+                )
+                pull_entities_count = (
+                    int(entity_pull_ids.numel())
+                    if entity_pull_ids is not None
+                    else 0
+                )
+                sampling_type = self.config.get("negative_sampling.sampling_type")
+                self.config.log(
+                    "NegSampling stats: "
+                    f"partition={self._current_partition_id} "
+                    f"window_members={window_members} "
+                    f"window_entities={window_entities_count} "
+                    f"work_entities={work_entities_count} "
+                    f"pool_entities={pool_entities_count} "
+                    f"pull_entities={pull_entities_count} "
+                    f"vocab_s={int(self._sampler.vocabulary_size[S])} "
+                    f"vocab_o={int(self._sampler.vocabulary_size[O])} "
+                    f"stage_local_ids={bool(self._stage_local_ids)} "
+                    f"sampling_type={sampling_type} "
+                    f"uses_pool={bool(self._sampler.uses_pool())}"
+                )
             self.dataloader_dataset.set_samples(
                 work,
                 self.epoch,
@@ -2571,8 +2636,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     )
 
                 # run the pre-batch hooks (may update the trace)
+                hook_time -= time.time()
                 for f in self.pre_batch_hooks:
                     f(self, batch_index)
+                hook_time += time.time()
 
                 # process batch (preprocessing + forward pass + backward pass on loss)
                 batch_result: TrainingJob._ProcessBatchResult = self._auto_subbatched_process_batch(
@@ -2603,7 +2670,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     sum_penalties[penalty_key] += penalty_value_torch.item()
                 sum_penalty += penalty
                 batch_backward_time += time.time()
+                grad_accum_time -= time.time()
                 self._accumulate_partition_gradient()
+                grad_accum_time += time.time()
 
                 # determine full cost
                 cost_value = batch_result.avg_loss + penalty
@@ -2631,10 +2700,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     self.optimizer.step()
                 batch_optimizer_time += time.time()
 
+                push_back_time -= time.time()
                 if self.entity_sync_level == "batch":
                     self.model.get_s_embedder().push_back()
                 if self.relation_sync_level == "batch":
                     self.model.get_p_embedder().push_back()
+                push_back_time += time.time()
 
                 # update batch trace with the results
                 self.current_trace["batch"].update(
@@ -2653,10 +2724,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 )
 
                 # run the post-batch hooks (may modify the trace)
+                hook_time -= time.time()
                 for f in self.post_batch_hooks:
                     f(self)
+                hook_time += time.time()
 
                 # output, then clear trace
+                trace_time -= time.time()
                 if self.trace_batch:
                     self.trace(**self.current_trace["batch"])
                 self.current_trace["batch"] = None
@@ -2685,6 +2759,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     end="",
                     flush=True,
                 )
+                trace_time += time.time()
 
                 # update epoch times
                 prepare_time += batch_result.prepare_time
@@ -2729,6 +2804,51 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 - optimizer_time
                 - scheduler_time
             )
+            if (
+                self._other_time_log_interval > 0
+                and local_partition_counter % self._other_time_log_interval == 0
+            ):
+                known_other = hook_time + trace_time + push_back_time + grad_accum_time
+                extra_other = (
+                    pre_pull_time
+                    + ps_set_time
+                    + ps_wait_time
+                    + pull_and_map_time
+                    + entity_pull_time
+                    + relation_pull_time
+                    + cpu_gpu_time
+                    + unique_time
+                    + dataloader_time
+                    + glow_window_union_time
+                    + glow_prefetch_time
+                    + glow_gradient_trace_time
+                    + glow_register_result_time
+                    + glow_conflict_time
+                )
+                residual = other_time - (known_other + extra_other)
+                self.config.log(
+                    "Other time breakdown: "
+                    f"other_time={other_time:.4f}s "
+                    f"hook={hook_time:.4f}s "
+                    f"trace={trace_time:.4f}s "
+                    f"push_back={push_back_time:.4f}s "
+                    f"grad_accum={grad_accum_time:.4f}s "
+                    f"pre_pull={pre_pull_time:.4f}s "
+                    f"ps_set={ps_set_time:.4f}s "
+                    f"ps_wait={ps_wait_time:.4f}s "
+                    f"pull_map={pull_and_map_time:.4f}s "
+                    f"entity_pull={entity_pull_time:.4f}s "
+                    f"relation_pull={relation_pull_time:.4f}s "
+                    f"cpu_gpu={cpu_gpu_time:.4f}s "
+                    f"unique={unique_time:.4f}s "
+                    f"dataloader={dataloader_time:.4f}s "
+                    f"glow_union={glow_window_union_time:.4f}s "
+                    f"glow_prefetch={glow_prefetch_time:.4f}s "
+                    f"glow_grad_trace={glow_gradient_trace_time:.4f}s "
+                    f"glow_register={glow_register_result_time:.4f}s "
+                    f"glow_conflict={glow_conflict_time:.4f}s "
+                    f"residual={residual:.4f}s"
+                )
 
             if self.entity_sync_level == "partition":
                 ps_set_time -= time.time()
