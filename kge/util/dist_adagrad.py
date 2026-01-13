@@ -43,11 +43,11 @@ class DistAdagrad(Optimizer):
         is_row=False,
         use_lr_scheduler=False,
         min_rank=-1,
-        max_pending_pushes=2,
+        max_pending_pushes=8,
         conflict_free_merge=False,
         causal_merge=False,
         row_causal_merge=False,
-        record_replay=True,
+        record_replay=False,
     ):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -68,9 +68,11 @@ class DistAdagrad(Optimizer):
         self.lapse_indexes = lapse_indexes
         self.pulled_parameters = [None, None]
         if async_write_back is None:
-            async_write_back = (False, False)
+            async_write_back = (True, True)
         if len(async_write_back) < 2:
-            async_write_back = tuple(async_write_back) + (False, False)
+            async_write_back = tuple(async_write_back) + (True,) * (
+                2 - len(async_write_back)
+            )
         self.async_write_back = tuple(async_write_back)
         self._async_write_back_map = {
             "entity": bool(async_write_back[0]) if len(async_write_back) > 0 else True,
@@ -211,6 +213,8 @@ class DistAdagrad(Optimizer):
 
                 if grad_indices.numel() == 0:
                     continue
+                group_name = group.get("name", "unknown")
+                sync_level = group.get("sync_level", None)
                 opt_values = group["optimizer_values"]
                 if opt_values.device != grad_indices.device:
                     raise RuntimeError(
@@ -218,6 +222,63 @@ class DistAdagrad(Optimizer):
                         f"device (optimizer_values={opt_values.device}, "
                         f"grad_indices={grad_indices.device})."
                     )
+
+                # Filter mapper indices first in batch sync so optimizer state matches.
+                if sync_level == "batch":
+                    update_indexes = grad_indices
+                    if update_indexes.device.type != "cpu":
+                        update_indexes = update_indexes.cpu()
+                    mapper = group.get("_lapse_mapper_cpu")
+                    if mapper is None:
+                        mapper = group.get("local_to_lapse_mapper")
+                        if mapper is None:
+                            raise RuntimeError(
+                                "Missing local_to_lapse_mapper for batch sync."
+                            )
+                        if not isinstance(mapper, torch.Tensor):
+                            mapper = torch.as_tensor(
+                                mapper, dtype=torch.long, device="cpu"
+                            )
+                        else:
+                            if mapper.dtype != torch.long:
+                                mapper = mapper.long()
+                            if mapper.device.type != "cpu":
+                                mapper = mapper.cpu()
+                        group["_lapse_mapper_cpu"] = mapper
+                    if update_indexes.numel() == 0:
+                        continue
+                    mapper_size = int(mapper.numel())
+                    if mapper_size == 0:
+                        continue
+                    valid_idx_mask = (update_indexes >= 0) & (
+                        update_indexes < mapper_size
+                    )
+                    if not torch.all(valid_idx_mask):
+                        invalid_count = int((~valid_idx_mask).sum().item())
+                        if invalid_count > 0 and not getattr(
+                            self, "_invalid_mapper_logged", False
+                        ):
+                            msg = (
+                                "Skipping optimizer updates with out-of-range "
+                                f"local_to_lapse_mapper indices "
+                                f"(count={invalid_count})."
+                            )
+                            if hasattr(self.parameter_client, "config"):
+                                self.parameter_client.config.log(msg)
+                            else:
+                                print(msg)
+                            self._invalid_mapper_logged = True
+                        if not valid_idx_mask.any():
+                            continue
+                        valid_idx = valid_idx_mask.nonzero(as_tuple=False).view(-1)
+                        update_indexes = update_indexes.index_select(0, valid_idx)
+                        valid_idx_dev = (
+                            valid_idx.to(grad_values.device)
+                            if grad_values.is_cuda
+                            else valid_idx
+                        )
+                        grad_indices = grad_indices.index_select(0, valid_idx_dev)
+                        grad_values = grad_values.index_select(0, valid_idx_dev)
 
                 # pull the current internal optimizer parameters
                 state_sum = opt_values[grad_indices]
@@ -227,14 +288,14 @@ class DistAdagrad(Optimizer):
                 else:
                     sum_update_values = grad_values.pow(2).mean(1).view(-1, 1)
                 state_sum.add_(sum_update_values)
+                # Keep local accumulator shadow updated even in batch mode.
+                opt_values[grad_indices] = state_sum
                 # std = state["sum"].sparse_mask(grad)
                 # std_values = std._values().sqrt_().add_(group["eps"])
                 std_values = state_sum.sqrt().add_(group["eps"])
                 update_value = (grad_values / std_values).mul_(-clr)
-                sync_level = group.get("sync_level", None)
                 if not hasattr(self, "_sync_level_logged"):
                     self._sync_level_logged = set()
-                group_name = group.get("name", "unknown")
                 if group_name not in self._sync_level_logged:
                     path = "ps_push" if sync_level == "batch" else "local_fused"
                     print(
@@ -268,34 +329,6 @@ class DistAdagrad(Optimizer):
                     mapper_size = int(mapper.numel())
                     if mapper_size == 0:
                         continue
-                    valid_idx_mask = update_indexes < mapper_size
-                    if not torch.all(valid_idx_mask):
-                        invalid_count = int((~valid_idx_mask).sum().item())
-                        if invalid_count > 0 and not getattr(
-                            self, "_invalid_mapper_logged", False
-                        ):
-                            msg = (
-                                "Skipping optimizer updates with out-of-range "
-                                f"local_to_lapse_mapper indices "
-                                f"(count={invalid_count})."
-                            )
-                            if hasattr(self.parameter_client, "config"):
-                                self.parameter_client.config.log(msg)
-                            else:
-                                print(msg)
-                            self._invalid_mapper_logged = True
-                        if not valid_idx_mask.any():
-                            continue
-                        valid_idx = valid_idx_mask.nonzero(as_tuple=False).view(-1)
-                        update_indexes = update_indexes.index_select(0, valid_idx)
-                        if update_value.is_cuda:
-                            valid_idx_dev = valid_idx.to(update_value.device)
-                        else:
-                            valid_idx_dev = valid_idx
-                        update_value = update_value.index_select(0, valid_idx_dev)
-                        sum_update_values = sum_update_values.index_select(
-                            0, valid_idx_dev
-                        )
                     push_keys = mapper.index_select(0, update_indexes)
                     num_keys = getattr(self.parameter_client, "num_keys", None)
                     if num_keys is None and hasattr(self.parameter_client, "parameters"):
@@ -329,11 +362,12 @@ class DistAdagrad(Optimizer):
                         push_keys = push_keys[valid_idx]
                         update_value = update_value[valid_idx_dev]
                         sum_update_values = sum_update_values[valid_idx_dev]
+                        state_sum = state_sum.index_select(0, valid_idx_dev)
                     payload_buffer = self._acquire_push_buffer(
                         group["name"], len(update_value)
                     )
                     payload = payload_buffer[: len(update_value)]
-                    self._pack_push_payload(payload, update_value, sum_update_values)
+                    self._pack_push_payload(payload, update_value, state_sum)
                     wait_value = self._push_with_context(
                         group["name"],
                         push_keys,

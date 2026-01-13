@@ -492,6 +492,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._current_partition_version = None
         self._current_partition_id = None
         self._partition_grad_sum = 0.0
+        self._partition_grad_sum_t = None
         self._partition_grad_samples = 0
         self._relation_gradient_trace = bool(
             self.config.get("job.distributed.relation_gradient_trace")
@@ -528,18 +529,24 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
         partition_type = str(self.config.get("job.distributed.partition_type") or "")
         self._use_glow_features = partition_type == "glow"
-        self._track_partition_gradients = bool(
-            self._use_glow_features
-            or self._relation_gradient_trace
-            or self._gradient_log_interval > 0
-            or self._gradient_log_top_relations > 0
-        )
+        glow_cfg = self.config.get("job.distributed.glow") or {}
+        track_cfg = glow_cfg.get("track_partition_gradients")
+        if track_cfg is None:
+            self._track_partition_gradients = bool(
+                self._use_glow_features
+                or self._relation_gradient_trace
+                or self._gradient_log_interval > 0
+                or self._gradient_log_top_relations > 0
+            )
+        else:
+            self._track_partition_gradients = (
+                bool(track_cfg) or self._relation_gradient_trace
+            )
         self._last_finished_partition = None
         self._current_window_members = None
         self._current_window_entities = None
         self._current_window_versions = None
         self._current_partition_size = 0
-        glow_cfg = self.config.get("job.distributed.glow") or {}
         if self._use_glow_features:
             self._prefetch_window_entities = bool(
                 glow_cfg.get("prefetch_window_entities", False)
@@ -852,7 +859,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     self._non_blocking_transfer
                     and getattr(self, "_effective_num_workers", 0) == 0
                 ):
-                    sample.pin_memory()
+                    sample = sample.pin_memory()
                 negative_samples.append(sample)
             unique_time = -time.time()
             unique_entities = None
@@ -1270,14 +1277,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if not batches:
             return
         head = batches[0]
-        if (
-            (self.entity_pre_pull > 1 or self.relation_pre_pull > 1)
-            and not head.get("_device_ready")
-        ):
+        should_prefetch = self.entity_pre_pull > 0 or self.relation_pre_pull > 0
+        if should_prefetch and not head.get("_device_ready"):
             gpu_triples = head.get("_gpu_triples")
             if gpu_triples is not None:
                 head["triples"] = gpu_triples
-            else:
+            elif head["triples"].device.type != "cuda":
                 head["triples"] = head["triples"].to(
                     self.device, non_blocking=self._non_blocking_transfer
                 )
@@ -1294,11 +1299,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 lookahead_entries[idx] = None
         if lookahead_entries and all(entry is None for entry in lookahead_entries):
             head.pop("_lookahead_negative_samples", None)
-        head["negative_samples"] = [
-            ns.to(self.device, non_blocking=self._non_blocking_transfer)
-            for ns in head["negative_samples"]
-        ]
-        head["_device_ready"] = True
+        if should_prefetch and not head.get("_device_ready"):
+            head["negative_samples"] = [
+                ns.to(self.device, non_blocking=self._non_blocking_transfer)
+                for ns in head["negative_samples"]
+            ]
+            head["_device_ready"] = True
         # prepare look-ahead negatives for the next batch
         target = new_batch if new_batch is not None else batches[-1]
         self._prepare_negative_lookahead(target)
@@ -1336,10 +1342,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         # be avoided.
         result.prepare_time -= time.time()
         # result.cpu_gpu_time -= time.time()
+        device_ready = batch.get("_device_ready", False)
         gpu_triples = batch.get("_gpu_triples")
         if gpu_triples is not None:
             batch["triples"] = gpu_triples
-        else:
+        elif not device_ready and batch["triples"].device.type != "cuda":
             batch["triples"] = batch["triples"].to(
                 self.device, non_blocking=self._non_blocking_transfer
             )
@@ -1356,10 +1363,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 lookahead_entries[idx] = None
         if lookahead_entries and all(entry is None for entry in lookahead_entries):
             batch.pop("_lookahead_negative_samples", None)
-        batch["negative_samples"] = [
-            ns.to(self.device, non_blocking=self._non_blocking_transfer)
-            for ns in batch["negative_samples"]
-        ]
+        if not device_ready:
+            batch["negative_samples"] = [
+                ns.to(self.device, non_blocking=self._non_blocking_transfer)
+                for ns in batch["negative_samples"]
+            ]
+            batch["_device_ready"] = True
         # result.cpu_gpu_time += time.time()
         result.unique_time += batch["unique_time"]
         if self.entity_sync_level == "batch":
@@ -1443,6 +1452,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
 
     def _reset_partition_gradient_trace(self):
         self._partition_grad_sum = 0.0
+        self._partition_grad_sum_t = (
+            torch.zeros((), device=self.device)
+            if self._track_partition_gradients
+            else None
+        )
         self._partition_grad_samples = 0
         self._reset_partition_relation_gradient_trace()
 
@@ -1460,14 +1474,28 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         grad_norm = self._compute_batch_gradient_norm()
         if grad_norm is None:
             return
-        self._partition_grad_sum += grad_norm
+        if self._partition_grad_sum_t is None:
+            self._partition_grad_sum_t = grad_norm
+        else:
+            if grad_norm.device != self._partition_grad_sum_t.device:
+                grad_norm = grad_norm.to(self._partition_grad_sum_t.device)
+            self._partition_grad_sum_t = self._partition_grad_sum_t + grad_norm
         self._partition_grad_samples += 1
         self._accumulate_partition_relation_gradients()
         if (
             self._gradient_log_interval > 0
             and self._partition_grad_samples % self._gradient_log_interval == 0
         ):
-            avg_grad = self._partition_grad_sum / max(1, self._partition_grad_samples)
+            if self._partition_grad_sum_t is None:
+                avg_grad = self._partition_grad_sum / max(
+                    1, self._partition_grad_samples
+                )
+            else:
+                avg_grad = float(
+                    (self._partition_grad_sum_t / max(1, self._partition_grad_samples))
+                    .detach()
+                    .cpu()
+                )
             message = (
                 f"Partition {self._current_partition_id} gradient norm avg="
                 f"{avg_grad:.6f} (samples={self._partition_grad_samples})."
@@ -1496,7 +1524,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             self.config.log(message)
 
     def _compute_batch_gradient_norm(self):
-        total = 0.0
+        total = None
         has_grad = False
         for param in self.model.parameters():
             if param.grad is None:
@@ -1506,15 +1534,23 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if grad.is_sparse:
                 grad = grad.coalesce()
                 values = grad.values()
-                total += values.pow(2).sum().item()
+                part = values.pow(2).sum()
             elif grad.layout != torch.strided:
                 values = grad.values() if hasattr(grad, "values") else grad._values()
-                total += values.pow(2).sum().item()
+                part = values.pow(2).sum()
             else:
-                total += grad.pow(2).sum().item()
+                part = grad.pow(2).sum()
+            if total is None:
+                total = part
+            else:
+                if part.device != total.device:
+                    part = part.to(total.device)
+                total = total + part
         if not has_grad:
-            return 0.0
-        return math.sqrt(total)
+            return torch.zeros((), device=self.device)
+        if total is None:
+            return torch.zeros((), device=self.device)
+        return torch.sqrt(total)
 
     def _accumulate_partition_relation_gradients(self):
         if (
@@ -1593,8 +1629,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             or self._partition_grad_samples <= 0
         ):
             return None
-        grad_sum = self._partition_grad_sum
         count = self._partition_grad_samples
+        if self._partition_grad_sum_t is not None:
+            grad_sum = float(self._partition_grad_sum_t.detach().cpu())
+        else:
+            grad_sum = float(self._partition_grad_sum)
         summary = {
             "grad_sum": grad_sum,
             "grad_count": count,

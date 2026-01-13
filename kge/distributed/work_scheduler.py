@@ -634,6 +634,25 @@ class WorkScheduler(mp.get_context("fork").Process):
                     if window_entities is None:
                         window_entities = work_package.entities_in_partition
                     work_package.window_entities = window_entities
+                if (
+                    self.config.get("job.distributed.relation_sync_level")
+                    == "partition"
+                    and work_package.relations_in_partition is None
+                    and window_members
+                ):
+                    window_relations = None
+                    if hasattr(self, "_get_window_relations"):
+                        window_relations = self._get_window_relations(
+                            tuple(window_members)
+                        )
+                    if (
+                        window_relations is None
+                        and hasattr(self, "_get_partition_relations")
+                    ):
+                        window_relations = self._get_partition_relations(
+                            window_members[0]
+                        )
+                    work_package.relations_in_partition = window_relations
                 if getattr(self, "_glow_debug", False):
                     self._glow_log(
                         "Rebuilt window work in _send_work for "
@@ -2652,6 +2671,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._glow_windows = deque()
         self._max_window_entities = 0
         self._window_work_key_map.clear()
+        self._window_swap_costs.clear()
         if preserve_served and self._served_partitions:
             ordered_partitions = [
                 pid for pid in ordered_partitions
@@ -3462,6 +3482,14 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         mid_epoch = 0 < served_count < self.num_partitions
         epoch_complete = served_count >= self.num_partitions
 
+        if mid_epoch:
+            if self._glow_debug:
+                self._glow_log(
+                    "Glow gradient repartition deferred until epoch boundary "
+                    f"(served={served_count}/{self.num_partitions})."
+                )
+            return
+
         moved = self._maybe_repartition_from_gradient_graph()
         if moved <= 0:
             return
@@ -3711,6 +3739,13 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         served_count = len(self._served_partitions)
         mid_epoch = 0 < served_count < self.num_partitions
         epoch_complete = served_count >= self.num_partitions
+        if mid_epoch:
+            if self._glow_debug:
+                self._glow_log(
+                    "Glow reshape deferred until epoch boundary "
+                    f"(served={served_count}/{self.num_partitions})."
+                )
+            return
         gradients = self.partition_gradient_stats or self._latest_gradients
         if not gradients:
             return
@@ -3791,6 +3826,16 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if self._partition_entities_map is not None:
             self._recompute_partition_entities(hot_id)
             self._recompute_partition_entities(cold_id)
+        if self._partition_relations_map is not None:
+            self._recompute_partition_relations(hot_id)
+            self._recompute_partition_relations(cold_id)
+        if self._partition_entities_map is not None:
+            self._max_partition_entities = max(
+                (int(v.numel()) for v in self._partition_entities_map.values()),
+                default=0,
+            )
+        if self._window_swap_costs:
+            self._window_swap_costs.clear()
         return moved.numel()
 
     def _recompute_partition_entities(self, partition_id):
@@ -3968,6 +4013,14 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 self._recompute_partition_entities(pid)
             if self._partition_relations_map is not None:
                 self._recompute_partition_relations(pid)
+        if moved_total > 0:
+            if self._partition_entities_map is not None:
+                self._max_partition_entities = max(
+                    (int(v.numel()) for v in self._partition_entities_map.values()),
+                    default=0,
+                )
+            if self._window_swap_costs:
+                self._window_swap_costs.clear()
         if moved_total > 0 and self._gradient_graph_cluster_enabled:
             self._maybe_update_gradient_graph_clusters(force=True)
         if moved_total == 0:

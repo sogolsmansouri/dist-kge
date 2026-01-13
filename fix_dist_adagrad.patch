@@ -1,0 +1,24 @@
+diff --git a/kge/optim/dist_adagrad.py b/kge/optim/dist_adagrad.py
+--- a/kge/optim/dist_adagrad.py
++++ b/kge/optim/dist_adagrad.py
+@@ -26,7 +26,7 @@ class DistAdagrad(Optimizer):
+         parameter_client=None,
+         lapse_indexes=None,
+         lapse_optimizer_index_offset=0,
+-        async_write_back=[],
++        async_write_back=None,
+         is_row=False,
+         use_lr_scheduler=False,
+         min_rank=-1,
+@@ -53,7 +53,13 @@ class DistAdagrad(Optimizer):
+         self.lapse_optimizer_index_offset = lapse_optimizer_index_offset
+         self.lapse_indexes = lapse_indexes
+         self.pulled_parameters = [None, None]
+-        self.async_write_back = async_write_back
++        if async_write_back is None:
++            async_write_back = (False, False)
++        if len(async_write_back) < 2:
++            async_write_back = tuple(async_write_back) + (False, False)
++        self.async_write_back = tuple(bool(x) for x in async_write_back[:2])
+ 
+         self.is_row = is_row
