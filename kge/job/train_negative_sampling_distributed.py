@@ -1218,6 +1218,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if triples is None:
             return work_relations
         work_cpu = work if work.device.type == "cpu" else work.cpu()
+        if work_cpu.dtype != torch.long:
+            work_cpu = work_cpu.to(dtype=torch.long)
         triples_cpu = triples if triples.device.type == "cpu" else triples.cpu()
         rel_ids = triples_cpu.index_select(0, work_cpu)[:, P]
         unique_rel = torch.unique(rel_ids)
