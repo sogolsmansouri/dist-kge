@@ -1025,30 +1025,7 @@ class WorkScheduler(mp.get_context("fork").Process):
         if partition_id is None:
             return
 
-        # Ignore sentinel NO_WORK (-1). Keep negative aliases (< -1) and complex ids (e.g., tuples).
-        if isinstance(partition_id, (int, np.integer)):
-            pid_int = int(partition_id)
-            if pid_int == -1:
-                return
-            if pid_int < -1:
-                decoded = self._decode_partition_id(pid_int)
-                if isinstance(decoded, (int, np.integer)) and int(decoded) < 0:
-                    return
-                partition_id = decoded
-
-        # normalize partition_id into a list of *int* base partition ids
-        base_pids = []
-        if isinstance(partition_id, (tuple, list)):
-            for item in partition_id:
-                try:
-                    base_pids.append(int(item))
-                except (TypeError, ValueError):
-                    continue
-        else:
-            try:
-                base_pids.append(int(partition_id))
-            except (TypeError, ValueError):
-                return
+        base_pids = self._base_partition_ids(partition_id)
         if not base_pids:
             return
 
@@ -1776,6 +1753,8 @@ class AdaptiveWorkScheduler(WorkScheduler):
     def _adaptive_reset_state(self):
         self._adaptive_offsets.clear()
         self._adaptive_total_lengths.clear()
+        self._adaptive_chunk_sizes.clear()
+        self._adaptive_split_counts.clear()
 
     def _adaptive_maybe_slice(self, partition_id, partition_tensor):
         if (
@@ -1806,7 +1785,7 @@ class AdaptiveWorkScheduler(WorkScheduler):
         else:
             self._adaptive_chunk_sizes[partition_id] = 0
             self._adaptive_offsets[partition_id] = 0
-        return partition_tensor.narrow(0, start, take).clone()
+        return partition_tensor.narrow(0, start, take)
 
     def _refill_work(self):
         self._adaptive_reset_state()
@@ -1829,22 +1808,24 @@ class RandomWorkScheduler(AdaptiveWorkScheduler):
         self, rank, machine_id
     ) -> WorkPackage:
         """add work/partitions to the list of work to do"""
-        try:
-            work_package = WorkPackage()
-            work_package.partition_id = self.work_to_do.pop()
-            partition_tensor = self.partitions[work_package.partition_id]
+        while True:
+            try:
+                partition_id = self.work_to_do.pop()
+            except IndexError:
+                return WorkPackage()
+            partition_tensor = self.partitions[partition_id]
             partition_slice = self._adaptive_maybe_slice(
-                work_package.partition_id, partition_tensor
+                partition_id, partition_tensor
             )
             if partition_slice is None or len(partition_slice) == 0:
-                return self._next_work(rank, machine_id)
+                continue
+            work_package = WorkPackage()
+            work_package.partition_id = partition_id
             work_package.partition_data = partition_slice
             # those are not entities in the partition but "local" entities for the
             #  worker to allow local sampling
             work_package.entities_in_partition = self.local_entities[rank]
             return work_package
-        except IndexError:
-            return WorkPackage()
 
     def _load_partitions(self, num_partitions):
         num_triples = len(self.dataset.split("train"))
@@ -1894,23 +1875,25 @@ class RelationWorkScheduler(AdaptiveWorkScheduler):
         self, rank, machine_id
     ) -> WorkPackage:
         """add work/partitions to the list of work to do"""
-        try:
-            work_package = WorkPackage()
-            work_package.partition_id = self.work_to_do.pop()
-            partition_tensor = self.partitions[work_package.partition_id]
+        while True:
+            try:
+                partition_id = self.work_to_do.pop()
+            except IndexError:
+                return WorkPackage()
+            partition_tensor = self.partitions[partition_id]
             partition_slice = self._adaptive_maybe_slice(
-                work_package.partition_id, partition_tensor
+                partition_id, partition_tensor
             )
             if partition_slice is None or len(partition_slice) == 0:
-                return self._next_work(rank, machine_id)
+                continue
+            work_package = WorkPackage()
+            work_package.partition_id = partition_id
             work_package.partition_data = partition_slice
-            work_package.relations_in_partition = self.relations_to_partition[work_package.partition_id]
+            work_package.relations_in_partition = self.relations_to_partition[partition_id]
             # those are not entities in the partition but "local" entities for the
             #  worker to allow local sampling
             work_package.entities_in_partition = self.local_entities[rank]
             return work_package
-        except IndexError:
-            return WorkPackage()
 
     def _load_partitions(self, num_partitions):
         np_type = TORCH_TO_NP_DTYPE[self.data_type]
@@ -2113,25 +2096,27 @@ class GraphCutWorkScheduler(WorkScheduler):
     def _next_work(
         self, rank, machine_id
     ) -> WorkPackage:
-        try:
-            work_package = WorkPackage()
-            prev_work_id = self.previous_partition_per_worker[rank]
-            if prev_work_id is not None and prev_work_id in self.work_to_do:
-                work_package.partition_id = prev_work_id
-                del self.work_to_do[self.work_to_do.index(prev_work_id)]
-            else:
-                work_package.partition_id = self.work_to_do.pop()
-            partition_tensor = self.partitions[work_package.partition_id]
+        while True:
+            try:
+                prev_work_id = self.previous_partition_per_worker[rank]
+                if prev_work_id is not None and prev_work_id in self.work_to_do:
+                    partition_id = prev_work_id
+                    del self.work_to_do[self.work_to_do.index(prev_work_id)]
+                else:
+                    partition_id = self.work_to_do.pop()
+            except IndexError:
+                return WorkPackage()
+            partition_tensor = self.partitions[partition_id]
             partition_slice = self._slice_partition(
-                work_package.partition_id, partition_tensor
+                partition_id, partition_tensor
             )
             if partition_slice is None or len(partition_slice) == 0:
-                return self._next_work(rank, machine_id)
+                continue
+            work_package = WorkPackage()
+            work_package.partition_id = partition_id
             work_package.partition_data = partition_slice
-            work_package.entities_in_partition = self.entities_to_partition[work_package.partition_id]
+            work_package.entities_in_partition = self.entities_to_partition[partition_id]
             return work_package
-        except IndexError:
-            return WorkPackage()
 
     def _slice_partition(self, partition_id, partition_tensor):
         total = len(partition_tensor)
@@ -2147,7 +2132,7 @@ class GraphCutWorkScheduler(WorkScheduler):
         self.partition_next_offset[partition_id] = end
         if end < total:
             self.work_to_do.appendleft(partition_id)
-        return partition_tensor.narrow(0, start, chunk_len).clone()
+        return partition_tensor.narrow(0, start, chunk_len)
 
     def _handle_work_done(self, rank):
         if self.max_chunk_size <= 0:
@@ -2423,6 +2408,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self._last_window_per_worker = {}
         self._partition_entities_map = None
         self._max_partition_entities = 0
+        self._max_partition_entities_bound = 0
         self._partition_relations_map = None
         self._all_relations = None
         self._reshape_counter = 0
@@ -2796,11 +2782,22 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             (self.glow_overlap_sampling or self.glow_window_work)
             and self._max_window_entities > self._max_partition_entities
         ):
-            self._max_partition_entities = self._max_window_entities
-            self.config.log(
-                "Glow window sizing increased max partition entities to "
-                f"{self._max_partition_entities}."
-            )
+            if (
+                self._max_partition_entities_bound
+                and self._max_window_entities > self._max_partition_entities_bound
+            ):
+                self.config.log(
+                    "Glow window entities exceed max bound "
+                    f"{self._max_partition_entities_bound} "
+                    f"(observed={self._max_window_entities}); "
+                    "increase partition embedder size or reduce window size."
+                )
+            else:
+                self._max_partition_entities = self._max_window_entities
+                self.config.log(
+                    "Glow window sizing increased max partition entities to "
+                    f"{self._max_partition_entities}."
+                )
 
     def _sort_glow_windows(self):
         if not self._glow_windows:
@@ -3056,6 +3053,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
                 f"Glow scheduler computed entity sets for {len(mapping)} partitions "
                 f"from train triples ({reason})."
             )
+            self._maybe_set_window_entity_bound()
             if self._glow_debug and mapping:
                 counts = [int(v.numel()) for v in mapping.values()]
                 self._glow_log(
@@ -3096,6 +3094,7 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         self.config.log(
             f"Glow scheduler loaded entity partition map for {len(mapping)} partitions."
         )
+        self._maybe_set_window_entity_bound()
         if self._glow_debug and mapping:
             counts = [int(v.numel()) for v in mapping.values()]
             self._glow_log(
@@ -3155,6 +3154,29 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
         if counts.size == 0:
             return 0
         return int(counts.max())
+
+    def _maybe_set_window_entity_bound(self):
+        if not (self.glow_window_work or self.glow_overlap_sampling):
+            return
+        if not self._partition_entities_map:
+            return
+        sizes = [int(v.numel()) for v in self._partition_entities_map.values()]
+        if not sizes:
+            return
+        window_size = max(1, int(self.glow_window_size))
+        window_size = min(window_size, len(sizes))
+        sizes.sort(reverse=True)
+        bound = int(sum(sizes[:window_size]))
+        if bound <= 0:
+            return
+        if bound > self._max_partition_entities_bound:
+            self._max_partition_entities_bound = bound
+        if self._max_partition_entities_bound > self._max_partition_entities:
+            self._max_partition_entities = self._max_partition_entities_bound
+            self.config.log(
+                "Glow window entity bound set max partition entities to "
+                f"{self._max_partition_entities}."
+            )
 
     def _get_partition_relations(self, partition_id):
         if self._partition_relations_map is not None:

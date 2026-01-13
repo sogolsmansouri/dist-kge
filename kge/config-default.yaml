@@ -106,6 +106,7 @@ job:
     map_ids_on_gpu: False  # map global->local ids on GPU when stage_local_ids is False
     sample_on_gpu: False  # sample negatives on GPU when device-resident triples are available
     debug_id_bounds: False  # log/raise when triples/negatives exceed vocab bounds
+    pull_buffer_rows_max: 0  # cap prefetch pull buffer rows (0 disables cap)
     conflict_free_merge: False
     causal_merge: False
     causal_merge_row: False

@@ -77,6 +77,9 @@ class DistributedLookupEmbedder(LookupEmbedder):
             int(complete_vocab_size or 0),
             self.dataset.num_entities() if "entity" in self.configuration_key else self.dataset.num_relations(),
         )
+        max_pull_rows = int(self.config.get("job.distributed.pull_buffer_rows_max"))
+        if max_pull_rows > 0:
+            pull_buffer_rows = min(pull_buffer_rows, max_pull_rows)
         self.pull_tensors = []
         for i in range(number_of_pre_pulls + 1):
             self.pull_tensors.append(
@@ -91,19 +94,6 @@ class DistributedLookupEmbedder(LookupEmbedder):
                     ),
                 ]
             )
-        if number_of_pre_pulls > 0 and len(self.pull_tensors) == 1:
-            self.config.log(
-                "Prefetch enabled but only one pull tensor available; "
-                "prefetch will be skipped."
-            )
-
-        if "cuda" in config.get("job.device"):
-            # only pin tensors if we are using gpu
-            # otherwise gpu memory will be allocated for no reason
-            with torch.cuda.device(config.get("job.device")):
-                for i in range(len(self.pull_tensors)):
-                    self.pull_tensors[i][1] = self.pull_tensors[i][1].pin_memory()
-
         self.num_pulled = 0
         self.mapping_time = 0.0
         # self.pre_pulled = None
@@ -153,8 +143,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
         device = self._embeddings.weight.device
         if device.type == "cuda":
             # pin pull buffers (CPU tensors)
+            pinned = 0
             for i in range(len(self.pull_tensors)):
-                self.pull_tensors[i][1] = self.pull_tensors[i][1].pin_memory()
+                pull_tensor = self.pull_tensors[i][1]
+                if not pull_tensor.is_pinned():
+                    self.pull_tensors[i][1] = pull_tensor.pin_memory()
+                    pinned += 1
+            if pinned > 0:
+                self.config.log(
+                    f"Pinned {pinned} pull buffers in to_device for {self.configuration_key}."
+                )
 
             # create copy stream
             self.copy_stream = torch.cuda.Stream(device=device)

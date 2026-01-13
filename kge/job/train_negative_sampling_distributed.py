@@ -17,7 +17,7 @@ from kge.job import Job
 from kge.job.train import TrainingJob, _generate_worker_init_fn
 from kge.job.train_negative_sampling import TrainingJobNegativeSampling
 from kge.model import KgeModel
-from kge.util import KgeOptimizer
+from kge.util import KgeOptimizer, KgeSampler
 from kge.util.dist_adagrad import DistAdagrad
 from kge.job.trace import format_trace_entry
 from kge.distributed.work_scheduler import SchedulerClient
@@ -151,8 +151,8 @@ class BatchDataset(torch.utils.data.Dataset):
                 .share_memory_()
             )
         if (
-            self.materialize_device
-            and self.materialize_device.startswith("cuda")
+            self._materialize_device is not None
+            and self._materialize_device.type == "cuda"
             and (
                 self.materialized_triples_device is None
                 or self.materialized_triples_device.size(0) < size
@@ -161,7 +161,7 @@ class BatchDataset(torch.utils.data.Dataset):
             self.materialized_triples_device = torch.empty(
                 (size, self.triples.size(1)),
                 dtype=self.triples.dtype,
-                device=self.materialize_device,
+                device=self._materialize_device,
                 requires_grad=False,
             )
 
@@ -430,7 +430,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             optimizer=optimizer,
             forward_only=forward_only,
             parameter_client=parameter_client,
-            work_scheduler_client=work_scheduler_client,
+            work_scheduler_client=self.work_scheduler_client,
         )
         self.type_str = "negative_sampling"
         self._map_ids_on_gpu = bool(
@@ -642,23 +642,26 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if self._map_ids_device.type == "cuda"
             else None
         )
-        for i in range(self._effective_num_workers + 1):
-            self.entity_mapper_tensors.append(
-                torch.full(
-                    (self.dataset.num_entities(),),
-                    -1,
-                    dtype=torch.long,
-                    device=mapper_device,
+        if self.entity_sync_level != "partition":
+            for _ in range(self._effective_num_workers + 1):
+                self.entity_mapper_tensors.append(
+                    torch.full(
+                        (self.dataset.num_entities(),),
+                        -1,
+                        dtype=torch.long,
+                        device=mapper_device,
+                    )
                 )
-            )
-            self.relation_mapper_tensors.append(
-                torch.full(
-                    (self.dataset.num_relations(),),
-                    -1,
-                    dtype=torch.long,
-                    device=mapper_device,
+        if self.relation_sync_level != "partition":
+            for _ in range(self._effective_num_workers + 1):
+                self.relation_mapper_tensors.append(
+                    torch.full(
+                        (self.dataset.num_relations(),),
+                        -1,
+                        dtype=torch.long,
+                        device=mapper_device,
+                    )
                 )
-            )
 
         # also defines the local entities
         self._initialize_parameter_server(init_for_load_only=init_for_load_only)

@@ -145,20 +145,32 @@ class WorkerProcess(mp.get_context("spawn").Process):
         device_pool: list = list(self.config.get("job.device_pool") or [])
         if len(device_pool) == 0:
             device_pool.append(base_device)
-        selected_device = device_pool[self.rank % len(device_pool)]
+        already_init_workers = int(
+            self.config.get("job.distributed.already_init_workers") or 0
+        )
+        if already_init_workers < 0:
+            already_init_workers = 0
+        if self.rank < already_init_workers:
+            local_rank = self.rank
+            global_worker_rank = self.rank + already_init_workers
+        else:
+            global_worker_rank = self.rank
+            local_rank = self.rank - already_init_workers
+        selected_device = device_pool[local_rank % len(device_pool)]
         torch_device = base_device
         if selected_device == "cuda":
             torch_device = "cuda:0"
         else:
             torch_device = selected_device
         if torch_device != "cpu":
-            torch.cuda.set_device(torch_device)
+            torch.cuda.set_device(torch.device(torch_device))
         # seeds need to be set in every process
-        set_seeds(self.config, self.rank)
+        min_rank = get_min_rank(self.config)
+        dist_rank = global_worker_rank + min_rank
+        set_seeds(self.config, dist_rank)
 
         set_master_environment(self.config)
-        min_rank = get_min_rank(self.config)
-        print("before init", self.rank + min_rank)
+        print("before init", dist_rank)
         if self.config.get("job.distributed.glow.causal_overlap.enable"):
             if not self.config.get("job.distributed.causal_merge_row"):
                 self.config.set(
@@ -175,7 +187,9 @@ class WorkerProcess(mp.get_context("spawn").Process):
         # create train-worker config, dataset and folder
         config = deepcopy(self.config)
         config.set("job.device", selected_device)
-        config.folder = os.path.join(self.config.folder, f"worker-{self.rank}")
+        config.folder = os.path.join(
+            self.config.folder, f"worker-{global_worker_rank}"
+        )
         config.init_folder()
         if getattr(config, "invocation", None):
             config.log(config.invocation, echo=False)
@@ -198,7 +212,7 @@ class WorkerProcess(mp.get_context("spawn").Process):
         )
         config.log(
             "Worker device assignment: "
-            f"local_rank={self.rank} dist_rank={self.rank + min_rank} "
+            f"local_rank={local_rank} dist_rank={dist_rank} "
             f"base_device={base_device} "
             f"device_pool={device_pool} selected={selected_device} "
             f"torch_device_set={torch_device} "
@@ -215,7 +229,7 @@ class WorkerProcess(mp.get_context("spawn").Process):
         parameter_client = KgeParameterClient.create(
             config=config,
             server_id=0,
-            client_id=self.rank + min_rank,
+            client_id=dist_rank,
             server=server,
             num_keys=self.num_keys,
         )
