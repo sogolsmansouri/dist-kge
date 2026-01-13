@@ -1175,6 +1175,56 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 continue
             _check_local(samples.view(-1), limit, desc)
 
+    def _local_ids_out_of_range(self, batch) -> bool:
+        """Return True if any ids exceed local embedder bounds."""
+        entity_vocab = self.model.get_s_embedder().vocab_size
+        relation_vocab = self.model.get_p_embedder().vocab_size
+
+        def _out_of_range(values, limit):
+            if values is None or values.numel() == 0:
+                return False
+            max_id = int(values.max().item())
+            min_id = int(values.min().item())
+            return min_id < 0 or max_id >= limit
+
+        triples = batch.get("triples")
+        if triples is not None and triples.numel() > 0:
+            if (
+                _out_of_range(triples[:, S].view(-1), entity_vocab)
+                or _out_of_range(triples[:, O].view(-1), entity_vocab)
+                or _out_of_range(triples[:, P].view(-1), relation_vocab)
+            ):
+                return True
+        for slot, limit in ((S, entity_vocab), (O, entity_vocab), (P, relation_vocab)):
+            neg_sample = batch["negative_samples"][slot]
+            samples = None
+            try:
+                samples = neg_sample.unique_samples(remove_dropped=False)
+            except Exception:
+                try:
+                    samples = neg_sample.samples()
+                except Exception:
+                    samples = None
+            if samples is None or samples.numel() == 0:
+                continue
+            if _out_of_range(samples.view(-1), limit):
+                return True
+        return False
+
+    def _maybe_remap_staged_batch(self, batch):
+        """Remap staged local ids if they appear to be global."""
+        if not self._stage_local_ids:
+            return batch
+        if not self._debug_id_bounds:
+            return batch
+        if self._local_ids_out_of_range(batch):
+            self.config.log(
+                "Detected out-of-range local ids in staged batch; "
+                "remapping with global_to_local mapper."
+            )
+            batch = self._map_ids_to_local(batch)
+        self._debug_validate_local_ids(batch)
+        return batch
     def _prepare_batch_ahead(self, batches: deque, new_batch=None):
         if not batches:
             return
@@ -2377,6 +2427,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                             break
                         if not self._stage_local_ids:
                             next_batch = self._map_ids_to_local(next_batch)
+                        else:
+                            next_batch = self._maybe_remap_staged_batch(next_batch)
                     else:
                         next_batch = next(self.iter_dataloader)
                         while next_batch["epoch"] != self.epoch or next_batch[
@@ -2384,6 +2436,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                             next_batch = next(self.iter_dataloader)
                         if not self._stage_local_ids:
                             next_batch = self._map_ids_to_local(next_batch)
+                        else:
+                            next_batch = self._maybe_remap_staged_batch(next_batch)
                         load_end = time.time()
                         dataloader_time += load_end
                         if profile_interval_batches > 0:
