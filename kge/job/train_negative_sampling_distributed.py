@@ -1234,9 +1234,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         ).to(dtype=torch.long)
         work_rel_sorted = torch.unique(work_rel_cpu)
         pos = torch.searchsorted(work_rel_sorted, unique_rel)
-        in_bounds = (pos < work_rel_sorted.numel()) & (
-            work_rel_sorted[pos] == unique_rel
-        )
+        in_bounds = pos < work_rel_sorted.numel()
+        if in_bounds.any():
+            matches = work_rel_sorted[pos[in_bounds]] == unique_rel[in_bounds]
+            in_bounds = in_bounds.clone()
+            in_bounds[in_bounds] = matches
         if in_bounds.all():
             return work_relations
         missing = unique_rel[~in_bounds]
