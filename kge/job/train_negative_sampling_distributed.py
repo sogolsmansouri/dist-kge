@@ -1211,6 +1211,42 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 return True
         return False
 
+    def _ensure_partition_relations(self, work, work_relations):
+        if work is None or work.numel() == 0:
+            return work_relations
+        triples = getattr(self.dataloader_dataset, "triples", None)
+        if triples is None:
+            return work_relations
+        work_cpu = work if work.device.type == "cpu" else work.cpu()
+        triples_cpu = triples if triples.device.type == "cpu" else triples.cpu()
+        rel_ids = triples_cpu.index_select(0, work_cpu)[:, P]
+        unique_rel = torch.unique(rel_ids)
+        if unique_rel.numel() == 0:
+            return work_relations
+        if work_relations is None or work_relations.numel() == 0:
+            return unique_rel.to(dtype=torch.long)
+        work_rel_cpu = (
+            work_relations
+            if work_relations.device.type == "cpu"
+            else work_relations.cpu()
+        ).to(dtype=torch.long)
+        work_rel_sorted = torch.unique(work_rel_cpu)
+        pos = torch.searchsorted(work_rel_sorted, unique_rel)
+        in_bounds = (pos < work_rel_sorted.numel()) & (
+            work_rel_sorted[pos] == unique_rel
+        )
+        if in_bounds.all():
+            return work_relations
+        missing = unique_rel[~in_bounds]
+        if self._debug_id_bounds:
+            self.config.log(
+                "Extending relation partition set with "
+                f"{missing.numel()} missing ids from work."
+            )
+        merged = torch.unique(torch.cat((work_rel_sorted, missing)))
+        target_device = work_relations.device
+        return merged.to(device=target_device, dtype=torch.long)
+
     def _maybe_remap_staged_batch(self, batch):
         """Remap staged local ids if they appear to be global."""
         if not self._stage_local_ids:
@@ -1225,6 +1261,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             batch = self._map_ids_to_local(batch)
         self._debug_validate_local_ids(batch)
         return batch
+
     def _prepare_batch_ahead(self, batches: deque, new_batch=None):
         if not batches:
             return
@@ -2120,6 +2157,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 work_entities = work_entities.long()
             if work_relations is not None:
                 work_relations = work_relations.long()
+            if self.relation_sync_level == "partition":
+                work_relations = self._ensure_partition_relations(work, work_relations)
             self.entity_partition_localized = False
             self.relation_partition_localized = False
             if work is None:
