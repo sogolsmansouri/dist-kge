@@ -134,6 +134,8 @@ job:
     relation_gradient_trace: False
     gradient_trace_log_interval: 0
     gradient_trace_top_relations: 0
+    negative_sampling_log_interval: 0  # log neg-sampling pool/window stats every N partitions
+    other_time_log_interval: 0  # log other_time breakdown every N partitions
     gradient_graph:
       enable: False
       top_relations: 0   # 0 keeps all relations per partition
