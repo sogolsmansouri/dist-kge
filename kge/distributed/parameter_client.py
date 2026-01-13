@@ -28,6 +28,7 @@ class KgeParameterClient:
         self.num_meta_keys: int = get_num_meta_keys(config)
         self._pull_stats = {"calls": 0, "keys": 0, "bytes": 0}
         self._push_stats = {"calls": 0, "keys": 0, "bytes": 0}
+        self._set_stats = {"calls": 0, "keys": 0, "bytes": 0}
         self._single_process = bool(config.get("job.distributed.single_process"))
         if self._single_process:
             self.worker_group = None
@@ -118,6 +119,28 @@ class KgeParameterClient:
         self._push_stats["keys"] += num_keys
         self._push_stats["bytes"] += num_keys * width * elem_size
 
+    def _track_set(self, keys, set_tensor):
+        try:
+            if keys is None:
+                return
+            if isinstance(keys, torch.Tensor):
+                num_keys = int(keys.numel())
+            else:
+                num_keys = int(len(keys))
+        except Exception:
+            return
+        if num_keys <= 0:
+            return
+        width = self.dim
+        elem_size = 4
+        if isinstance(set_tensor, torch.Tensor):
+            if set_tensor.dim() >= 2:
+                width = int(set_tensor.shape[1])
+            elem_size = set_tensor.element_size()
+        self._set_stats["calls"] += 1
+        self._set_stats["keys"] += num_keys
+        self._set_stats["bytes"] += num_keys * width * elem_size
+
     def get_pull_stats(self):
         return dict(self._pull_stats)
 
@@ -138,6 +161,17 @@ class KgeParameterClient:
     def get_and_reset_push_stats(self):
         stats = self.get_push_stats()
         self.reset_push_stats()
+        return stats
+
+    def get_set_stats(self):
+        return dict(self._set_stats)
+
+    def reset_set_stats(self):
+        self._set_stats = {"calls": 0, "keys": 0, "bytes": 0}
+
+    def get_and_reset_set_stats(self):
+        stats = self.get_set_stats()
+        self.reset_set_stats()
         return stats
 
     @staticmethod
@@ -300,6 +334,7 @@ class LapseParameterClient(LapseWorker, KgeParameterClient):
 
     def set(self, keys, set_tensor, asynchronous=False):
         super(LapseParameterClient, self).set(keys, set_tensor, asynchronous)
+        self._track_set(keys, set_tensor)
 
     def localize(self, keys, asynchronous=False):
         super(LapseParameterClient, self).localize(keys, asynchronous)
@@ -421,6 +456,7 @@ class TorchParameterClient(KgeParameterClient):
         dist.send(cmd, dst=self.server_rank)
         dist.send(keys, dst=self.server_rank)
         dist.send(set_tensor, dst=self.server_rank)
+        self._track_set(keys, set_tensor)
 
     def localize(self, keys, asynchronous=False):
         pass
@@ -694,6 +730,7 @@ class SharedParameterClient(KgeParameterClient):
     @torch.no_grad()
     def set(self, keys, set_tensor, asynchronous=False):
         self.parameters[keys, :] = set_tensor
+        self._track_set(keys, set_tensor)
 
     def localize(self, keys, asynchronous=False):
         pass

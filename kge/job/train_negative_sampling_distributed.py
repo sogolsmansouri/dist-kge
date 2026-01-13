@@ -2977,6 +2977,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         )
         pull_stats = None
         push_stats = None
+        set_stats = None
         if hasattr(self.parameter_client, "get_and_reset_pull_stats"):
             try:
                 pull_stats = self.parameter_client.get_and_reset_pull_stats()
@@ -2987,6 +2988,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 push_stats = self.parameter_client.get_and_reset_push_stats()
             except Exception:
                 push_stats = None
+        if hasattr(self.parameter_client, "get_and_reset_set_stats"):
+            try:
+                set_stats = self.parameter_client.get_and_reset_set_stats()
+            except Exception:
+                set_stats = None
         # --- GPU cache stats (best-effort; never crash training) ---
         try:
             stats = {}
@@ -3159,6 +3165,14 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     ps_push_calls=push_stats.get("calls", 0),
                     ps_push_keys=push_stats.get("keys", 0),
                     ps_push_bytes=push_stats.get("bytes", 0),
+                )
+            )
+        if set_stats:
+            self.current_trace["epoch"].update(
+                dict(
+                    ps_set_calls=set_stats.get("calls", 0),
+                    ps_set_keys=set_stats.get("keys", 0),
+                    ps_set_bytes=set_stats.get("bytes", 0),
                 )
             )
         trace_entry = self.trace(**self.current_trace["epoch"], echo=False, log=True)
