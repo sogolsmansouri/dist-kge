@@ -3089,23 +3089,27 @@ class GlowWorkScheduler(AdaptiveWorkScheduler):
             self._partition_relations_map = None
             return
         try:
-            assignments = self.dataset.load_relations_to_partitions(self.num_partitions)
+            triples = self._get_train_triples()
         except Exception as exc:
             self.config.log(
-                f"Glow scheduler: could not load relation partition map ({exc}); using all relations."
+                "Glow scheduler: could not load train triples for relation map "
+                f"({exc}); using all relations."
             )
             self._partition_relations_map = None
             return
-        np_type = TORCH_TO_NP_DTYPE[self.data_type]
+        if triples.numel() == 0:
+            self._partition_relations_map = {}
+            return
+        relations = triples[:, 1]
         mapping = {}
-        for partition in range(self.num_partitions):
-            indexes = np.where(assignments == partition)[0]
-            if indexes.size == 0:
+        for partition, tensor_ids in enumerate(self.partitions):
+            if tensor_ids is None or len(tensor_ids) == 0:
                 mapping[partition] = torch.empty((0,), dtype=self.data_type)
-            else:
-                mapping[partition] = torch.from_numpy(
-                    indexes.astype(np_type)
-                ).contiguous()
+                continue
+            if tensor_ids.dtype != torch.long:
+                tensor_ids = tensor_ids.long()
+            rels = torch.unique(relations.index_select(0, tensor_ids))
+            mapping[partition] = rels.to(dtype=self.data_type).contiguous().cpu()
         self._partition_relations_map = mapping
         self.config.log(
             f"Glow scheduler loaded relation partition map for {len(mapping)} partitions."
