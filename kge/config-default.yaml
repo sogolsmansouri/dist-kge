@@ -134,6 +134,7 @@ job:
     relation_gradient_trace: False
     gradient_trace_log_interval: 0
     gradient_trace_top_relations: 0
+    gradient_accum_interval: 1  # compute partition gradient stats every N batches
     negative_sampling_log_interval: 0  # log neg-sampling pool/window stats every N partitions
     other_time_log_interval: 0  # log other_time breakdown every N partitions
     gradient_graph:

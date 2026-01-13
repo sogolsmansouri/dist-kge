@@ -486,6 +486,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         )
         self._entity_vocab_size = self.dataset.num_entities()
         self._relation_vocab_size = self.dataset.num_relations()
+        self._active_entity_pull_ids_cpu = None
+        self._active_relation_pull_ids_cpu = None
         self._debug_id_bounds = bool(
             self.config.get("job.distributed.debug_id_bounds")
         )
@@ -501,6 +503,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         self._gradient_log_top_relations = 0
         self._neg_sample_log_interval = 0
         self._other_time_log_interval = 0
+        self._gradient_accum_interval = 1
         try:
             self._gradient_log_interval = int(
                 self.config.get("job.distributed.gradient_trace_log_interval")
@@ -519,6 +522,14 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
         except KeyError:
             self._gradient_log_top_relations = 0
+        try:
+            self._gradient_accum_interval = int(
+                self.config.get("job.distributed.gradient_accum_interval")
+            )
+        except KeyError:
+            self._gradient_accum_interval = 1
+        if self._gradient_accum_interval < 1:
+            self._gradient_accum_interval = 1
         try:
             self._neg_sample_log_interval = int(
                 self.config.get("job.distributed.negative_sampling_log_interval")
@@ -1475,6 +1486,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if self._track_partition_gradients
             else None
         )
+        self._partition_grad_batch_counter = 0
         self._partition_grad_samples = 0
         self._reset_partition_relation_gradient_trace()
 
@@ -1488,6 +1500,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         if not self._track_partition_gradients:
             return
         if self.is_forward_only or self._current_partition_id is None:
+            return
+        self._partition_grad_batch_counter += 1
+        if (
+            self._gradient_accum_interval > 1
+            and (self._partition_grad_batch_counter % self._gradient_accum_interval) != 0
+        ):
             return
         grad_norm = self._compute_batch_gradient_norm()
         if grad_norm is None:
@@ -2362,6 +2380,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     ] = torch.arange(
                         len(entity_pull_ids), dtype=torch.long, device="cpu"
                     )
+                    self._active_entity_pull_ids_cpu = (
+                        entity_pull_ids.detach().cpu().long()
+                    )
                     if self._map_ids_device.type == "cuda" and not self._stage_local_ids:
                         entity_mapper_device = self._ensure_partition_mapper_device(
                             "entity"
@@ -2390,6 +2411,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         work_relations
                     ] = torch.arange(
                         len(work_relations), dtype=torch.long, device="cpu"
+                    )
+                    self._active_relation_pull_ids_cpu = (
+                        work_relations.detach().cpu().long()
                     )
                     if self._map_ids_device.type == "cuda" and not self._stage_local_ids:
                         relation_mapper_device = self._ensure_partition_mapper_device(
@@ -2858,8 +2882,21 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 else:
                     self.model.get_s_embedder().set_embeddings()
                 ps_set_time += time.time()
-                # this is expensive and unnecessary
-                # self.model.get_s_embedder().global_to_local_mapper[:] = -1
+                if self._active_entity_pull_ids_cpu is not None:
+                    self.model.get_s_embedder().global_to_local_mapper[
+                        self._active_entity_pull_ids_cpu
+                    ] = -1
+                    if self._map_ids_device.type == "cuda" and not self._stage_local_ids:
+                        entity_mapper_device = self._ensure_partition_mapper_device(
+                            "entity"
+                        )
+                        if entity_mapper_device is not None:
+                            entity_mapper_device[
+                                self._active_entity_pull_ids_cpu.to(
+                                    self._map_ids_device, non_blocking=True
+                                )
+                            ] = -1
+                    self._active_entity_pull_ids_cpu = None
                 self.model.get_s_embedder().push_back()
             if self.relation_sync_level == "partition":
                 ps_set_time -= time.time()
@@ -2869,7 +2906,21 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 else:
                     self.model.get_p_embedder().set_embeddings()
                 ps_set_time += time.time()
-                # self.model.get_p_embedder().global_to_local_mapper[:] = -1
+                if self._active_relation_pull_ids_cpu is not None:
+                    self.model.get_p_embedder().global_to_local_mapper[
+                        self._active_relation_pull_ids_cpu
+                    ] = -1
+                    if self._map_ids_device.type == "cuda" and not self._stage_local_ids:
+                        relation_mapper_device = self._ensure_partition_mapper_device(
+                            "relation"
+                        )
+                        if relation_mapper_device is not None:
+                            relation_mapper_device[
+                                self._active_relation_pull_ids_cpu.to(
+                                    self._map_ids_device, non_blocking=True
+                                )
+                            ] = -1
+                    self._active_relation_pull_ids_cpu = None
                 self.model.get_p_embedder().push_back()
             partition_duration = time.time() - partition_start_time
             chunk_partition_id = self._current_partition_id

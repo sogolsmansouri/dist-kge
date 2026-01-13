@@ -23,7 +23,7 @@ def get_optimizer_dim(config: Config, dim):
     optimizer = config.get("train.optimizer.default.type")
     optimizer_key = str(optimizer).lower()
     if optimizer_key in ["dist_sgd", "sgd"]:
-        optimizer_dim = -1
+        optimizer_dim = 0
     elif optimizer_key in ["dist_adagrad", "adagrad"]:
         optimizer_dim = dim
     elif optimizer_key in ["dist_rowadagrad", "rowadagrad"]:
