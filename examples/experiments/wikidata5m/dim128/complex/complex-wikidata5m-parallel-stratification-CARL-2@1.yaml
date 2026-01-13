@@ -3,7 +3,7 @@ complex:
     dropout: 0.44299429655075073
     regularize_weight: 7.830760727899156e-12
   relation_embedder:
-    dropout: -0.4746062345802784
+    dropout: 0.0
     regularize_weight: 1.182876478423781e-10
 dataset:
   name: wikidata5m
@@ -81,4 +81,3 @@ valid:
       epochs: 2
       metric_value: 0.1
   every: 5
-
