@@ -1441,6 +1441,72 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             result.relation_pull_time += relation_pull_time
             result.cpu_gpu_time += cpu_gpu_time
 
+        # --- Duplication ratio stats (best-effort; cheap and optional) ---
+        try:
+            interval = int(self.config.get("train.duplication_log_interval_batches"))
+        except Exception:
+            interval = 0
+        if interval > 0 and batch_index % interval == 0:
+            # Approximate raw "row touches" implied by negative sampling:
+            # each scored triple touches 2 entity rows (s,o) and 1 relation row (p).
+            # We score: positive + S negatives + P negatives + O negatives.
+            try:
+                num_pos = int(result.size)
+                num_s = int(getattr(self._sampler, "num_samples", [0, 0, 0])[S])
+                num_p = int(getattr(self._sampler, "num_samples", [0, 0, 0])[P])
+                num_o = int(getattr(self._sampler, "num_samples", [0, 0, 0])[O])
+                scored_per_pos = 1 + max(0, num_s) + max(0, num_p) + max(0, num_o)
+                raw_entity_touches = 2 * num_pos * scored_per_pos
+                raw_relation_touches = 1 * num_pos * scored_per_pos
+
+                unique_entities = batch.get("unique_entities")
+                unique_relations = batch.get("unique_relations")
+                unique_entity_rows = int(unique_entities.numel()) if unique_entities is not None else 0
+                unique_relation_rows = int(unique_relations.numel()) if unique_relations is not None else 0
+
+                entity_dup = (
+                    (raw_entity_touches / unique_entity_rows)
+                    if unique_entity_rows > 0
+                    else float("nan")
+                )
+                relation_dup = (
+                    (raw_relation_touches / unique_relation_rows)
+                    if unique_relation_rows > 0
+                    else float("nan")
+                )
+
+                result.duplication_stats = {
+                    "num_pos": num_pos,
+                    "num_neg_s": max(0, num_s),
+                    "num_neg_p": max(0, num_p),
+                    "num_neg_o": max(0, num_o),
+                    "raw_entity_touches": int(raw_entity_touches),
+                    "unique_entity_rows": unique_entity_rows,
+                    "entity_dup_ratio": float(entity_dup),
+                    "raw_relation_touches": int(raw_relation_touches),
+                    "unique_relation_rows": unique_relation_rows,
+                    "relation_dup_ratio": float(relation_dup),
+                }
+
+                # Avoid log spam: emit only on rank 0 / min_rank.
+                if (
+                    getattr(self, "parameter_client", None) is None
+                    or getattr(self.parameter_client, "rank", None) == self.min_rank
+                ):
+                    self.config.log(
+                        "[dup] "
+                        f"batch={batch_index} pos={num_pos} "
+                        f"neg(s,p,o)=({max(0,num_s)},{max(0,num_p)},{max(0,num_o)}) "
+                        f"unique_entities={unique_entity_rows} "
+                        f"raw_entity_touches={raw_entity_touches} "
+                        f"entity_dup={entity_dup:.3f} | "
+                        f"unique_relations={unique_relation_rows} "
+                        f"raw_relation_touches={raw_relation_touches} "
+                        f"relation_dup={relation_dup:.3f}"
+                    )
+            except Exception:
+                pass
+
         batch["labels"] = [None] * 3  # reuse label tensors b/w subbatches
         result.size = len(batch["triples"])
         result.prepare_time += time.time()
@@ -2753,6 +2819,9 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         "event": "batch_completed",
                     }
                 )
+                dup_stats = getattr(batch_result, "duplication_stats", None)
+                if isinstance(dup_stats, dict):
+                    self.current_trace["batch"].update(dup_stats)
 
                 # run the post-batch hooks (may modify the trace)
                 hook_time -= time.time()

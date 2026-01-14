@@ -499,6 +499,9 @@ train:
   # When enabled, synchronize CUDA at timing boundaries for more accurate
   # attribution between compute and scheduler time. Use for profiling.
   sync_cuda_timing: False
+  # When >0, log estimated duplication ratios every N batches (negative sampling).
+  # Useful to assess whether reduce-by-key / fused sparse kernels can help.
+  duplication_log_interval_batches: 0
 
   # When to create checkpoints
   checkpoint:
