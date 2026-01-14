@@ -106,20 +106,22 @@ class ComplEx(KgeModel):
         self._cache_row_grads = False
         self._reduce_by_key_logged = False
         if config is not None:
+            # Resolve reduce-by-key options via the model's configuration key so
+            # distributed base-model overrides are honored.
             try:
-                self._reduce_by_key = bool(config.get("complex.reduce_by_key"))
+                self._reduce_by_key = bool(self.get_option("reduce_by_key"))
             except Exception:
                 self._reduce_by_key = False
             try:
                 reduce_by_key_row_grads = bool(
-                    config.get("complex.reduce_by_key_row_grads")
+                    self.get_option("reduce_by_key_row_grads")
                 )
             except Exception:
                 reduce_by_key_row_grads = False
             if reduce_by_key_row_grads and not self._reduce_by_key:
                 if config.get("train.auto_correct"):
-                    config.set(
-                        "complex.reduce_by_key",
+                    self.set_option(
+                        "reduce_by_key",
                         True,
                         overwrite=Config.Overwrite.Yes,
                         log=True,
