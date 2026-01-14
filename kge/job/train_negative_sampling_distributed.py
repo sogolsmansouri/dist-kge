@@ -1451,16 +1451,47 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             # each scored triple touches 2 entity rows (s,o) and 1 relation row (p).
             # We score: positive + S negatives + P negatives + O negatives.
             try:
-                num_pos = int(result.size)
-                num_s = int(getattr(self._sampler, "num_samples", [0, 0, 0])[S])
-                num_p = int(getattr(self._sampler, "num_samples", [0, 0, 0])[P])
-                num_o = int(getattr(self._sampler, "num_samples", [0, 0, 0])[O])
+                triples = batch.get("triples")
+                if triples is None:
+                    raise RuntimeError("Missing triples in batch.")
+                num_pos = int(triples.size(0))
+
+                num_samples = getattr(self._sampler, "num_samples", [0, 0, 0])
+                num_s = int(num_samples[S]) if len(num_samples) > S else 0
+                num_p = int(num_samples[P]) if len(num_samples) > P else 0
+                num_o = int(num_samples[O]) if len(num_samples) > O else 0
                 scored_per_pos = 1 + max(0, num_s) + max(0, num_p) + max(0, num_o)
                 raw_entity_touches = 2 * num_pos * scored_per_pos
                 raw_relation_touches = 1 * num_pos * scored_per_pos
 
+                # Reuse precomputed uniques when available (batch-sync mode),
+                # otherwise compute on-demand (every N batches).
                 unique_entities = batch.get("unique_entities")
                 unique_relations = batch.get("unique_relations")
+                if unique_entities is None:
+                    pos_entities = triples[:, [S, O]].reshape(-1)
+                    if pos_entities.device.type != "cpu":
+                        pos_entities = pos_entities.detach().cpu()
+                    neg_s = batch["negative_samples"][S].unique_samples(remove_dropped=True)
+                    if neg_s.device.type != "cpu":
+                        neg_s = neg_s.detach().cpu()
+                    neg_o = batch["negative_samples"][O].unique_samples(remove_dropped=True)
+                    if neg_o.device.type != "cpu":
+                        neg_o = neg_o.detach().cpu()
+                    unique_entities = torch.unique(
+                        torch.cat((pos_entities, neg_s, neg_o)), sorted=False
+                    )
+                if unique_relations is None:
+                    pos_relations = triples[:, P].reshape(-1)
+                    if pos_relations.device.type != "cpu":
+                        pos_relations = pos_relations.detach().cpu()
+                    neg_p = batch["negative_samples"][P].unique_samples(remove_dropped=True)
+                    if neg_p.device.type != "cpu":
+                        neg_p = neg_p.detach().cpu()
+                    unique_relations = torch.unique(
+                        torch.cat((pos_relations, neg_p)), sorted=False
+                    )
+
                 unique_entity_rows = int(unique_entities.numel()) if unique_entities is not None else 0
                 unique_relation_rows = int(unique_relations.numel()) if unique_relations is not None else 0
 
