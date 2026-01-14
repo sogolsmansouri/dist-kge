@@ -24,6 +24,7 @@ class ComplExScorer(RelationalScorer):
         self._reduce_by_key = False
         self._cache_row_grads = False
         self._reduce_by_key_logged = False
+        self._reduce_by_key_inactive_logged = False
         if self.config is not None:
             self.config.log(
                 "ComplEx fused path: "
@@ -46,6 +47,22 @@ class ComplExScorer(RelationalScorer):
         if self._cache_row_grads and not self._reduce_by_key:
             self._cache_row_grads = False
 
+    def _maybe_log_reduce_by_key_inactive(self, reasons) -> None:
+        if (
+            not self._reduce_by_key
+            or self._reduce_by_key_inactive_logged
+            or self.config is None
+        ):
+            return
+        if not reasons:
+            return
+        self.config.log(
+            "ComplEx reduce_by_key configured but inactive: "
+            + ", ".join(str(r) for r in reasons)
+            + "."
+        )
+        self._reduce_by_key_inactive_logged = True
+
     def _get_bool_option(self, key: str, default: bool = False) -> bool:
         value = None
         try:
@@ -57,7 +74,7 @@ class ComplExScorer(RelationalScorer):
         if isinstance(value, (int, float)):
             return bool(int(value))
         if isinstance(value, str):
-            raw = value.strip().lower()
+            raw = value.strip().strip("'\"").lower()
             if raw in ("1", "true", "yes", "y", "on"):
                 return True
             if raw in ("0", "false", "no", "n", "off", ""):
@@ -76,18 +93,32 @@ class ComplExScorer(RelationalScorer):
     ):
         if not self._reduce_by_key:
             return None
-        if not training or not torch.is_grad_enabled():
-            return None
+        reasons = []
+        if not training:
+            reasons.append("not training")
+        if not torch.is_grad_enabled():
+            reasons.append("grad disabled")
         if not getattr(s_embedder, "sparse", False):
-            return None
+            reasons.append("s_embedder.sparse=False")
         if not getattr(p_embedder, "sparse", False):
-            return None
+            reasons.append("p_embedder.sparse=False")
         if not getattr(o_embedder, "sparse", False):
-            return None
+            reasons.append("o_embedder.sparse=False")
         # Needs direct access to embedding weights.
-        if not hasattr(s_embedder, "_embeddings") or not hasattr(p_embedder, "_embeddings"):
-            return None
-        if not hasattr(o_embedder, "_embeddings"):
+        if not hasattr(s_embedder, "_embeddings") or not hasattr(
+            getattr(s_embedder, "_embeddings", None), "weight"
+        ):
+            reasons.append("s_embedder missing _embeddings.weight")
+        if not hasattr(p_embedder, "_embeddings") or not hasattr(
+            getattr(p_embedder, "_embeddings", None), "weight"
+        ):
+            reasons.append("p_embedder missing _embeddings.weight")
+        if not hasattr(o_embedder, "_embeddings") or not hasattr(
+            getattr(o_embedder, "_embeddings", None), "weight"
+        ):
+            reasons.append("o_embedder missing _embeddings.weight")
+        if reasons:
+            self._maybe_log_reduce_by_key_inactive(reasons)
             return None
         if self.config is not None and not self._reduce_by_key_logged:
             self.config.log(
@@ -187,16 +218,19 @@ class ComplEx(KgeModel):
         self._reduce_by_key = False
         self._cache_row_grads = False
         self._reduce_by_key_logged = False
+        self._reduce_by_key_inactive_logged = False
         if config is not None:
             # Resolve reduce-by-key options via the model's configuration key so
             # distributed base-model overrides are honored.
             try:
-                self._reduce_by_key = bool(self.get_option("reduce_by_key"))
+                self._reduce_by_key = self._get_bool_option(
+                    "reduce_by_key", default=False
+                )
             except Exception:
                 self._reduce_by_key = False
             try:
-                reduce_by_key_row_grads = bool(
-                    self.get_option("reduce_by_key_row_grads")
+                reduce_by_key_row_grads = self._get_bool_option(
+                    "reduce_by_key_row_grads", default=False
                 )
             except Exception:
                 reduce_by_key_row_grads = False
@@ -219,19 +253,71 @@ class ComplEx(KgeModel):
                 if reduce_by_key_row_grads:
                     self._cache_row_grads = True
 
+    def _maybe_log_reduce_by_key_inactive(self, reasons) -> None:
+        if (
+            not self._reduce_by_key
+            or self._reduce_by_key_inactive_logged
+            or self.config is None
+        ):
+            return
+        if not reasons:
+            return
+        self.config.log(
+            "ComplEx reduce_by_key configured but inactive: "
+            + ", ".join(str(r) for r in reasons)
+            + "."
+        )
+        self._reduce_by_key_inactive_logged = True
+
+    def _get_bool_option(self, key: str, default: bool = False) -> bool:
+        value = None
+        try:
+            value = self.get_option(key)
+        except Exception:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            raw = value.strip().strip("'\"").lower()
+            if raw in ("1", "true", "yes", "y", "on"):
+                return True
+            if raw in ("0", "false", "no", "n", "off", ""):
+                return False
+        return bool(value)
+
     def _reduce_by_key_enabled(self) -> bool:
         if not self._reduce_by_key:
             return False
-        if not self.training or not torch.is_grad_enabled():
-            return False
+        reasons = []
+        if not self.training:
+            reasons.append("not training")
+        if not torch.is_grad_enabled():
+            reasons.append("grad disabled")
         s_embedder = self.get_s_embedder()
         p_embedder = self.get_p_embedder()
         o_embedder = self.get_o_embedder()
         if not getattr(s_embedder, "sparse", False):
-            return False
+            reasons.append("s_embedder.sparse=False")
         if not getattr(p_embedder, "sparse", False):
-            return False
+            reasons.append("p_embedder.sparse=False")
         if not getattr(o_embedder, "sparse", False):
+            reasons.append("o_embedder.sparse=False")
+        if not hasattr(s_embedder, "_embeddings") or not hasattr(
+            getattr(s_embedder, "_embeddings", None), "weight"
+        ):
+            reasons.append("s_embedder missing _embeddings.weight")
+        if not hasattr(p_embedder, "_embeddings") or not hasattr(
+            getattr(p_embedder, "_embeddings", None), "weight"
+        ):
+            reasons.append("p_embedder missing _embeddings.weight")
+        if not hasattr(o_embedder, "_embeddings") or not hasattr(
+            getattr(o_embedder, "_embeddings", None), "weight"
+        ):
+            reasons.append("o_embedder missing _embeddings.weight")
+        if reasons:
+            self._maybe_log_reduce_by_key_inactive(reasons)
             return False
         if not self._reduce_by_key_logged and self.config is not None:
             self.config.log(

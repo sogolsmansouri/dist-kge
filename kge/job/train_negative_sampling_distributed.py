@@ -909,7 +909,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 pos_entities = pos_source[:, [S, O]].view(-1)
                 if not use_gpu_unique and pos_entities.device.type != "cpu":
                     pos_entities = pos_entities.cpu()
-                neg_s = negative_samples[S].unique_samples(remove_dropped=False)
+                neg_s = negative_samples[S].unique_samples(remove_dropped=True)
                 if use_gpu_unique:
                     if neg_s.device != sampler_triples.device:
                         neg_s = neg_s.to(
@@ -918,7 +918,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         )
                 elif neg_s.device.type != "cpu":
                     neg_s = neg_s.cpu()
-                neg_o = negative_samples[O].unique_samples(remove_dropped=False)
+                neg_o = negative_samples[O].unique_samples(remove_dropped=True)
                 if use_gpu_unique:
                     if neg_o.device != sampler_triples.device:
                         neg_o = neg_o.to(
@@ -950,7 +950,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 pos_relations = pos_source[:, [P]].view(-1)
                 if not use_gpu_unique and pos_relations.device.type != "cpu":
                     pos_relations = pos_relations.cpu()
-                neg_p = negative_samples[P].unique_samples(remove_dropped=False)
+                neg_p = negative_samples[P].unique_samples(remove_dropped=True)
                 if use_gpu_unique:
                     if neg_p.device != sampler_triples.device:
                         neg_p = neg_p.to(
@@ -2644,7 +2644,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 batch = pre_load_batches.popleft()
 
                 # create initial batch trace (yet incomplete)
-                total_batches = (
+                num_batches = (
                     len(self.loader)
                     if self.loader is not None
                     else self.dataloader_dataset.get_real_len()
@@ -2655,7 +2655,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     "epoch": self.epoch,
                     "split": self.train_split,
                     "batch": batch_index,
-                    "batches": total_batches,
+                    "batches": num_batches,
                 }
                 if not self.is_forward_only:
                     self.current_trace["batch"].update(

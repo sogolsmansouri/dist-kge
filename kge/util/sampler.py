@@ -301,7 +301,18 @@ class BatchNegativeSample(Configurable):
 
         """
         samples = self.samples(indexes)
-        return torch.unique(samples.view(-1), return_inverse=return_inverse)
+        flat = samples.view(-1)
+        if remove_dropped and not return_inverse:
+            # Some sampling/mapping paths can mark invalid samples with negative ids
+            # (e.g., -1). These must never reach prefetch/pull/indexing paths.
+            #
+            # IMPORTANT: do NOT filter when return_inverse=True, because that would
+            # make the returned inverse mapping inconsistent with the original
+            # samples tensor.
+            valid = flat >= 0
+            if not torch.all(valid):
+                flat = flat[valid]
+        return torch.unique(flat, return_inverse=return_inverse)
 
     def to(self, device, non_blocking: bool = False) -> "BatchNegativeSample":
         """Move the negative samples to the specified device."""

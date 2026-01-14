@@ -28,7 +28,7 @@ class LookupEmbedder(KgeEmbedder):
         self.regularize = self.check_option("regularize", ["", "lp"])
         self.sparse = self.get_option("sparse")
         if isinstance(self.sparse, str):
-            sparse_raw = self.sparse.strip().lower()
+            sparse_raw = self.sparse.strip().strip("'\"").lower()
             if sparse_raw in ("1", "true", "yes", "y", "on"):
                 self.sparse = True
             elif sparse_raw in ("0", "false", "no", "n", "off", ""):

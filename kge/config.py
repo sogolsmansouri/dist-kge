@@ -232,6 +232,12 @@ class Config:
                 value = int(value)
             elif isinstance(value, str) and is_number(value, float):
                 value = float(value)
+            elif isinstance(value, str):
+                raw = value.strip().strip("'\"").lower()
+                if raw in ("1", "true", "yes", "y", "on"):
+                    value = True
+                elif raw in ("0", "false", "no", "n", "off", ""):
+                    value = False
         else:
             if (
                 isinstance(value, str)
@@ -246,7 +252,7 @@ class Config:
             ):
                 value = int(value)
             elif isinstance(value, str) and isinstance(current_value, bool):
-                raw = value.strip().lower()
+                raw = value.strip().strip("'\"").lower()
                 if raw in ("1", "true", "yes", "y", "on"):
                     value = True
                 elif raw in ("0", "false", "no", "n", "off", ""):

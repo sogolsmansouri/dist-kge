@@ -706,6 +706,45 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self.copy_stream.record_event(event)
         return target, event
 
+    @staticmethod
+    def _prefetch_signature(indexes: torch.Tensor):
+        """Cheap signature for a pull request to detect prefetch queue misalignment."""
+        if not isinstance(indexes, torch.Tensor):
+            try:
+                n = len(indexes)
+            except Exception:
+                return None
+            if n <= 0:
+                return (0, 0, 0, 0, 0, 0)
+            try:
+                first = int(indexes[0])
+                q1 = int(indexes[n // 4])
+                mid = int(indexes[n // 2])
+                q3 = int(indexes[(3 * n) // 4])
+                last = int(indexes[-1])
+            except Exception:
+                return (n, 0, 0, 0, 0, 0)
+            return (n, first, q1, mid, q3, last)
+
+        flat = indexes.reshape(-1)
+        n = int(flat.numel())
+        if n <= 0:
+            return (0, 0, 0, 0, 0, 0)
+        # Use a few sampled entries; avoids O(n) comparisons on large id lists.
+        try:
+            idx = torch.tensor(
+                [0, n // 4, n // 2, (3 * n) // 4, n - 1],
+                dtype=torch.long,
+                device=flat.device,
+            )
+            sample = flat.index_select(0, idx).detach()
+            if sample.device.type != "cpu":
+                sample = sample.cpu()
+            first, q1, mid, q3, last = (int(x) for x in sample.tolist())
+        except Exception:
+            return (n, 0, 0, 0, 0, 0)
+        return (n, first, q1, mid, q3, last)
+
     @torch.no_grad()
     def pre_pull(self, indexes):
         indexes_cpu = indexes.detach().cpu().long()
@@ -758,6 +797,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
         pull_future = self.parameter_client.pull(
             pull_indexes, pull_tensor, asynchronous=True
         )
+        signature = self._prefetch_signature(indexes_cpu)
         self.pre_pulled.append(
             {
                 "indexes": indexes,
@@ -770,6 +810,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
                 "cold_mask": cold_mask,
                 "cold_rows": cold_rows,
                 "cold_indexes_cpu": cold_indexes_cpu,
+                "signature": signature,
             }
         )
 
@@ -787,9 +828,41 @@ class DistributedLookupEmbedder(LookupEmbedder):
             self._setup_gpu_cache()
         use_prefetch = len(self.pre_pulled) > 0
         if use_prefetch:
-            # todo: add workaround for relations here as well
+            # Guard against prefetch queue misalignment: only consume a prefetch entry
+            # when it matches the current pull request. Otherwise, discard stale
+            # entries and fall back to synchronous pulls for correctness.
+            requested_sig = self._prefetch_signature(indexes)
+            pre_pulled = None
+            while self.pre_pulled:
+                candidate = self.pre_pulled[0]
+                cand_sig = candidate.get("signature")
+                if cand_sig is None or requested_sig is None or cand_sig == requested_sig:
+                    pre_pulled = self.pre_pulled.popleft()
+                    break
+                stale = self.pre_pulled.popleft()
+                try:
+                    self.parameter_client.wait(stale.get("pull_future"))
+                except Exception:
+                    pass
+                try:
+                    self.pull_tensors[stale.get("pull_tensor_index", 0)][0] = True
+                except Exception:
+                    pass
+                if not hasattr(self, "_prefetch_mismatch_logged"):
+                    self._prefetch_mismatch_logged = True
+                    try:
+                        self.config.log(
+                            "Discarded stale prefetch entry due to signature mismatch "
+                            f"(expected={requested_sig}, got={cand_sig})."
+                        )
+                    except Exception:
+                        pass
+
+            if pre_pulled is None:
+                use_prefetch = False
+
+        if use_prefetch:
             # todo: clean up this method
-            pre_pulled = self.pre_pulled.popleft()
             indexes = pre_pulled["indexes"]
             len_indexes = pre_pulled.get("num_indexes", len(indexes))
             self.pulled_ids = indexes
