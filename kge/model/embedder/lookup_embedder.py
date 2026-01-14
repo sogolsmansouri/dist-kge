@@ -27,6 +27,16 @@ class LookupEmbedder(KgeEmbedder):
         self.normalize_p = self.get_option("normalize.p")
         self.regularize = self.check_option("regularize", ["", "lp"])
         self.sparse = self.get_option("sparse")
+        if isinstance(self.sparse, str):
+            sparse_raw = self.sparse.strip().lower()
+            if sparse_raw in ("1", "true", "yes", "y", "on"):
+                self.sparse = True
+            elif sparse_raw in ("0", "false", "no", "n", "off", ""):
+                self.sparse = False
+            else:
+                raise ValueError(
+                    f"{configuration_key}.sparse must be bool, got '{self.sparse}'."
+                )
         self.config.check("train.trace_level", ["batch", "epoch"])
         self.vocab_size = vocab_size
 
