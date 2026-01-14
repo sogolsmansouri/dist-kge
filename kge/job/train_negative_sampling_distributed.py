@@ -2217,6 +2217,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             ps_wait_time = 0.0
             ps_set_time = 0.0
             dataloader_time = 0.0
+            self._maybe_sync_cuda_timing()
             scheduler_time = -time.time()
             glow_window_union_time = 0.0
             glow_prefetch_time = 0.0
@@ -2695,6 +2696,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         penalty_value_torch.backward()
                     penalty += penalty_value_torch.item()
                     sum_penalties[penalty_key] += penalty_value_torch.item()
+                if not self.is_forward_only:
+                    self._maybe_sync_cuda_timing()
                 sum_penalty += penalty
                 batch_backward_time += time.time()
                 grad_accum_time -= time.time()
@@ -2725,6 +2728,7 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 batch_optimizer_time = -time.time()
                 if not self.is_forward_only:
                     self.optimizer.step()
+                    self._maybe_sync_cuda_timing()
                 batch_optimizer_time += time.time()
 
                 push_back_time -= time.time()

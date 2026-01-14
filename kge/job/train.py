@@ -92,6 +92,7 @@ class TrainingJob(TrainingOrEvaluationJob):
 
         self.config.check("train.trace_level", ["batch", "epoch"])
         self.trace_batch: bool = self.config.get("train.trace_level") == "batch"
+        self._sync_cuda_timing: bool = bool(self.config.get("train.sync_cuda_timing"))
         self.epoch: int = 0
         self.is_forward_only = forward_only
 
@@ -623,6 +624,12 @@ class TrainingJob(TrainingOrEvaluationJob):
                 self.config.set(
                     "train.subbatch_size", self._max_subbatch_size, log=True
                 )
+
+    def _maybe_sync_cuda_timing(self) -> None:
+        if not self._sync_cuda_timing:
+            return
+        if isinstance(self.device, str) and self.device.startswith("cuda"):
+            torch.cuda.synchronize(self.device)
 
     def _prepare_batch_ahead(self, batches: deque):
         pass

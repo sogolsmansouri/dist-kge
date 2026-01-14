@@ -189,6 +189,7 @@ class TrainingJobNegativeSampling(TrainingJob):
                 result.backward_time -= time.time()
                 if not self.is_forward_only:
                     loss_value_torch.backward()
+                    self._maybe_sync_cuda_timing()
                 result.backward_time += time.time()
 
         if self._fuse_slot_losses and fused_scores:
@@ -204,4 +205,5 @@ class TrainingJobNegativeSampling(TrainingJob):
             result.backward_time -= time.time()
             if not self.is_forward_only:
                 loss_value_torch.backward()
+                self._maybe_sync_cuda_timing()
             result.backward_time += time.time()

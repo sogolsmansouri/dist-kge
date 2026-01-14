@@ -496,6 +496,9 @@ train:
   # When to write entries to the trace file.
   trace_level: epoch           # batch, epoch
   profile_interval_batches: 0  # when >0, log per-batch timing breakdown every N batches
+  # When enabled, synchronize CUDA at timing boundaries for more accurate
+  # attribution between compute and scheduler time. Use for profiling.
+  sync_cuda_timing: False
 
   # When to create checkpoints
   checkpoint:
