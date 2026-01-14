@@ -1,7 +1,7 @@
 import torch
 from torch import Tensor
 from kge import Config, Dataset
-from kge.model.kge_model import KgeModel, KgeEmbedder
+from kge.model.kge_model import KgeModel, KgeEmbedder, _normalize_pretrain_filename
 from kge.util import load_checkpoint
 from kge.distributed.misc import get_min_rank
 from typing import Optional
@@ -100,6 +100,14 @@ class DistributedModel(KgeModel):
                 pretrained_relations_filename = self.base_model.get_option(
                     "relation_embedder.pretrain.model_filename"
                 )
+            pretrained_entities_filename = _normalize_pretrain_filename(
+                pretrained_entities_filename,
+                f"{self.base_model_config_key}.entity_embedder.pretrain.model_filename",
+            )
+            pretrained_relations_filename = _normalize_pretrain_filename(
+                pretrained_relations_filename,
+                f"{self.base_model_config_key}.relation_embedder.pretrain.model_filename",
+            )
 
             def load_pretrained_model(
                     pretrained_filename: str,

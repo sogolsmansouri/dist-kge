@@ -20,6 +20,29 @@ if TYPE_CHECKING:
     from kge.job import Job
 
 
+def _normalize_pretrain_filename(value: Any, key: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "__fspath__"):
+        try:
+            return os.fspath(value)
+        except Exception:
+            pass
+    if isinstance(value, bool):
+        if not value:
+            return ""
+        raise ValueError(
+            f"{key} must be a path string; got {value!r}. Set it to '' to disable."
+        )
+    if not value:
+        return ""
+    raise ValueError(
+        f"{key} must be a path string; got {type(value).__name__}={value!r}."
+    )
+
+
 SLOTS = [0, 1, 2]
 S, P, O = SLOTS
 
@@ -455,6 +478,14 @@ class KgeModel(KgeBase):
                     pretrained_relations_filename = self.get_option(
                         "relation_embedder.pretrain.model_filename"
                     )
+                pretrained_entities_filename = _normalize_pretrain_filename(
+                    pretrained_entities_filename,
+                    f"{self.configuration_key}.entity_embedder.pretrain.model_filename",
+                )
+                pretrained_relations_filename = _normalize_pretrain_filename(
+                    pretrained_relations_filename,
+                    f"{self.configuration_key}.relation_embedder.pretrain.model_filename",
+                )
 
                 def load_pretrained_model(
                     pretrained_filename: str,
@@ -547,6 +578,14 @@ class KgeModel(KgeBase):
                 pretrained_relations_filename = self.get_option(
                     "relation_embedder.pretrain.model_filename"
                 )
+            pretrained_entities_filename = _normalize_pretrain_filename(
+                pretrained_entities_filename,
+                f"{self.configuration_key}.entity_embedder.pretrain.model_filename",
+            )
+            pretrained_relations_filename = _normalize_pretrain_filename(
+                pretrained_relations_filename,
+                f"{self.configuration_key}.relation_embedder.pretrain.model_filename",
+            )
 
             def load_pretrained_model(
                     pretrained_filename: str,
