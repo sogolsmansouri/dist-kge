@@ -206,16 +206,17 @@ class _ComplExScoreSpoReduceFn(torch.autograd.Function):
             grad_o_weight = _reduce_by_key(o_idx, grad_o, ctx.o_weight_shape[0])
 
         return (
-            None,
-            None,
-            None,
-            grad_s_weight,
-            grad_p_weight,
-            grad_o_weight,
-            None,
-            None,
-            None,
-            None,
+            None,  # s_idx
+            None,  # p_idx
+            None,  # o_idx
+            grad_s_weight,  # s_weight
+            grad_p_weight,  # p_weight
+            grad_o_weight,  # o_weight
+            None,  # s_dropout
+            None,  # p_dropout
+            None,  # o_dropout
+            None,  # training
+            None,  # cache_row_grads
         )
 
 
@@ -342,16 +343,17 @@ class _ComplExScoreSpReduceFn(torch.autograd.Function):
             grad_o_weight = _reduce_by_key(o_idx, grad_o, ctx.o_weight_shape[0])
 
         return (
-            None,
-            None,
-            None,
-            grad_s_weight,
-            grad_p_weight,
-            grad_o_weight,
-            None,
-            None,
-            None,
-            None,
+            None,  # s_idx
+            None,  # p_idx
+            None,  # o_idx
+            grad_s_weight,  # s_weight
+            grad_p_weight,  # p_weight
+            grad_o_weight,  # o_weight
+            None,  # s_dropout
+            None,  # p_dropout
+            None,  # o_dropout
+            None,  # training
+            None,  # cache_row_grads
         )
 
 
@@ -480,16 +482,17 @@ class _ComplExScorePoReduceFn(torch.autograd.Function):
             grad_s_weight = _reduce_by_key(s_idx, grad_s, ctx.s_weight_shape[0])
 
         return (
-            None,
-            None,
-            None,
-            grad_p_weight,
-            grad_o_weight,
-            grad_s_weight,
-            None,
-            None,
-            None,
-            None,
+            None,  # p_idx
+            None,  # o_idx
+            None,  # s_idx
+            grad_p_weight,  # p_weight
+            grad_o_weight,  # o_weight
+            grad_s_weight,  # s_weight
+            None,  # p_dropout
+            None,  # o_dropout
+            None,  # s_dropout
+            None,  # training
+            None,  # cache_row_grads
         )
 
 
