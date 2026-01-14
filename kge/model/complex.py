@@ -21,11 +21,93 @@ class ComplExScorer(RelationalScorer):
         super().__init__(config, dataset, configuration_key)
         self._use_fused = fused_complex_requested()
         self._use_triton = has_triton_complex()
+        self._reduce_by_key = False
+        self._cache_row_grads = False
+        self._reduce_by_key_logged = False
         if self.config is not None:
             self.config.log(
                 "ComplEx fused path: "
                 f"requested={self._use_fused} triton_available={self._use_triton}"
             )
+        # Enable reduce-by-key scoring when configured for this model instance.
+        # Note: in distributed training, the scorer's configuration key is
+        # `distributed_model.base_model`, so this picks up CLI overrides like
+        # `--distributed_model.base_model.reduce_by_key true`.
+        try:
+            self._reduce_by_key = self._get_bool_option("reduce_by_key", default=False)
+        except Exception:
+            self._reduce_by_key = False
+        try:
+            self._cache_row_grads = self._get_bool_option(
+                "reduce_by_key_row_grads", default=False
+            )
+        except Exception:
+            self._cache_row_grads = False
+        if self._cache_row_grads and not self._reduce_by_key:
+            self._cache_row_grads = False
+
+    def _get_bool_option(self, key: str, default: bool = False) -> bool:
+        value = None
+        try:
+            value = self.get_option(key)
+        except Exception:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            raw = value.strip().lower()
+            if raw in ("1", "true", "yes", "y", "on"):
+                return True
+            if raw in ("0", "false", "no", "n", "off", ""):
+                return False
+        return bool(value)
+
+    def score_spo_indexed(
+        self,
+        s_idx: torch.Tensor,
+        p_idx: torch.Tensor,
+        o_idx: torch.Tensor,
+        s_embedder,
+        p_embedder,
+        o_embedder,
+        training: bool,
+    ):
+        if not self._reduce_by_key:
+            return None
+        if not training or not torch.is_grad_enabled():
+            return None
+        if not getattr(s_embedder, "sparse", False):
+            return None
+        if not getattr(p_embedder, "sparse", False):
+            return None
+        if not getattr(o_embedder, "sparse", False):
+            return None
+        # Needs direct access to embedding weights.
+        if not hasattr(s_embedder, "_embeddings") or not hasattr(p_embedder, "_embeddings"):
+            return None
+        if not hasattr(o_embedder, "_embeddings"):
+            return None
+        if self.config is not None and not self._reduce_by_key_logged:
+            self.config.log(
+                "ComplEx reduce_by_key active "
+                f"(cache_row_grads={self._cache_row_grads})."
+            )
+            self._reduce_by_key_logged = True
+        return complex_score_spo_reduce(
+            s_idx,
+            p_idx,
+            o_idx,
+            s_embedder._embeddings.weight,
+            p_embedder._embeddings.weight,
+            o_embedder._embeddings.weight,
+            s_embedder.dropout.p,
+            p_embedder.dropout.p,
+            o_embedder.dropout.p,
+            training,
+            self._cache_row_grads,
+        )
 
     def score_emb(self, s_emb, p_emb, o_emb, combine: str):
         if self._use_fused:

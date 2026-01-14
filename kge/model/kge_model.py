@@ -837,10 +837,24 @@ class KgeModel(KgeBase):
         score of triple :math:`(s_i, p_i, o_i)`.
 
         """
+        scorer = self._scorer
+        if hasattr(scorer, "score_spo_indexed"):
+            indexed = scorer.score_spo_indexed(
+                s,
+                p,
+                o,
+                self.get_s_embedder(),
+                self.get_p_embedder(),
+                self.get_o_embedder(),
+                training=self.training,
+            )
+            if indexed is not None:
+                return indexed.view(-1)
+
         s = self.get_s_embedder().embed(s)
         p = self.get_p_embedder().embed(p)
         o = self.get_o_embedder().embed(o)
-        return self._scorer.score_emb(s, p, o, combine="spo").view(-1)
+        return scorer.score_emb(s, p, o, combine="spo").view(-1)
 
     def score_sp(self, s: Tensor, p: Tensor, o: Tensor = None) -> Tensor:
         r"""Compute scores for triples formed from a set of sp-pairs and all (or a subset of the) objects.
