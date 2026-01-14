@@ -107,6 +107,7 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._hot_cache_id_to_slot: Optional[torch.Tensor] = None
         self._hot_cache_embeddings: Optional[torch.Tensor] = None
         self._hot_cache_optimizer: Optional[torch.Tensor] = None
+        self._hot_cache_pull_tensor: Optional[torch.Tensor] = None
         self._last_hot_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._gpu_cache_enabled = False
         self._gpu_cache_max_entries = 0
@@ -1311,7 +1312,41 @@ class DistributedLookupEmbedder(LookupEmbedder):
         self._hot_cache_embeddings.copy_(embeddings.to(device))
         self._hot_cache_optimizer.copy_(optim_values.to(optimizer_device))
         self._hot_cache_ids = hot_ids
+        self._hot_cache_pull_tensor = pull_tensor
         self._last_hot_batch = None
+
+    def refresh_hot_cache(self) -> None:
+        """Refresh cached hot rows from the parameter server (best-effort)."""
+        if (
+            self._hot_cache_ids is None
+            or self._hot_cache_embeddings is None
+            or self._hot_cache_optimizer is None
+        ):
+            return
+        hot_ids = self._hot_cache_ids
+        if hot_ids.numel() == 0:
+            return
+        try:
+            num_hot = int(hot_ids.numel())
+            cols = int(self.dim + self.optimizer_dim + self.unnecessary_dim)
+            pull_tensor = self._hot_cache_pull_tensor
+            if pull_tensor is None or pull_tensor.shape != (num_hot, cols):
+                pull_tensor = torch.empty(
+                    (num_hot, cols), dtype=torch.float32, device="cpu"
+                )
+                self._hot_cache_pull_tensor = pull_tensor
+            self.parameter_client.pull((hot_ids + self.lapse_offset).cpu(), pull_tensor)
+            embeddings, optim_values, _ = torch.split(
+                pull_tensor, [self.dim, self.optimizer_dim, self.unnecessary_dim], dim=1
+            )
+            self._hot_cache_embeddings.copy_(
+                embeddings.to(self._hot_cache_embeddings.device)
+            )
+            self._hot_cache_optimizer.copy_(
+                optim_values.to(self._hot_cache_optimizer.device)
+            )
+        except Exception:
+            return
 
     def _load_locality_rank(self):
         cfg = self.config.get("job.distributed.locality_ordering") or {}

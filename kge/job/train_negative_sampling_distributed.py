@@ -677,6 +677,28 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             except Exception as exc:
                 self.config.log(f"Failed to enable hot entity cache: {exc}")
 
+        # Optional: keep all relations hot on GPU (tiny vocab) and refresh periodically.
+        self._relation_hot_cache_refresh_interval = 0
+        try:
+            rel_cache_cfg = self.config.get("job.distributed.relation_hot_cache") or {}
+        except Exception:
+            rel_cache_cfg = {}
+        if bool(rel_cache_cfg.get("enable", False)):
+            try:
+                relation_ids = torch.arange(
+                    self.dataset.num_relations(), dtype=torch.long
+                )
+                self.model.get_p_embedder().enable_hot_cache(relation_ids)
+                self.config.log(
+                    f"Hot relation cache enabled for {self.dataset.num_relations()} relations."
+                )
+                self._relation_hot_cache_refresh_interval = int(
+                    rel_cache_cfg.get("refresh_interval_batches", 0) or 0
+                )
+            except Exception as exc:
+                self.config.log(f"Failed to enable hot relation cache: {exc}")
+                self._relation_hot_cache_refresh_interval = 0
+
         def stop_and_wait(job):
             job.parameter_client.stop()
             job.parameter_client.barrier()
@@ -2765,6 +2787,16 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 for f in self.pre_batch_hooks:
                     f(self, batch_index)
                 hook_time += time.time()
+
+                # Optional: refresh hot relation cache from PS to stay in sync across workers.
+                if (
+                    self._relation_hot_cache_refresh_interval
+                    and batch_index % self._relation_hot_cache_refresh_interval == 0
+                ):
+                    try:
+                        self.model.get_p_embedder().refresh_hot_cache()
+                    except Exception:
+                        pass
 
                 # process batch (preprocessing + forward pass + backward pass on loss)
                 batch_result: TrainingJob._ProcessBatchResult = self._auto_subbatched_process_batch(

@@ -31,6 +31,15 @@ job:
   device: 'cuda'
   device_pool: [ ]
   distributed:
+    # Optional: keep (small) relation embeddings hot on GPU by caching them and
+    # periodically refreshing from the parameter server. This is useful when the
+    # relation vocabulary is tiny compared to entities.
+    relation_hot_cache:
+      enable: False
+      # When >0, refresh the cached relations every N batches by pulling the full
+      # cached set from the parameter server. 0 disables refresh (cache may drift
+      # across workers as they apply local updates).
+      refresh_interval_batches: 0
     gpu_cache:
       enable: False
       # Max entries for all embedders (0 disables). Can override per type below.
