@@ -68,6 +68,9 @@ train:
     threshold: 0.0001
   max_epochs: 300
   num_workers: 4
+  # Profiling (enable temporarily; `sync_cuda_timing: true` adds overhead).
+  profile_interval_batches: 200
+  sync_cuda_timing: true
   optimizer:
     default:
       args:

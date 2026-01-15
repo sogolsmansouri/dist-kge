@@ -2295,6 +2295,121 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     pull_map=profile_stats["pull_and_map"],
                 )
             )
+            if profile_stats.get("scheduler_total", 0.0):
+                total_time_with_sched = total_time + profile_stats.get(
+                    "scheduler_total", 0.0
+                )
+                throughput_with_sched = (
+                    profile_stats["examples"] / total_time_with_sched
+                    if total_time_with_sched > 0
+                    else float("inf")
+                )
+                self.config.log(
+                    (
+                        "[profile-sched] batches {start}-{end}: {throughput:.1f} triples/s; "
+                        "times(s) -> scheduler={sched:.3f} "
+                        "(get_work={get_work:.3f}, localize={loc:.3f}, "
+                        "partition_pull={pull:.3f}, sampler_pool={pool:.3f}, "
+                        "set_samples={set_samples:.3f}, loader_init={loader:.3f}, other={other:.3f})"
+                    ).format(
+                        start=start,
+                        end=end,
+                        throughput=throughput_with_sched,
+                        sched=profile_stats.get("scheduler_total", 0.0),
+                        get_work=profile_stats.get("sched_get_work", 0.0),
+                        loc=profile_stats.get("sched_localize", 0.0),
+                        pull=profile_stats.get("sched_partition_pull", 0.0),
+                        pool=profile_stats.get("sched_sampler_pool", 0.0),
+                        set_samples=profile_stats.get("sched_set_samples", 0.0),
+                        loader=profile_stats.get("sched_loader_init", 0.0),
+                        other=profile_stats.get("sched_other", 0.0),
+                    )
+                )
+            if (
+                profile_stats.get("loss_backward", 0.0)
+                or profile_stats.get("penalty_backward", 0.0)
+                or profile_stats.get("grad_trace", 0.0)
+                or profile_stats.get("push_back", 0.0)
+            ):
+                self.config.log(
+                    (
+                        "[profile-bwd] batches {start}-{end}: "
+                        "loss_bwd={loss_bwd:.3f}, penalty_bwd={pen_bwd:.3f}, "
+                        "grad_trace={grad_trace:.3f}, push_back={push_back:.3f}"
+                    ).format(
+                        start=start,
+                        end=end,
+                        loss_bwd=profile_stats.get("loss_backward", 0.0),
+                        pen_bwd=profile_stats.get("penalty_backward", 0.0),
+                        grad_trace=profile_stats.get("grad_trace", 0.0),
+                        push_back=profile_stats.get("push_back", 0.0),
+                    )
+                )
+            if (
+                profile_stats.get("penalty_forward", 0.0)
+                or profile_stats.get("ns_neg_prep_s", 0.0)
+                or profile_stats.get("ns_neg_prep_p", 0.0)
+                or profile_stats.get("ns_neg_prep_o", 0.0)
+                or profile_stats.get("ns_loss_fwd_s", 0.0)
+                or profile_stats.get("ns_loss_fwd_p", 0.0)
+                or profile_stats.get("ns_loss_fwd_o", 0.0)
+                or profile_stats.get("ns_loss_fwd_fused", 0.0)
+            ):
+                self.config.log(
+                    (
+                        "[profile-fwd] batches {start}-{end}: "
+                        "penalty_fwd={pen_fwd:.3f}, "
+                        "neg_prep(s/p/o)={np_s:.3f}/{np_p:.3f}/{np_o:.3f}, "
+                        "loss_fwd(s/p/o|fused)={lf_s:.3f}/{lf_p:.3f}/{lf_o:.3f}|{lf_fused:.3f}"
+                    ).format(
+                        start=start,
+                        end=end,
+                        pen_fwd=profile_stats.get("penalty_forward", 0.0),
+                        np_s=profile_stats.get("ns_neg_prep_s", 0.0),
+                        np_p=profile_stats.get("ns_neg_prep_p", 0.0),
+                        np_o=profile_stats.get("ns_neg_prep_o", 0.0),
+                        lf_s=profile_stats.get("ns_loss_fwd_s", 0.0),
+                        lf_p=profile_stats.get("ns_loss_fwd_p", 0.0),
+                        lf_o=profile_stats.get("ns_loss_fwd_o", 0.0),
+                        lf_fused=profile_stats.get("ns_loss_fwd_fused", 0.0),
+                    )
+                )
+            if any(
+                profile_stats.get(k, 0.0)
+                for k in (
+                    "ns_pos_fwd_s",
+                    "ns_pos_fwd_p",
+                    "ns_pos_fwd_o",
+                    "ns_neg_fwd_s",
+                    "ns_neg_fwd_p",
+                    "ns_neg_fwd_o",
+                    "ns_loss_bwd_s",
+                    "ns_loss_bwd_p",
+                    "ns_loss_bwd_o",
+                    "ns_loss_bwd_fused",
+                )
+            ):
+                self.config.log(
+                    (
+                        "[profile-ns] batches {start}-{end}: "
+                        "pos_fwd(s/p/o)={pos_s:.3f}/{pos_p:.3f}/{pos_o:.3f}, "
+                        "neg_fwd(s/p/o)={neg_s:.3f}/{neg_p:.3f}/{neg_o:.3f}, "
+                        "loss_bwd(s/p/o|fused)={lb_s:.3f}/{lb_p:.3f}/{lb_o:.3f}|{lb_fused:.3f}"
+                    ).format(
+                        start=start,
+                        end=end,
+                        pos_s=profile_stats.get("ns_pos_fwd_s", 0.0),
+                        pos_p=profile_stats.get("ns_pos_fwd_p", 0.0),
+                        pos_o=profile_stats.get("ns_pos_fwd_o", 0.0),
+                        neg_s=profile_stats.get("ns_neg_fwd_s", 0.0),
+                        neg_p=profile_stats.get("ns_neg_fwd_p", 0.0),
+                        neg_o=profile_stats.get("ns_neg_fwd_o", 0.0),
+                        lb_s=profile_stats.get("ns_loss_bwd_s", 0.0),
+                        lb_p=profile_stats.get("ns_loss_bwd_p", 0.0),
+                        lb_o=profile_stats.get("ns_loss_bwd_o", 0.0),
+                        lb_fused=profile_stats.get("ns_loss_bwd_fused", 0.0),
+                    )
+                )
             dataset_stats = {}
             if getattr(self, "dataloader_dataset", None) is not None:
                 dataset_stats = self.dataloader_dataset.collect_debug_stats()
@@ -2345,6 +2460,14 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             glow_conflict_time = 0.0
 
             # load new work package
+            sched_get_work_time = 0.0
+            sched_localize_time = 0.0
+            sched_partition_pull_time = 0.0
+            sched_sampler_pool_time = 0.0
+            sched_set_samples_time = 0.0
+            sched_loader_init_time = 0.0
+            if profile_interval_batches > 0:
+                _sched_t = time.time()
             (
                 work,
                 work_entities,
@@ -2355,6 +2478,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 window_entities,
                 window_versions,
             ) = self.work_scheduler_client.get_work()
+            if profile_interval_batches > 0:
+                sched_get_work_time = time.time() - _sched_t
             if work_entities is not None:
                 work_entities = work_entities.long()
             if work_relations is not None:
@@ -2486,14 +2611,20 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                             )
                             self._overlap_sampling_logged = True
                         pool_entities = work_entities
+            if profile_interval_batches > 0:
+                _sched_t = time.time()
             if work_entities is not None and self.entity_localize:
                 self.model.get_s_embedder().localize(entity_pull_ids)
                 self.entity_partition_localized = True
             if work_relations is not None and self.relation_localize:
                 self.model.get_p_embedder().localize(work_relations)
                 self.relation_partition_localized = True
+            if profile_interval_batches > 0:
+                sched_localize_time += time.time() - _sched_t
             if self.entity_sync_level == "partition":
                 if work_entities is not None:
+                    if profile_interval_batches > 0:
+                        _sched_t = time.time()
                     entity_pull_time -= time.time()
                     actual_entity_pull_time, entity_cpu_gpu_time = self.model.get_s_embedder()._pull_embeddings(
                         entity_pull_ids
@@ -2521,6 +2652,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                             )
                     entity_pull_time += time.time()
                     cpu_gpu_time += entity_cpu_gpu_time
+                    if profile_interval_batches > 0:
+                        sched_partition_pull_time += time.time() - _sched_t
                 else:
                     raise ValueError(
                         "the used work-scheduler seems not to support "
@@ -2528,6 +2661,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     )
             if self.relation_sync_level == "partition":
                 if work_relations is not None:
+                    if profile_interval_batches > 0:
+                        _sched_t = time.time()
                     relation_pull_time -= time.time()
                     actual_relation_pull_time, relation_cpu_gpu_time = self.model.get_p_embedder()._pull_embeddings(work_relations)
                     self.model.get_p_embedder().global_to_local_mapper[
@@ -2553,6 +2688,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                             )
                     relation_pull_time += time.time()
                     cpu_gpu_time += relation_cpu_gpu_time
+                    if profile_interval_batches > 0:
+                        sched_partition_pull_time += time.time() - _sched_t
                 else:
                     raise ValueError(
                         "the used work-scheduler seems not to support "
@@ -2564,6 +2701,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             )
 
             if work_entities is not None and self._sampler.uses_pool():
+                if profile_interval_batches > 0:
+                    _sched_t = time.time()
                 pool_entities = (
                     pool_entities if pool_entities is not None else work_entities
                 )
@@ -2583,6 +2722,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 if pool_device is not None:
                     self._sampler.set_pool(pool_device, S)
                     self._sampler.set_pool(pool_device, O)
+                if profile_interval_batches > 0:
+                    sched_sampler_pool_time += time.time() - _sched_t
             if self._stage_local_ids and work_entities is not None:
                 local_entities_count = len(entity_pull_ids)
                 self._sampler.vocabulary_size[S] = local_entities_count
@@ -2632,6 +2773,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     f"sampling_type={sampling_type} "
                     f"uses_pool={bool(self._sampler.uses_pool())}"
                 )
+            if profile_interval_batches > 0:
+                _sched_t = time.time()
             self.dataloader_dataset.set_samples(
                 work,
                 self.epoch,
@@ -2649,6 +2792,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 ),
                 stage_local_ids=self._stage_local_ids,
             )
+            if profile_interval_batches > 0:
+                sched_set_samples_time += time.time() - _sched_t
+            if profile_interval_batches > 0:
+                _sched_t = time.time()
             if (
                 self._materialize_partitions
                 and not self._materialization_notice_logged
@@ -2680,7 +2827,26 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     "_sampler_iter",
                     iter(self.iter_dataloader._index_sampler),
                 )
+            if profile_interval_batches > 0:
+                sched_loader_init_time += time.time() - _sched_t
             scheduler_time += time.time()
+            if profile_interval_batches > 0:
+                profile_stats["scheduler_total"] += scheduler_time
+                profile_stats["sched_get_work"] += sched_get_work_time
+                profile_stats["sched_localize"] += sched_localize_time
+                profile_stats["sched_partition_pull"] += sched_partition_pull_time
+                profile_stats["sched_sampler_pool"] += sched_sampler_pool_time
+                profile_stats["sched_set_samples"] += sched_set_samples_time
+                profile_stats["sched_loader_init"] += sched_loader_init_time
+                known = (
+                    sched_get_work_time
+                    + sched_localize_time
+                    + sched_partition_pull_time
+                    + sched_sampler_pool_time
+                    + sched_set_samples_time
+                    + sched_loader_init_time
+                )
+                profile_stats["sched_other"] += max(0.0, scheduler_time - known)
 
             # process each batch
             pre_load_batches = deque()
@@ -2806,17 +2972,18 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 chunk_examples += batch_result.size
 
                 # determine penalty terms (forward pass)
-                batch_forward_time = batch_result.forward_time - time.time()
+                penalty_forward_start = time.time()
                 penalties_torch = self.model.penalty(
                     epoch=self.epoch,
                     batch_index=batch_index,
                     num_batches=self.dataloader_dataset.get_real_len(),
                     batch=batch,
                 )
-                batch_forward_time += time.time()
+                penalty_forward_time = time.time() - penalty_forward_start
+                batch_forward_time = batch_result.forward_time + penalty_forward_time
 
                 # backward pass on penalties
-                batch_backward_time = batch_result.backward_time - time.time()
+                penalty_backward_start = time.time()
                 penalty = 0.0
                 for index, (penalty_key, penalty_value_torch) in enumerate(
                     penalties_torch
@@ -2827,10 +2994,13 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     sum_penalties[penalty_key] += penalty_value_torch.item()
                 if not self.is_forward_only:
                     self._maybe_sync_cuda_timing()
+                penalty_backward_time = time.time() - penalty_backward_start
                 sum_penalty += penalty
-                batch_backward_time += time.time()
+                batch_backward_time = batch_result.backward_time + penalty_backward_time
                 grad_accum_time -= time.time()
+                grad_trace_start = time.time()
                 self._accumulate_partition_gradient()
+                batch_grad_trace_time = time.time() - grad_trace_start
                 grad_accum_time += time.time()
 
                 # determine full cost
@@ -2861,10 +3031,12 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 batch_optimizer_time += time.time()
 
                 push_back_time -= time.time()
+                push_back_start = time.time()
                 if self.entity_sync_level == "batch":
                     self.model.get_s_embedder().push_back()
                 if self.relation_sync_level == "batch":
                     self.model.get_p_embedder().push_back()
+                batch_push_back_time = time.time() - push_back_start
                 push_back_time += time.time()
 
                 # update batch trace with the results
@@ -2947,12 +3119,37 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     profile_stats["forward"] += batch_forward_time
                     profile_stats["backward"] += batch_backward_time
                     profile_stats["optimizer"] += batch_optimizer_time
+                    profile_stats["loss_backward"] += batch_result.backward_time
+                    profile_stats["penalty_forward"] += penalty_forward_time
+                    profile_stats["penalty_backward"] += penalty_backward_time
+                    profile_stats["grad_trace"] += batch_grad_trace_time
+                    profile_stats["push_back"] += batch_push_back_time
                     profile_stats["pull_and_map"] += batch_result.pull_and_map_time
                     profile_stats["entity_pull"] += batch_result.entity_pull_time
                     profile_stats["relation_pull"] += batch_result.relation_pull_time
                     profile_stats["unique"] += batch_result.unique_time
                     profile_stats["cpu_gpu"] += batch_result.cpu_gpu_time
                     profile_stats["ps_wait"] += batch_result.ps_wait_time
+                    for key in (
+                        "ns_pos_fwd_s",
+                        "ns_pos_fwd_p",
+                        "ns_pos_fwd_o",
+                        "ns_neg_fwd_s",
+                        "ns_neg_fwd_p",
+                        "ns_neg_fwd_o",
+                        "ns_neg_prep_s",
+                        "ns_neg_prep_p",
+                        "ns_neg_prep_o",
+                        "ns_loss_fwd_s",
+                        "ns_loss_fwd_p",
+                        "ns_loss_fwd_o",
+                        "ns_loss_bwd_s",
+                        "ns_loss_bwd_p",
+                        "ns_loss_bwd_o",
+                        "ns_loss_fwd_fused",
+                        "ns_loss_bwd_fused",
+                    ):
+                        profile_stats[key] += float(getattr(batch_result, key, 0.0))
                     maybe_log_profile()
 
             # all done; now trace and log
