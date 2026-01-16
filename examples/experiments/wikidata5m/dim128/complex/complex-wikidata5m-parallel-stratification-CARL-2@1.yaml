@@ -49,8 +49,8 @@ modules:
 negative_sampling:
   implementation: batch
   num_samples:
-    o: 7851
-    s: 2176
+    o: 2048
+    s: 512
   sampling_type: pooled
   shared: true
   shared_type: naive
