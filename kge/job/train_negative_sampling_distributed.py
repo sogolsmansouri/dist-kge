@@ -2251,17 +2251,30 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
         profile_stats = defaultdict(float)
         profile_batch_counter = 0
         profile_total_batches = 0
+        pending_cuda_event_pairs = []
         if self._glow_debug_trace:
             self._init_glow_trace_stats()
 
         def maybe_log_profile(force=False):
-            nonlocal profile_stats, profile_batch_counter, profile_total_batches
+            nonlocal profile_stats, profile_batch_counter, profile_total_batches, pending_cuda_event_pairs
             if profile_interval_batches <= 0:
                 return
             if not force and profile_batch_counter < profile_interval_batches:
                 return
             if profile_batch_counter == 0:
                 return
+            if pending_cuda_event_pairs and getattr(self, "_profile_cuda_events", False):
+                try:
+                    if isinstance(self.device, str) and self.device.startswith("cuda"):
+                        torch.cuda.synchronize()
+                except Exception:
+                    pass
+                for key, start_event, end_event in pending_cuda_event_pairs:
+                    try:
+                        profile_stats[key] += float(end_event.elapsed_time(start_event)) / 1000.0
+                    except Exception:
+                        continue
+                pending_cuda_event_pairs = []
             start = profile_total_batches - profile_batch_counter + 1
             end = profile_total_batches
             compute_time = (
@@ -2410,6 +2423,56 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         lb_fused=profile_stats.get("ns_loss_bwd_fused", 0.0),
                     )
                 )
+            if any(
+                profile_stats.get(k, 0.0)
+                for k in (
+                    "cuda_ns_pos_score_s",
+                    "cuda_ns_pos_score_p",
+                    "cuda_ns_pos_score_o",
+                    "cuda_ns_neg_score_s",
+                    "cuda_ns_neg_score_p",
+                    "cuda_ns_neg_score_o",
+                    "cuda_ns_loss_fwd_s",
+                    "cuda_ns_loss_fwd_p",
+                    "cuda_ns_loss_fwd_o",
+                    "cuda_ns_loss_bwd_s",
+                    "cuda_ns_loss_bwd_p",
+                    "cuda_ns_loss_bwd_o",
+                    "cuda_ns_loss_fwd_fused",
+                    "cuda_ns_loss_bwd_fused",
+                    "cuda_penalty_bwd",
+                    "cuda_optimizer_step",
+                )
+            ):
+                self.config.log(
+                    (
+                        "[profile-cuda] batches {start}-{end}: "
+                        "pos_score(s/p/o)={pos_s:.3f}/{pos_p:.3f}/{pos_o:.3f}, "
+                        "neg_score(s/p/o)={neg_s:.3f}/{neg_p:.3f}/{neg_o:.3f}, "
+                        "loss_fwd(s/p/o|fused)={lf_s:.3f}/{lf_p:.3f}/{lf_o:.3f}|{lf_fused:.3f}, "
+                        "loss_bwd(s/p/o|fused)={lb_s:.3f}/{lb_p:.3f}/{lb_o:.3f}|{lb_fused:.3f}, "
+                        "penalty_bwd={pen_bwd:.3f}, opt_step={opt:.3f}"
+                    ).format(
+                        start=start,
+                        end=end,
+                        pos_s=profile_stats.get("cuda_ns_pos_score_s", 0.0),
+                        pos_p=profile_stats.get("cuda_ns_pos_score_p", 0.0),
+                        pos_o=profile_stats.get("cuda_ns_pos_score_o", 0.0),
+                        neg_s=profile_stats.get("cuda_ns_neg_score_s", 0.0),
+                        neg_p=profile_stats.get("cuda_ns_neg_score_p", 0.0),
+                        neg_o=profile_stats.get("cuda_ns_neg_score_o", 0.0),
+                        lf_s=profile_stats.get("cuda_ns_loss_fwd_s", 0.0),
+                        lf_p=profile_stats.get("cuda_ns_loss_fwd_p", 0.0),
+                        lf_o=profile_stats.get("cuda_ns_loss_fwd_o", 0.0),
+                        lf_fused=profile_stats.get("cuda_ns_loss_fwd_fused", 0.0),
+                        lb_s=profile_stats.get("cuda_ns_loss_bwd_s", 0.0),
+                        lb_p=profile_stats.get("cuda_ns_loss_bwd_p", 0.0),
+                        lb_o=profile_stats.get("cuda_ns_loss_bwd_o", 0.0),
+                        lb_fused=profile_stats.get("cuda_ns_loss_bwd_fused", 0.0),
+                        pen_bwd=profile_stats.get("cuda_penalty_bwd", 0.0),
+                        opt=profile_stats.get("cuda_optimizer_step", 0.0),
+                    )
+                )
             dataset_stats = {}
             if getattr(self, "dataloader_dataset", None) is not None:
                 dataset_stats = self.dataloader_dataset.collect_debug_stats()
@@ -2468,16 +2531,17 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             sched_loader_init_time = 0.0
             if profile_interval_batches > 0:
                 _sched_t = time.time()
-            (
-                work,
-                work_entities,
-                work_relations,
-                current_partition_id,
-                current_partition_version,
-                window_members,
-                window_entities,
-                window_versions,
-            ) = self.work_scheduler_client.get_work()
+            with self._nvtx_range("sched/get_work"):
+                (
+                    work,
+                    work_entities,
+                    work_relations,
+                    current_partition_id,
+                    current_partition_version,
+                    window_members,
+                    window_entities,
+                    window_versions,
+                ) = self.work_scheduler_client.get_work()
             if profile_interval_batches > 0:
                 sched_get_work_time = time.time() - _sched_t
             if work_entities is not None:
@@ -2775,23 +2839,24 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 )
             if profile_interval_batches > 0:
                 _sched_t = time.time()
-            self.dataloader_dataset.set_samples(
-                work,
-                self.epoch,
-                local_partition_counter,
-                partition_version=self._current_partition_version,
-                entity_mapper=(
-                    self.model.get_s_embedder().global_to_local_mapper
-                    if self._stage_local_ids
-                    else None
-                ),
-                relation_mapper=(
-                    self.model.get_p_embedder().global_to_local_mapper
-                    if self._stage_local_ids
-                    else None
-                ),
-                stage_local_ids=self._stage_local_ids,
-            )
+            with self._nvtx_range("sched/set_samples"):
+                self.dataloader_dataset.set_samples(
+                    work,
+                    self.epoch,
+                    local_partition_counter,
+                    partition_version=self._current_partition_version,
+                    entity_mapper=(
+                        self.model.get_s_embedder().global_to_local_mapper
+                        if self._stage_local_ids
+                        else None
+                    ),
+                    relation_mapper=(
+                        self.model.get_p_embedder().global_to_local_mapper
+                        if self._stage_local_ids
+                        else None
+                    ),
+                    stage_local_ids=self._stage_local_ids,
+                )
             if profile_interval_batches > 0:
                 sched_set_samples_time += time.time() - _sched_t
             if profile_interval_batches > 0:
@@ -2815,7 +2880,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 self.iter_dataloader = None
             else:
                 if self.loader is None:
-                    self._init_dataloader()
+                    with self._nvtx_range("sched/loader_init"):
+                        self._init_dataloader()
                     self.iter_dataloader = iter(self.loader)
                 object.__setattr__(
                     self.loader,
@@ -2965,9 +3031,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                         pass
 
                 # process batch (preprocessing + forward pass + backward pass on loss)
-                batch_result: TrainingJob._ProcessBatchResult = self._auto_subbatched_process_batch(
-                    batch_index, batch
-                )
+                with self._nvtx_range("batch/loss_fwd_bwd"):
+                    batch_result: TrainingJob._ProcessBatchResult = self._auto_subbatched_process_batch(
+                        batch_index, batch
+                    )
                 sum_loss += batch_result.avg_loss * batch_result.size
                 chunk_examples += batch_result.size
 
@@ -2985,13 +3052,16 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 # backward pass on penalties
                 penalty_backward_start = time.time()
                 penalty = 0.0
-                for index, (penalty_key, penalty_value_torch) in enumerate(
-                    penalties_torch
+                with self._nvtx_range("penalty/bwd"), self._cuda_event_range(
+                    batch_result, "cuda_penalty_bwd"
                 ):
-                    if not self.is_forward_only:
-                        penalty_value_torch.backward()
-                    penalty += penalty_value_torch.item()
-                    sum_penalties[penalty_key] += penalty_value_torch.item()
+                    for index, (penalty_key, penalty_value_torch) in enumerate(
+                        penalties_torch
+                    ):
+                        if not self.is_forward_only:
+                            penalty_value_torch.backward()
+                        penalty += penalty_value_torch.item()
+                        sum_penalties[penalty_key] += penalty_value_torch.item()
                 if not self.is_forward_only:
                     self._maybe_sync_cuda_timing()
                 penalty_backward_time = time.time() - penalty_backward_start
@@ -3026,7 +3096,10 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 # update parameters
                 batch_optimizer_time = -time.time()
                 if not self.is_forward_only:
-                    self.optimizer.step()
+                    with self._nvtx_range("optimizer/step"), self._cuda_event_range(
+                        batch_result, "cuda_optimizer_step"
+                    ):
+                        self.optimizer.step()
                     self._maybe_sync_cuda_timing()
                 batch_optimizer_time += time.time()
 
@@ -3114,6 +3187,16 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                 if profile_interval_batches > 0:
                     profile_batch_counter += 1
                     profile_total_batches += 1
+                    cuda_pairs = getattr(batch_result, "_cuda_event_pairs", None)
+                    if cuda_pairs:
+                        try:
+                            pending_cuda_event_pairs.extend(cuda_pairs)
+                        except Exception:
+                            pass
+                        try:
+                            cuda_pairs.clear()
+                        except Exception:
+                            pass
                     profile_stats["examples"] += batch_result.size
                     profile_stats["prepare"] += batch_result.prepare_time
                     profile_stats["forward"] += batch_forward_time

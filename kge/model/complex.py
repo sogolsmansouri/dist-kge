@@ -148,19 +148,24 @@ class ComplExScorer(RelationalScorer):
                 self._use_fused = False
 
         n = p_emb.size(0)
+        s_emb_re, s_emb_im = (t.contiguous() for t in s_emb.chunk(2, dim=1))
         p_emb_re, p_emb_im = (t.contiguous() for t in p_emb.chunk(2, dim=1))
         o_emb_re, o_emb_im = (t.contiguous() for t in o_emb.chunk(2, dim=1))
 
-        s_all = torch.cat((s_emb, s_emb), dim=1)  # re, im, re, im
-        r_all = torch.cat((p_emb_re, p_emb, -p_emb_im), dim=1)  # re, re, im, -im
-        o_all = torch.cat((o_emb, o_emb_im, o_emb_re), dim=1)  # re, im, im, re
-
         if combine == "spo":
-            out = (s_all * o_all * r_all).sum(dim=1)
+            a = s_emb_re * p_emb_re - s_emb_im * p_emb_im
+            b = s_emb_re * p_emb_im + s_emb_im * p_emb_re
+            out = (a * o_emb_re + b * o_emb_im).sum(dim=1, keepdim=True)
         elif combine == "sp_":
-            out = (s_all * r_all).mm(o_all.transpose(0, 1))
+            a = s_emb_re * p_emb_re - s_emb_im * p_emb_im
+            b = s_emb_re * p_emb_im + s_emb_im * p_emb_re
+            out = a.mm(o_emb_re.transpose(0, 1))
+            out.addmm_(b, o_emb_im.transpose(0, 1))
         elif combine == "_po":
-            out = (r_all * o_all).mm(s_all.transpose(0, 1))
+            a = p_emb_re * o_emb_re + p_emb_im * o_emb_im
+            b = p_emb_im * o_emb_re - p_emb_re * o_emb_im
+            out = a.mm(s_emb_re.transpose(0, 1))
+            out.addmm_(b, s_emb_im.transpose(0, 1), alpha=-1.0)
         else:
             return super().score_emb(s_emb, p_emb, o_emb, combine)
 

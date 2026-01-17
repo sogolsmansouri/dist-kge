@@ -4,6 +4,7 @@ import math
 import time
 import traceback
 from collections import defaultdict, deque
+from contextlib import contextmanager
 
 from dataclasses import dataclass
 
@@ -93,6 +94,11 @@ class TrainingJob(TrainingOrEvaluationJob):
         self.config.check("train.trace_level", ["batch", "epoch"])
         self.trace_batch: bool = self.config.get("train.trace_level") == "batch"
         self._sync_cuda_timing: bool = bool(self.config.get("train.sync_cuda_timing"))
+        self._profile_interval_batches: int = int(
+            self.config.get("train.profile_interval_batches") or 0
+        )
+        self._profile_nvtx: bool = bool(self.config.get("train.profile_nvtx"))
+        self._profile_cuda_events: bool = bool(self.config.get("train.profile_cuda_events"))
         self.epoch: int = 0
         self.is_forward_only = forward_only
 
@@ -630,6 +636,62 @@ class TrainingJob(TrainingOrEvaluationJob):
             return
         if isinstance(self.device, str) and self.device.startswith("cuda"):
             torch.cuda.synchronize(self.device)
+
+    def _profiling_enabled(self) -> bool:
+        return bool(getattr(self, "_profile_interval_batches", 0) > 0)
+
+    @contextmanager
+    def _nvtx_range(self, name: str):
+        if (
+            not getattr(self, "_profile_nvtx", False)
+            or not self._profiling_enabled()
+            or not isinstance(self.device, str)
+            or not self.device.startswith("cuda")
+        ):
+            yield
+            return
+        try:
+            torch.cuda.nvtx.range_push(str(name))
+        except Exception:
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
+
+    @contextmanager
+    def _cuda_event_range(self, result: "TrainingJob._ProcessBatchResult", key: str):
+        if (
+            not getattr(self, "_profile_cuda_events", False)
+            or not self._profiling_enabled()
+            or not isinstance(self.device, str)
+            or not self.device.startswith("cuda")
+        ):
+            yield
+            return
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+        except Exception:
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                end.record()
+                pairs = getattr(result, "_cuda_event_pairs", None)
+                if pairs is None:
+                    pairs = []
+                    setattr(result, "_cuda_event_pairs", pairs)
+                pairs.append((str(key), start, end))
+            except Exception:
+                pass
 
     def _prepare_batch_ahead(self, batches: deque):
         pass

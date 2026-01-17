@@ -425,9 +425,28 @@ class BatchNegativeSample(Configurable):
 
             # compute all scores for slot
             self.forward_time -= time.time()
-            all_scores = self._score_unique_targets(
-                model, slot, triples, unique_targets
-            )
+            use_nvtx = False
+            try:
+                use_nvtx = bool(self.config.get("train.profile_nvtx")) and int(
+                    self.config.get("train.profile_interval_batches") or 0
+                ) > 0 and device.type == "cuda"
+            except Exception:
+                use_nvtx = False
+            if use_nvtx:
+                try:
+                    torch.cuda.nvtx.range_push(f"ns/{SLOT_STR[slot]}/score_unique_targets")
+                except Exception:
+                    use_nvtx = False
+            try:
+                all_scores = self._score_unique_targets(
+                    model, slot, triples, unique_targets
+                )
+            finally:
+                if use_nvtx:
+                    try:
+                        torch.cuda.nvtx.range_pop()
+                    except Exception:
+                        pass
             self.forward_time += time.time()
 
             # determine indexes of relevant scores in scoring matrix
@@ -442,7 +461,19 @@ class BatchNegativeSample(Configurable):
 
             # and pick the scores we need
             self.forward_time -= time.time()
-            scores = all_scores[row_indexes, column_indexes].view(chunk_size, -1)
+            if use_nvtx:
+                try:
+                    torch.cuda.nvtx.range_push(f"ns/{SLOT_STR[slot]}/gather_scores")
+                except Exception:
+                    use_nvtx = False
+            try:
+                scores = all_scores[row_indexes, column_indexes].view(chunk_size, -1)
+            finally:
+                if use_nvtx:
+                    try:
+                        torch.cuda.nvtx.range_pop()
+                    except Exception:
+                        pass
             self.forward_time += time.time()
         else:
             raise ValueError

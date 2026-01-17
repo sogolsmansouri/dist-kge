@@ -167,9 +167,15 @@ class TrainingJobNegativeSampling(TrainingJob):
             result.forward_time -= time.time()
             scores = torch.empty((subbatch_size, num_samples + 1), device=self.device)
             pos_start = time.time() if profile_enabled else None
-            scores[:, 0] = self.model.score_spo(
-                triples[:, S], triples[:, P], triples[:, O], direction=SLOT_STR[slot],
-            )
+            with self._nvtx_range(f"ns/{SLOT_STR[slot]}/pos_score"), self._cuda_event_range(
+                result, f"cuda_ns_pos_score_{SLOT_STR[slot]}"
+            ):
+                scores[:, 0] = self.model.score_spo(
+                    triples[:, S],
+                    triples[:, P],
+                    triples[:, O],
+                    direction=SLOT_STR[slot],
+                )
             if profile_enabled:
                 setattr(
                     result,
@@ -178,9 +184,12 @@ class TrainingJobNegativeSampling(TrainingJob):
                     + (time.time() - pos_start),
                 )
             result.forward_time += time.time()
-            scores[:, 1:] = batch_negative_samples[slot].score(
-                self.model, indexes=subbatch_slice
-            )
+            with self._nvtx_range(f"ns/{SLOT_STR[slot]}/neg_score"), self._cuda_event_range(
+                result, f"cuda_ns_neg_score_{SLOT_STR[slot]}"
+            ):
+                scores[:, 1:] = batch_negative_samples[slot].score(
+                    self.model, indexes=subbatch_slice
+                )
             result.forward_time += batch_negative_samples[slot].forward_time
             result.prepare_time += batch_negative_samples[slot].prepare_time
             if profile_enabled:
@@ -205,10 +214,13 @@ class TrainingJobNegativeSampling(TrainingJob):
                 # compute loss for slot in subbatch (concluding the forward pass)
                 result.forward_time -= time.time()
                 loss_fwd_start = time.time() if profile_enabled else None
-                loss_value_torch = (
-                    self.loss(scores, labels[slot], num_negatives=num_samples)
-                    / batch_size
-                )
+                with self._nvtx_range(
+                    f"ns/{SLOT_STR[slot]}/loss_fwd"
+                ), self._cuda_event_range(result, f"cuda_ns_loss_fwd_{SLOT_STR[slot]}"):
+                    loss_value_torch = (
+                        self.loss(scores, labels[slot], num_negatives=num_samples)
+                        / batch_size
+                    )
                 result.avg_loss += loss_value_torch.item()
                 if profile_enabled:
                     setattr(
@@ -223,7 +235,12 @@ class TrainingJobNegativeSampling(TrainingJob):
                 result.backward_time -= time.time()
                 if not self.is_forward_only:
                     loss_bwd_start = time.time() if profile_enabled else None
-                    loss_value_torch.backward()
+                    with self._nvtx_range(
+                        f"ns/{SLOT_STR[slot]}/loss_bwd"
+                    ), self._cuda_event_range(
+                        result, f"cuda_ns_loss_bwd_{SLOT_STR[slot]}"
+                    ):
+                        loss_value_torch.backward()
                     self._maybe_sync_cuda_timing()
                     if profile_enabled:
                         setattr(
@@ -239,9 +256,12 @@ class TrainingJobNegativeSampling(TrainingJob):
             fused_labels_tensor = torch.cat(fused_labels, dim=1)
             result.forward_time -= time.time()
             fused_loss_fwd_start = time.time() if profile_enabled else None
-            loss_value_torch = (
-                self.loss(fused_scores_tensor, fused_labels_tensor) / batch_size
-            )
+            with self._nvtx_range("ns/fused/loss_fwd"), self._cuda_event_range(
+                result, "cuda_ns_loss_fwd_fused"
+            ):
+                loss_value_torch = (
+                    self.loss(fused_scores_tensor, fused_labels_tensor) / batch_size
+                )
             result.avg_loss += loss_value_torch.item()
             if profile_enabled:
                 setattr(
@@ -255,7 +275,10 @@ class TrainingJobNegativeSampling(TrainingJob):
             result.backward_time -= time.time()
             if not self.is_forward_only:
                 fused_loss_bwd_start = time.time() if profile_enabled else None
-                loss_value_torch.backward()
+                with self._nvtx_range("ns/fused/loss_bwd"), self._cuda_event_range(
+                    result, "cuda_ns_loss_bwd_fused"
+                ):
+                    loss_value_torch.backward()
                 self._maybe_sync_cuda_timing()
                 if profile_enabled:
                     setattr(

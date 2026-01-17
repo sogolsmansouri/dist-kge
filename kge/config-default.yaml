@@ -505,6 +505,12 @@ train:
   # When to write entries to the trace file.
   trace_level: epoch           # batch, epoch
   profile_interval_batches: 0  # when >0, log per-batch timing breakdown every N batches
+  # Add NVTX ranges (Nsight Systems) around key regions (scheduler/forward/backward).
+  # Only active when profile_interval_batches > 0.
+  profile_nvtx: False
+  # Record CUDA event timings for key regions and report them in [profile-cuda] logs.
+  # Only active when profile_interval_batches > 0. Adds low overhead (no extra sync per batch).
+  profile_cuda_events: False
   # When enabled, synchronize CUDA at timing boundaries for more accurate
   # attribution between compute and scheduler time. Use for profiling.
   sync_cuda_timing: False
