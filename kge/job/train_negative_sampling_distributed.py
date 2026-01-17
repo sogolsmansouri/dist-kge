@@ -2271,7 +2271,8 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
                     pass
                 for key, start_event, end_event in pending_cuda_event_pairs:
                     try:
-                        profile_stats[key] += float(end_event.elapsed_time(start_event)) / 1000.0
+                        # torch.cuda.Event.elapsed_time expects start.elapsed_time(end)
+                        profile_stats[key] += float(start_event.elapsed_time(end_event)) / 1000.0
                     except Exception:
                         continue
                 pending_cuda_event_pairs = []

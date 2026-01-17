@@ -89,6 +89,19 @@ class TrainingJob(TrainingOrEvaluationJob):
             and self.device.startswith("cuda")
             and self.config.get("train.pin_memory")
         )
+        if (
+            isinstance(self.device, str)
+            and self.device.startswith("cuda")
+            and bool(self.config.get("train.allow_tf32"))
+        ):
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+            except Exception:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
         self.train_split = config.get("train.split")
 
         self.config.check("train.trace_level", ["batch", "epoch"])
