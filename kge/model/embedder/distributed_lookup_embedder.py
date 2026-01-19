@@ -1200,6 +1200,16 @@ class DistributedLookupEmbedder(LookupEmbedder):
 
     def embed(self, indexes: Tensor) -> Tensor:
         long_indexes = indexes.long()
+        try:
+            unique_indices = bool(self.get_option("unique_indices"))
+        except Exception:
+            unique_indices = False
+        if unique_indices:
+            flat = long_indexes.reshape(-1)
+            unique, inv = torch.unique(flat, return_inverse=True)
+            emb_unique = self._embeddings(unique)
+            emb = emb_unique.index_select(0, inv).view(*long_indexes.size(), -1)
+            return self._postprocess(emb)
         return self._postprocess(self._embeddings(long_indexes))
 
     def embed_all(self) -> Tensor:

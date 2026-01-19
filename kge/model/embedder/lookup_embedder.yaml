@@ -76,5 +76,11 @@ lookup_embedder:
   # Sparse tensors might require special settings, e.g. SparseAdam instead of Adam
   sparse: False
 
+  # When true, de-duplicate indices inside each embed() call and then re-expand
+  # to the original shape before applying postprocessing (e.g., dropout). This
+  # can reduce sparse-gradient coalesce/sort overhead when the same embedding
+  # row is used many times within a batch.
+  unique_indices: False
+
   # Will be deprecated.
   round_dim_to: []

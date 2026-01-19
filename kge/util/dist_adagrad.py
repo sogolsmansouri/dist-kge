@@ -1,4 +1,5 @@
 from collections import deque
+from typing import Tuple
 import torch
 import numpy as np
 from torch.optim.optimizer import Optimizer
@@ -10,7 +11,7 @@ from kge.util.row_grad_cache import pop_row_grad
 
 def _reduce_by_key_rows(
     indices: torch.Tensor, values: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reduce duplicate row indices by summing values (GPU-friendly).
 
     This replaces PyTorch's sparse grad coalesce() for embedding grads. It returns
