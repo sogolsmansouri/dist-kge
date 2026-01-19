@@ -425,6 +425,16 @@ train:
   # See kge/loss.py for details.
   loss: kl
 
+  # Optimization hint for train.loss=kl in negative sampling:
+  #
+  # When labels are provided as a (batch_size x (1+num_negatives)) matrix with the
+  # positive example always in column 0 and all negatives in the remaining
+  # columns, KL divergence equals cross entropy with target class 0. Enabling this
+  # option switches the KL loss implementation to the CrossEntropyLoss fast path,
+  # which avoids the heavier log_softmax + KLDivLoss path (often visible as
+  # SoftMax/KLDiv kernels in GPU profiles).
+  kl_pos_is_first_column: False
+
   # Argument of loss function (if any). If .nan is specified, a default value is
   # used (as stated in parenthesis below).
   #

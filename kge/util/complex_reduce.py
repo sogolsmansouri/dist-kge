@@ -59,11 +59,22 @@ def _reduce_by_key(
     out.index_add_(0, segment_id, val_sorted)
     unique = idx_sorted[boundary]
     if return_sparse:
-        return torch.sparse_coo_tensor(
-            unique.unsqueeze(0),
-            out,
-            size=(num_rows, values.size(1)),
-        ).coalesce()
+        # Indices are strictly increasing and unique here, so the tensor is already
+        # coalesced. Use is_coalesced=True when supported to avoid an extra
+        # coalesce() (which shows up as coalesceValuesKernel + sort in profiles).
+        try:
+            return torch.sparse_coo_tensor(
+                unique.unsqueeze(0),
+                out,
+                size=(num_rows, values.size(1)),
+                is_coalesced=True,
+            )
+        except TypeError:
+            return torch.sparse_coo_tensor(
+                unique.unsqueeze(0),
+                out,
+                size=(num_rows, values.size(1)),
+            ).coalesce()
     return unique, out
 
 
