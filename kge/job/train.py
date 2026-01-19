@@ -112,6 +112,10 @@ class TrainingJob(TrainingOrEvaluationJob):
         )
         self._profile_nvtx: bool = bool(self.config.get("train.profile_nvtx"))
         self._profile_cuda_events: bool = bool(self.config.get("train.profile_cuda_events"))
+        # Pool CUDA Events to reduce profiler overhead when profile_cuda_events is enabled.
+        # Events are recycled once their elapsed time has been collected.
+        self._cuda_event_pool: deque = deque()
+        self._cuda_event_pool_max: int = 8192
         self.epoch: int = 0
         self.is_forward_only = forward_only
 
@@ -653,11 +657,33 @@ class TrainingJob(TrainingOrEvaluationJob):
     def _profiling_enabled(self) -> bool:
         return bool(getattr(self, "_profile_interval_batches", 0) > 0)
 
+    def _acquire_cuda_event(self) -> "torch.cuda.Event":
+        pool = getattr(self, "_cuda_event_pool", None)
+        if isinstance(pool, deque) and pool:
+            try:
+                return pool.popleft()
+            except Exception:
+                pass
+        return torch.cuda.Event(enable_timing=True)
+
+    def _release_cuda_event(self, event: "torch.cuda.Event") -> None:
+        pool = getattr(self, "_cuda_event_pool", None)
+        if not isinstance(pool, deque):
+            return
+        try:
+            if len(pool) >= int(getattr(self, "_cuda_event_pool_max", 0) or 0):
+                return
+        except Exception:
+            return
+        try:
+            pool.append(event)
+        except Exception:
+            pass
+
     @contextmanager
     def _nvtx_range(self, name: str):
         if (
             not getattr(self, "_profile_nvtx", False)
-            or not self._profiling_enabled()
             or not isinstance(self.device, str)
             or not self.device.startswith("cuda")
         ):
@@ -687,8 +713,8 @@ class TrainingJob(TrainingOrEvaluationJob):
             yield
             return
         try:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            start = self._acquire_cuda_event()
+            end = self._acquire_cuda_event()
             start.record()
         except Exception:
             yield

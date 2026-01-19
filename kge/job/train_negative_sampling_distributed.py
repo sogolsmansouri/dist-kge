@@ -2272,17 +2272,26 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             if profile_batch_counter == 0:
                 return
             if pending_cuda_event_pairs and getattr(self, "_profile_cuda_events", False):
+                synced = False
                 try:
                     if isinstance(self.device, str) and self.device.startswith("cuda"):
                         torch.cuda.synchronize()
+                        synced = True
                 except Exception:
-                    pass
+                    synced = False
                 for key, start_event, end_event in pending_cuda_event_pairs:
                     try:
                         # torch.cuda.Event.elapsed_time expects start.elapsed_time(end)
                         profile_stats[key] += float(start_event.elapsed_time(end_event)) / 1000.0
                     except Exception:
                         continue
+                    finally:
+                        if synced:
+                            try:
+                                self._release_cuda_event(start_event)
+                                self._release_cuda_event(end_event)
+                            except Exception:
+                                pass
                 pending_cuda_event_pairs = []
             start = profile_total_batches - profile_batch_counter + 1
             end = profile_total_batches

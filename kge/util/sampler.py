@@ -427,9 +427,7 @@ class BatchNegativeSample(Configurable):
             self.forward_time -= time.time()
             use_nvtx = False
             try:
-                use_nvtx = bool(self.config.get("train.profile_nvtx")) and int(
-                    self.config.get("train.profile_interval_batches") or 0
-                ) > 0 and device.type == "cuda"
+                use_nvtx = bool(self.config.get("train.profile_nvtx")) and device.type == "cuda"
             except Exception:
                 use_nvtx = False
             if use_nvtx:

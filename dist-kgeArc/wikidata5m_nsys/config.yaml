@@ -418,13 +418,13 @@ train:
         +++: +++
       regex: .*_relation_embedder.*
   pin_memory: true
-  profile_cuda_events: true
-  profile_interval_batches: 200
+  profile_cuda_events: false
+  profile_interval_batches: 0
   profile_nvtx: true
   split: train
   subbatch_auto_tune: false
   subbatch_size: -1
-  sync_cuda_timing: true
+  sync_cuda_timing: false
   trace_level: epoch
   type: distributed_negative_sampling
   visualize_graph: false
