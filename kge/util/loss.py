@@ -196,6 +196,20 @@ class KLDivWithSoftmaxKgeLoss(KgeLoss):
         self._klloss = torch.nn.KLDivLoss(reduction=reduction, **kwargs)
 
     def __call__(self, scores, labels, **kwargs):
+        # Fast path for negative sampling: labels are often a one-hot matrix where the
+        # first column corresponds to the positive triple and all remaining columns to
+        # negatives. In that common case, KL divergence equals cross-entropy with
+        # target class 0, and we can use CrossEntropyLoss to avoid the heavier
+        # log_softmax + KLDivLoss path (which shows up as SoftMax/KLDiv backward in Nsight).
+        try:
+            pos_is_first = bool(self.config.get("train.kl_pos_is_first_column"))
+        except KeyError:
+            pos_is_first = False
+        if pos_is_first and labels.dim() == 2:
+            target = torch.zeros(
+                scores.size(0), device=scores.device, dtype=torch.long
+            )
+            return self._celoss(scores, target)
         if labels.dim() == 1:
             # Labels are indexes of positive classes, i.e., we are in a multiclass
             # setting. Then kl divergence can be computed more efficiently using

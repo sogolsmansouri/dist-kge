@@ -1690,7 +1690,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             has_grad = True
             grad = param.grad.detach()
             if grad.is_sparse:
-                grad = grad.coalesce()
+                try:
+                    if hasattr(grad, "is_coalesced") and not grad.is_coalesced():
+                        grad = grad.coalesce()
+                except Exception:
+                    grad = grad.coalesce()
                 values = grad.values()
                 part = values.pow(2).sum()
             elif grad.layout != torch.strided:
@@ -1724,7 +1728,11 @@ class TrainingJobNegativeSamplingDistributed(TrainingJobNegativeSampling):
             return
         grad = grad.detach()
         if grad.is_sparse:
-            grad = grad.coalesce()
+            try:
+                if hasattr(grad, "is_coalesced") and not grad.is_coalesced():
+                    grad = grad.coalesce()
+            except Exception:
+                grad = grad.coalesce()
             row_ids = grad.indices()[0]
             row_norms = torch.zeros(
                 grad.size(0), device=grad.device, dtype=grad.dtype
