@@ -4970,6 +4970,7 @@ class StratificationWorkScheduler(AdaptiveWorkScheduler):
 
 class SchedulerClient:
     def __init__(self, config):
+        self._nvtx_enabled = bool(config.get("train.profile_nvtx") or False)
         self.scheduler_rank = get_min_rank(config) - 1
         self.machine_id = config.get("job.distributed.machine_id")
         if config.get("job.distributed.scheduler_data_type") not in ["int", "int32", "int64", "long"]:
@@ -4981,6 +4982,26 @@ class SchedulerClient:
             prefetch = 1
         self.prefetch_per_request = max(1, prefetch)
         self._prefetched_work = deque()
+
+    def _nvtx_push(self, name: str) -> None:
+        if not self._nvtx_enabled:
+            return
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.nvtx.range_push(name)
+        except Exception:
+            pass
+
+    def _nvtx_pop(self) -> None:
+        if not self._nvtx_enabled:
+            return
+        if not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.nvtx.range_pop()
+        except Exception:
+            pass
 
     def get_init_info(self):
         cmd = torch.tensor([SCHEDULER_CMDS.INIT_INFO, 0], dtype=self.data_type)
@@ -5074,8 +5095,12 @@ class SchedulerClient:
             cmd = torch.tensor(
                 [SCHEDULER_CMDS.GET_WORK, self.machine_id], dtype=self.data_type
             )
+            self._nvtx_push("sched/get_work/send_cmd")
             dist.send(cmd, dst=self.scheduler_rank)
+            self._nvtx_pop()
+            self._nvtx_push("sched/get_work/recv_cmd")
             dist.recv(cmd, src=self.scheduler_rank)
+            self._nvtx_pop()
             if cmd[0] == SCHEDULER_CMDS.WORK:
                 return self._receive_work(cmd)
             elif cmd[0] == SCHEDULER_CMDS.WAIT:
@@ -5083,7 +5108,9 @@ class SchedulerClient:
                 if wait_raw > 0:
                     # New protocol sends milliseconds; keep backward-compat for seconds.
                     wait = wait_raw / 1000.0 if wait_raw > 10 else wait_raw
+                    self._nvtx_push("sched/get_work/wait_sleep")
                     time.sleep(wait)
+                    self._nvtx_pop()
             else:
                 return None, None, None, None, None, None, None, None
 

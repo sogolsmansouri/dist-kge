@@ -201,10 +201,17 @@ class KLDivWithSoftmaxKgeLoss(KgeLoss):
         # negatives. In that common case, KL divergence equals cross-entropy with
         # target class 0, and we can use CrossEntropyLoss to avoid the heavier
         # log_softmax + KLDivLoss path (which shows up as SoftMax/KLDiv backward in Nsight).
+        # Prefer the explicit train.* knob when available, but also allow a user.*
+        # knob so users can enable this optimization even with strict configs that
+        # disallow adding new train.* keys.
+        pos_is_first = False
         try:
             pos_is_first = bool(self.config.get("train.kl_pos_is_first_column"))
         except KeyError:
-            pos_is_first = False
+            try:
+                pos_is_first = bool(self.config.get("user.kl_pos_is_first_column"))
+            except KeyError:
+                pos_is_first = False
         if pos_is_first and labels.dim() == 2:
             target = torch.zeros(
                 scores.size(0), device=scores.device, dtype=torch.long
