@@ -1678,6 +1678,11 @@ class AdaptiveWorkScheduler(WorkScheduler):
         super(AdaptiveWorkScheduler, self).__init__(config=config, dataset=dataset)
         cfg = config.get("job.distributed.scheduler_feedback") or {}
         self._adaptive_enabled = bool(cfg.get("enable", False))
+        # When enabled, large partitions are always served in chunks (within the same
+        # epoch) instead of waiting for feedback history to identify "slow"
+        # partitions. This reduces long-tail stalls where other workers block in
+        # get_work() behind a single heavy partition.
+        self._adaptive_force_chunking = bool(cfg.get("force_chunking", False))
         self._adaptive_min_history = max(1, int(cfg.get("min_history", 3)))
         self._adaptive_slow_factor = max(1.0, float(cfg.get("slow_partition_factor", 1.5)))
         self._adaptive_target_chunk = max(0, int(cfg.get("target_chunk_size", 0)))
@@ -1769,6 +1774,17 @@ class AdaptiveWorkScheduler(WorkScheduler):
         if partition_id not in self._adaptive_total_lengths:
             self._adaptive_total_lengths[partition_id] = total
         chunk_size = self._adaptive_chunk_sizes.get(partition_id, 0)
+        if (
+            chunk_size <= 0
+            and self._adaptive_force_chunking
+            and self._adaptive_target_chunk > 0
+            and total > self._adaptive_target_chunk
+        ):
+            # Always chunk this partition; keep chunk size constant throughout
+            # the partition to avoid feedback lag within an epoch.
+            chunk_size = max(self._adaptive_min_chunk, self._adaptive_target_chunk)
+            chunk_size = min(chunk_size, total)
+            self._adaptive_chunk_sizes[partition_id] = chunk_size
         if chunk_size <= 0 or chunk_size >= total:
             self._adaptive_offsets[partition_id] = 0
             return partition_tensor
