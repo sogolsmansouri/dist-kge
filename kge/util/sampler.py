@@ -559,6 +559,10 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
         self._repeat_indexes = repeat_indexes
         self._unique_samples_cpu = None
         self._repeat_indexes_cpu = None
+        # Cached column index used when sampling with replacement requires repeating
+        # targets. Avoids re-materializing torch.cat(...) every batch.
+        self._score_col_index = None
+        self._score_col_index_cpu = None
 
     def _tensor_for_device(self, tensor, cache_attr, device):
         if tensor.device == device:
@@ -644,15 +648,29 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
 
         # repeat scores as needed for WR sampling
         if num_unique != self.num_samples:
-            scores = scores[
-                :,
-                torch.cat(
+            device = scores.device
+            col_index = self._tensor_for_device(
+                self._score_col_index,
+                "_score_col_index_cpu",
+                device,
+            )
+            if (
+                col_index is None
+                or col_index.device != device
+                or col_index.numel() != self.num_samples
+            ):
+                repeat_indexes = self._tensor_for_device(
+                    self._repeat_indexes, "_repeat_indexes_cpu", device
+                )
+                col_index = torch.cat(
                     (
-                        torch.arange(num_unique, device=scores.device),
-                        self._repeat_indexes,
+                        torch.arange(num_unique, device=device),
+                        repeat_indexes,
                     )
-                ),
-            ]
+                )
+                self._score_col_index = col_index if device.type != "cpu" else None
+                self._score_col_index_cpu = col_index if device.type == "cpu" else None
+            scores = scores[:, col_index]
         self.forward_time += time.time()
 
         return scores
@@ -684,6 +702,8 @@ class NaiveSharedNegativeSample(BatchNegativeSample):
             )
         self._unique_samples_cpu = None
         self._repeat_indexes_cpu = None
+        self._score_col_index = None
+        self._score_col_index_cpu = None
         return self
 
     def pin_memory(self) -> "NaiveSharedNegativeSample":
