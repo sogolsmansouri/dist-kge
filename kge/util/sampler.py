@@ -450,16 +450,7 @@ class BatchNegativeSample(Configurable):
             self.forward_time += time.time()
 
             # determine indexes of relevant scores in scoring matrix
-            self.prepare_time -= time.time()
-            row_indexes = (
-                torch.arange(chunk_size, device=device)
-                .unsqueeze(1)
-                .repeat(1, num_samples)
-                .view(-1)
-            )  # 000 111 222; each num_samples times (here: 3)
-            self.prepare_time += time.time()
-
-            # and pick the scores we need
+            # and pick the scores we need (avoid advanced indexing; use gather)
             self.forward_time -= time.time()
             if use_nvtx:
                 try:
@@ -467,7 +458,10 @@ class BatchNegativeSample(Configurable):
                 except Exception:
                     use_nvtx = False
             try:
-                scores = all_scores[row_indexes, column_indexes].view(chunk_size, -1)
+                if column_indexes.dtype != torch.long:
+                    column_indexes = column_indexes.long()
+                column_indexes_2d = column_indexes.view(chunk_size, num_samples)
+                scores = all_scores.gather(1, column_indexes_2d)
             finally:
                 if use_nvtx:
                     try:

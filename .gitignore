@@ -157,3 +157,6 @@ data/freebase/partitions/
 # local run outputs / checkpoints
 wikidata5m_glow_2gpu/
 *.pt
+newExp.qdstrm
+newExp.zip
+
