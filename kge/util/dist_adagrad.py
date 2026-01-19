@@ -8,6 +8,40 @@ from kge.util.triton_fused import fused_embedding_optimizer_update
 from kge.util.row_grad_cache import pop_row_grad
 
 
+def _reduce_by_key_rows(
+    indices: torch.Tensor, values: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce duplicate row indices by summing values (GPU-friendly).
+
+    This replaces PyTorch's sparse grad coalesce() for embedding grads. It returns
+    (unique_rows, summed_values) where unique_rows is sorted ascending.
+    """
+    if indices.numel() == 0:
+        return indices, values
+    if indices.dtype != torch.long:
+        indices = indices.long()
+    if values.dim() == 1:
+        values = values.view(-1, 1)
+
+    perm = torch.argsort(indices)
+    idx_sorted = indices.index_select(0, perm)
+    val_sorted = values.index_select(0, perm)
+
+    boundary = torch.ones_like(idx_sorted, dtype=torch.bool)
+    if idx_sorted.numel() > 1:
+        boundary[1:] = idx_sorted[1:] != idx_sorted[:-1]
+    segment = torch.cumsum(boundary, dim=0) - 1
+    num_unique = int(segment[-1].item()) + 1
+    out = torch.zeros(
+        (num_unique, val_sorted.size(1)),
+        device=val_sorted.device,
+        dtype=val_sorted.dtype,
+    )
+    out.index_add_(0, segment, val_sorted)
+    unique = idx_sorted[boundary]
+    return unique, out
+
+
 class DistAdagrad(Optimizer):
     """Implements Adagrad algorithm.
 
@@ -204,11 +238,20 @@ class DistAdagrad(Optimizer):
                         raise ValueError(
                             "Currently only sparse parameters supported with dist_adagrad and dist_rowadagrad"
                         )
-                    if hasattr(grad, "is_coalesced") and not grad.is_coalesced():
-                        grad = grad.coalesce()
+                    # Avoid grad.coalesce(), which triggers expensive GPU sort/coalesce
+                    # kernels. Reduce duplicates ourselves and operate on row grads.
                     grad_indices = grad._indices()[0]
-                    # grad_indices_flat = grad_indices.flatten()
                     grad_values = grad._values()
+                    try:
+                        needs_reduce = bool(
+                            hasattr(grad, "is_coalesced") and not grad.is_coalesced()
+                        )
+                    except Exception:
+                        needs_reduce = True
+                    if needs_reduce:
+                        grad_indices, grad_values = _reduce_by_key_rows(
+                            grad_indices, grad_values
+                        )
                     size = grad.size()
 
                 if grad_indices.numel() == 0:
