@@ -398,6 +398,7 @@ def build_parser():
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="device type")
     parser.add_argument("--device-id", type=int, default=None, help="explicit CUDA device id per rank")
     parser.add_argument("--local-rank", type=int, default=None, help="LOCAL_RANK override")
+    parser.add_argument("--local_rank", dest="local_rank", type=int, default=None, help="LOCAL_RANK override (torch.distributed.launch)")
 
     parser.add_argument("--num-partitions", type=int, default=None, help="number of partitions (default: world size)")
     parser.add_argument("--logical-workers", type=int, default=8, help="logical workers/partitions (default: 8)")
