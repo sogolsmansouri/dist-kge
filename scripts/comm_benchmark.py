@@ -56,6 +56,61 @@ def _parse_rows(rows_arg: str, num_parts: int):
     return rows
 
 
+def _count_partitions_from_array(arr, num_parts: int):
+    import numpy as np  # local import to avoid hard dependency at module level
+    counts = np.zeros((num_parts,), dtype=np.int64)
+    if arr.ndim == 1:
+        vals = arr
+    else:
+        vals = arr.reshape(-1)
+    vals = vals[(vals >= 0) & (vals < num_parts)]
+    if vals.size == 0:
+        return counts.tolist()
+    uniq, cnt = np.unique(vals, return_counts=True)
+    counts[uniq] += cnt
+    return counts.tolist()
+
+
+def _stream_count_partitions(del_path: Path, num_parts: int):
+    counts = [0] * num_parts
+    with del_path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            for token in parts:
+                if not token:
+                    continue
+                try:
+                    pid = int(token)
+                except ValueError:
+                    continue
+                if 0 <= pid < num_parts:
+                    counts[pid] += 1
+    return counts
+
+
+def _load_sizes_from_partition_dir(part_dir: Path, num_parts: int):
+    # Prefer pickled arrays if present
+    pckl = part_dir / "entity_to_partitions.del.pckl"
+    if pckl.exists():
+        import pickle
+        with pckl.open("rb") as f:
+            arr = pickle.load(f)
+        try:
+            import numpy as np
+            arr = np.asarray(arr)
+            return _count_partitions_from_array(arr, num_parts)
+        except Exception:
+            pass
+    # Fallback to raw .del file (streaming)
+    del_file = part_dir / "entity_to_partitions.del"
+    if del_file.exists():
+        return _stream_count_partitions(del_file, num_parts)
+    return None
+
+
 def _load_partition_sizes(args, world_size: int):
     if not args.override_partitions:
         if args.partition_sizes or args.num_entities is not None:
@@ -67,18 +122,26 @@ def _load_partition_sizes(args, world_size: int):
                 "partition scaling is disabled by default; use --override-partitions to customize"
             )
     if args.partition_npz:
-        if np is None:
-            raise RuntimeError("numpy is required to read --partition-npz")
         path = Path(args.partition_npz)
-        if not path.exists():
-            raise FileNotFoundError(path)
-        data = np.load(path)
-        sizes = []
-        for i in range(world_size):
-            key = f"entity_part_{i}"
-            if key not in data:
-                raise KeyError(f"{key} not found in {path}")
-            sizes.append(int(data[key].shape[0]))
+        if path.exists():
+            if np is None:
+                raise RuntimeError("numpy is required to read --partition-npz")
+            data = np.load(path)
+            sizes = []
+            for i in range(world_size):
+                key = f"entity_part_{i}"
+                if key not in data:
+                    raise KeyError(f"{key} not found in {path}")
+                sizes.append(int(data[key].shape[0]))
+            return sizes
+    # Fallback to partition directory mapping
+    if args.partition_dir:
+        part_dir = Path(args.partition_dir)
+    else:
+        part_dir = Path("data") / "wikidata5m" / "partitions" / "stratification" / f"num_{world_size}"
+    sizes = _load_sizes_from_partition_dir(part_dir, world_size)
+    if sizes is not None:
+        return sizes
     elif args.partition_sizes:
         sizes = [int(x) for x in args.partition_sizes.split(",") if x.strip()]
         if len(sizes) != world_size:
@@ -405,8 +468,14 @@ def build_parser():
     parser.add_argument(
         "--partition-npz",
         type=str,
-        default="/home/smansou2/dist-kge/data/wikidata5m/partitions/stratification/num_8/entity_partition_entities.npz",
+        default="data/wikidata5m/partitions/stratification/num_8/entity_partition_entities.npz",
         help="path to entity_partition_entities.npz (default: wikidata5m stratification num_8)",
+    )
+    parser.add_argument(
+        "--partition-dir",
+        type=str,
+        default=None,
+        help="partition directory with entity_to_partitions.del(.pckl) as fallback",
     )
     parser.add_argument("--partition-sizes", type=str, default=None, help="comma-separated sizes per partition")
 
