@@ -322,7 +322,7 @@ def run_benchmark(args):
         # warmup
         for _ in range(args.warmup):
             with _NvtxRange(args.nvtx, f"row/{row}/broadcast"):
-                dist.broadcast(row_tensor, src=row)
+                dist.broadcast(row_tensor, src=owner_rank)
             if args.compute:
                 with _NvtxRange(args.nvtx, f"row/{row}/compute"):
                     grad_row.copy_(row_tensor[:reduce_entities])
@@ -356,7 +356,7 @@ def run_benchmark(args):
             _sync(device)
             t0 = time.perf_counter()
             with _NvtxRange(args.nvtx, f"row/{row}/broadcast"):
-                dist.broadcast(row_tensor, src=row)
+                dist.broadcast(row_tensor, src=owner_rank)
             _sync(device)
             t1 = time.perf_counter()
 
