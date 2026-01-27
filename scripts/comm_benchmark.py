@@ -158,6 +158,7 @@ def _all_reduce_stats(value: float, device: torch.device):
 
 
 def run_benchmark(args):
+    device = _get_device(args)
     _init_dist(args.backend)
 
     world_size = dist.get_world_size()
@@ -180,8 +181,6 @@ def run_benchmark(args):
                 f"logical workers must be divisible by world_size; got num_partitions={num_parts}, world_size={world_size}. "
                 "Use --override-partitions to customize."
             )
-
-    device = _get_device(args)
 
     dtype_map = {
         "fp32": torch.float32,
