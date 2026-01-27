@@ -11,6 +11,7 @@ This approximates processing row i of an 8x8 partition matrix.
 """
 
 import argparse
+import csv
 import json
 import os
 import time
@@ -436,8 +437,35 @@ def run_benchmark(args):
 
     if rank == 0 and args.output:
         out = Path(args.output)
+        summary = None
+        if results:
+            total_bcast_bytes = sum(r["bcast_bytes"] for r in results)
+            total_reduce_bytes = sum(r["reduce_bytes"] for r in results)
+            total_bcast_time = sum(r["broadcast_max_s"] for r in results)
+            total_reduce_time = sum(r["reduce_max_s"] for r in results)
+            summary = {
+                "rows_measured": len(results),
+                "rows_total": num_parts,
+                "bcast_bytes_total": total_bcast_bytes,
+                "reduce_bytes_total": total_reduce_bytes,
+                "bcast_time_total_s": total_bcast_time,
+                "reduce_time_total_s": total_reduce_time,
+                "comm_time_total_s": total_bcast_time + total_reduce_time,
+                "bcast_time_per_row_s": total_bcast_time / len(results),
+                "reduce_time_per_row_s": total_reduce_time / len(results),
+            }
+            if len(results) != num_parts:
+                scale = float(num_parts) / float(len(results))
+                summary["estimated_bcast_time_total_s"] = total_bcast_time * scale
+                summary["estimated_reduce_time_total_s"] = total_reduce_time * scale
+                summary["estimated_comm_time_total_s"] = (
+                    total_bcast_time + total_reduce_time
+                ) * scale
+                summary["estimated_bcast_bytes_total"] = int(total_bcast_bytes * scale)
+                summary["estimated_reduce_bytes_total"] = int(total_reduce_bytes * scale)
         payload = {
             "world_size": world_size,
+            "logical_workers": num_parts,
             "backend": args.backend,
             "device": str(device),
             "embedding_dim": args.embedding_dim,
@@ -447,9 +475,88 @@ def run_benchmark(args):
             "iters": args.iters,
             "warmup": args.warmup,
             "results": results,
+            "summary": summary,
         }
         out.write_text(json.dumps(payload, indent=2))
         print(f"wrote {out}")
+        if summary is not None:
+            print(
+                "summary: rows={}/{} bcast_total={} reduce_total={} "
+                "bcast_time={:.3f}s reduce_time={:.3f}s comm_time={:.3f}s".format(
+                    summary["rows_measured"],
+                    summary["rows_total"],
+                    _human_bytes(summary["bcast_bytes_total"]),
+                    _human_bytes(summary["reduce_bytes_total"]),
+                    summary["bcast_time_total_s"],
+                    summary["reduce_time_total_s"],
+                    summary["comm_time_total_s"],
+                )
+            )
+            if len(results) != num_parts and "estimated_comm_time_total_s" in summary:
+                print(
+                    "estimated_full_rows: bcast_time={:.3f}s reduce_time={:.3f}s comm_time={:.3f}s".format(
+                        summary["estimated_bcast_time_total_s"],
+                        summary["estimated_reduce_time_total_s"],
+                        summary["estimated_comm_time_total_s"],
+                    )
+                )
+
+    if rank == 0 and args.output_csv:
+        out_csv = Path(args.output_csv)
+        with out_csv.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "row",
+                    "row_entities",
+                    "row_reduce_entities",
+                    "bcast_bytes",
+                    "reduce_bytes",
+                    "broadcast_avg_s",
+                    "broadcast_max_s",
+                    "broadcast_bw_gbps",
+                    "reduce_avg_s",
+                    "reduce_max_s",
+                    "reduce_bw_gbps",
+                ]
+            )
+            for r in results:
+                writer.writerow(
+                    [
+                        r["row"],
+                        r["row_entities"],
+                        r["row_reduce_entities"],
+                        r["bcast_bytes"],
+                        r["reduce_bytes"],
+                        r["broadcast_avg_s"],
+                        r["broadcast_max_s"],
+                        r["broadcast_bw_gbps"],
+                        r["reduce_avg_s"],
+                        r["reduce_max_s"],
+                        r["reduce_bw_gbps"],
+                    ]
+                )
+            if results:
+                total_bcast_bytes = sum(r["bcast_bytes"] for r in results)
+                total_reduce_bytes = sum(r["reduce_bytes"] for r in results)
+                total_bcast_time = sum(r["broadcast_max_s"] for r in results)
+                total_reduce_time = sum(r["reduce_max_s"] for r in results)
+                writer.writerow(
+                    [
+                        "summary",
+                        "",
+                        "",
+                        total_bcast_bytes,
+                        total_reduce_bytes,
+                        "",
+                        total_bcast_time,
+                        "",
+                        "",
+                        total_reduce_time,
+                        "",
+                    ]
+                )
+        print(f"wrote {out_csv}")
 
     dist.barrier()
 
@@ -501,6 +608,7 @@ def build_parser():
     parser.add_argument("--id-bytes", type=int, default=8, help="bytes per ID when include-id-bytes is set")
     parser.add_argument("--nvtx", action="store_true", help="emit NVTX ranges for Nsight Systems")
     parser.add_argument("--output", type=str, default=None, help="write JSON results to path")
+    parser.add_argument("--output-csv", type=str, default=None, help="write CSV results to path")
     return parser
 
 
